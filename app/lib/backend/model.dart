@@ -6,11 +6,24 @@ import '../term/screen.dart';
 enum Mode { ssh, pylon }
 
 class Host {
-  Host({required this.name, required this.user, required this.address, this.port = 22, this.mode = Mode.ssh, this.jump = '', this.tag = ''});
+  Host({required this.name, required this.user, required this.address, this.port = 22, this.mode = Mode.ssh, this.jump = '', this.tag = ''}) : local = false;
+
+  /// The local shell (SPEC 13): a shell on this device, in a sandbox of
+  /// its own, never a server. Not stored with the hosts.
+  Host.local()
+      : name = 'local',
+        user = '',
+        address = '',
+        jump = '',
+        tag = '',
+        port = 0,
+        mode = Mode.ssh,
+        local = true;
 
   String name, user, address, jump, tag;
   int port;
   Mode mode;
+  final bool local;
 
   String get target => '$user@$address';
 
@@ -45,6 +58,7 @@ class Outcome {
 abstract class Session {
   Session(this.host);
   final Host host;
+  bool get local => host.local;
   Screen screen = Screen.blank(24, 80);
   String title = '';
   int? exitCode;
@@ -67,4 +81,11 @@ abstract class Backend {
   Future<Outcome> trustCa(String pattern, String key);
   Session open(Host h, int rows, int cols);
   bool get demo;
+
+  /// Whether this device can run the local shell (SPEC 13).
+  bool get hasLocalShell;
+
+  /// A new local shell. [shareNet] (Linux only) leaves it the device's
+  /// network instead of none.
+  Session openLocal(int rows, int cols, {bool shareNet = false});
 }

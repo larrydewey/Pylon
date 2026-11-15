@@ -44,6 +44,8 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | `pylond` releases | pushed only as a release signed by k of n pinned Ed25519 release keys, in an RFC 9162 transparency log (inclusion proof under a tree head signed by the log key, consistent with the newest head seen), with a release counter that never goes back; verified offline from the files shipped beside `pylond`, before anything reaches the host; `pylon pylond-check DIR [PROOF]`; `tools/release` makes keys, manifests, signatures, the log and proofs; code images reproducible (SPEC 8.2.1). No release keys are pinned yet: until the first release ceremony only `--pylond-roots ROOTS` or `--pylond-unverified` (developer options, announced) push a `pylond` |
 | Host trust | pinned keys (`pylon pin HOST FINGERPRINT`; re-pinning replaces the old key) or host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked); a changed key names the old pin; `pylon history [HOST]` |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
+| Local shell | `pylon-local` (SPEC 13): a shell on the device that cannot reach Pylon's files, the agent, Pylon's processes or the network. Linux: an empty environment and new user, mount, pid and network namespaces with a root of its own (system directories read-only, its own home at `~/.local/share/pylon-local/home`); Android: an `isolatedProcess` service (its own UID, no permissions, no storage), not yet verified on a device. No SSH from it yet |
+| Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
 133 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
@@ -70,6 +72,7 @@ Requires the Resid toolchain (`residc`, see the Resid README).
 residc cli/pylon.resid -o build/pylon
 residc cli/pylond.resid -o build/pylond   # optional: the Pylon protocol server
 residc tools/release/release.resid -o build/pylon-release   # making pylond releases (SPEC 8.2.1)
+residc cli/pylon_local.resid -o build/pylon-local   # optional: the local shell (SPEC 13)
 
 # Pin a host: get its fingerprint out of band (its console:
 # ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub), then
@@ -99,6 +102,8 @@ residc test tests/kex_test.resid  # key derivation known answers
 residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, replay, padding, cookies
 residc test tests/term_test.resid  # the terminal emulator core
 residc test tests/release_test.resid # pylond releases: Merkle log, proofs, quorum, rollback
+tests/local_shell.sh build         # the local shell can't read PYLON_HOME or reach SSH_AUTH_SOCK
+(cd app && flutter test)           # the app: keys, frames, tabs and splits, the local shell's backend
 
 # Fuzzing through a mutating proxy in front of a running sshd (port 2222),
 # with the host pinned under the proxy's port:
@@ -110,8 +115,10 @@ FUZZ_PORT=2299 FUZZ_EXPECT=ok tests/fuzz_proxy.py 200 2222 -- build/pylon -p {po
 - `core/` the SSH client core: wire types, packet ciphers, key exchange,
   host keys, transport, agent client, user authentication, sessions,
   pinned hosts.
-- `cli/` the `pylon` command and `pylond`.
+- `cli/` the `pylon` command, `pylon-term` (the confined emulator),
+  `pylon-local` (the local shell's launcher) and `pylond`.
 - `tools/release/` `pylon-release`, for signed, logged `pylond` releases.
+- `app/` the Flutter app (Android, Linux desktop).
 - `tests/` interoperability tests and a hostile server.
 
 ## License

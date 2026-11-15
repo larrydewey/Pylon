@@ -13,20 +13,67 @@ import 'model.dart';
 /// at least as new as the newest it has accepted.
 const unverifiedPylond = bool.fromEnvironment('PYLON_UNVERIFIED_PYLOND');
 
+/// The connection side of one terminal, framed both ways (type (1) |
+/// length (4) | payload): `pylon --app` for a host, `pylon-local` for the
+/// local shell, or (Android) the local shell in Pylon's isolated service.
+/// From it: 1 the host's (or shell's) output, 3 an agent request, 4 ready,
+/// 5 the exit status (1 byte); to it: 1 keys, 2 a size, 3 agent replies.
+abstract class Conduit {
+  Stream<List<int>> get output;
+
+  /// Text from the core for the principal (prompts, refusals).
+  Stream<String> get messages;
+  void add(List<int> frame);
+  Future<int> get exitCode;
+
+  /// Ends it: its input is closed (a confined process that outlived its
+  /// parent sees end of input and hangs up) and it is killed.
+  void close();
+}
+
+class ProcessConduit implements Conduit {
+  ProcessConduit(this.p);
+  final Process p;
+  bool _closed = false;
+
+  @override
+  Stream<List<int>> get output => p.stdout;
+  @override
+  Stream<String> get messages => p.stderr.transform(utf8.decoder);
+  @override
+  void add(List<int> frame) {
+    if (!_closed) p.stdin.add(frame);
+  }
+
+  @override
+  Future<int> get exitCode => p.exitCode;
+  @override
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    p.stdin.close().catchError((_) {});
+    p.kill();
+  }
+}
+
 /// The real backend: the Resid core as processes. Per terminal, `pylon
 /// --app` holds the connection (keys from the agent at SSH_AUTH_SOCK,
 /// Symbolon's) and `pylon-term` (confined) turns the host's output into
 /// screens. This app only relays bytes between them and draws screens.
 class ProcessBackend implements Backend {
-  /// A desktop layout: `pylon`, `pylon-term` and `pylond` side by side.
+  /// A desktop layout: `pylon`, `pylon-term`, `pylon-local` and `pylond`
+  /// side by side.
   ProcessBackend(String binDir, this.home)
       : pylonPath = '$binDir/pylon',
         termPath = '$binDir/pylon-term',
-        pylondPath = '$binDir/pylond';
+        pylondPath = '$binDir/pylond',
+        localPath = '$binDir/pylon-local',
+        localConduit = null;
 
   /// Explicit paths (Android: the native library directory for the core,
-  /// a directory of pylond builds per machine type).
-  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose});
+  /// a directory of pylond builds per machine type, and the local shell
+  /// through the isolated service, [localConduit]).
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose, this.localPath, this.localConduit});
 
   /// Where the core's agent requests go when it has no SSH_AUTH_SOCK
   /// (Android: Symbolon's agent service, SPEC 7.3). Gets a session's
@@ -45,6 +92,13 @@ class ProcessBackend implements Backend {
   /// with the signed release beside them (pylond.release, pylond.proof).
   final String pylondPath;
 
+  /// `pylon-local` (Linux): the confined local shell, SPEC 13.
+  final String? localPath;
+
+  /// Starts a local shell elsewhere than in a child process (Android: in
+  /// the isolated service, under a UID of its own).
+  final Future<Conduit> Function(int rows, int cols)? localConduit;
+
   /// PYLON_HOME: pins, CAs, pin history, and this app's host list.
   final String home;
 
@@ -52,8 +106,25 @@ class ProcessBackend implements Backend {
   String get _hostsFile => '$home/app_hosts.json';
   Map<String, String> get _env => {'PYLON_HOME': home, if (agent != null) 'PYLON_AGENT': 'app'};
 
+  /// pylon-local's environment: nothing of the app's but what it needs
+  /// to find the local home and to refuse a layout that would put
+  /// Pylon's files or the agent's socket in it. It hands the shell none
+  /// of it (env -i).
+  Map<String, String> get _localEnv {
+    final e = Platform.environment;
+    return {
+      for (final k in ['HOME', 'SHELL', 'LANG', 'USER', 'SSH_AUTH_SOCK'])
+        if (e[k] != null) k: e[k]!,
+      'PYLON_HOME': home,
+      'PATH': '/usr/bin:/bin',
+    };
+  }
+
   @override
   bool get demo => false;
+
+  @override
+  bool get hasLocalShell => localConduit != null || (localPath != null && File(localPath!).existsSync());
 
   @override
   Future<List<Host>> loadHosts() async {
@@ -95,17 +166,34 @@ class ProcessBackend implements Backend {
   }
 
   @override
-  Session open(Host h, int rows, int cols) => _ProcSession(this, h, rows, cols);
+  Session open(Host h, int rows, int cols) => ProcSession(this, h, rows, cols, () async {
+        final args = ['--app', '-p', '${h.port}', if (h.jump.isNotEmpty) ...['-J', h.jump], if (h.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', pylondPath], h.target];
+        return ProcessConduit(await Process.start(pylonPath, args, environment: _env));
+      });
+
+  @override
+  Session openLocal(int rows, int cols, {bool shareNet = false}) => ProcSession(this, Host.local(), rows, cols, () async {
+        final lc = localConduit;
+        if (lc != null) return lc(rows, cols);
+        final p = localPath;
+        if (p == null) throw StateError('no local shell on this device');
+        return ProcessConduit(await Process.start(p, [if (shareNet) '--share-net', '$rows', '$cols'], environment: _localEnv, includeParentEnvironment: false));
+      });
 }
 
-class _ProcSession extends Session {
-  _ProcSession(this.b, Host h, int rows, int cols) : super(h) {
+/// One terminal: a [Conduit] for the connection (or the local shell) and
+/// `pylon-term`, the confined emulator, for its screens.
+class ProcSession extends Session {
+  ProcSession(this.b, Host h, int rows, int cols, this._connect) : super(h) {
     screen = Screen.blank(rows, cols);
     _start(rows, cols);
   }
 
   final ProcessBackend b;
-  Process? _conn, _term;
+  final Future<Conduit> Function() _connect;
+  Conduit? _conn;
+  Process? _term;
+  bool _closed = false;
 
   // Until the core says the terminal is ready (frame 4) it reads nothing
   // but agent replies: keys and sizes wait here.
@@ -113,64 +201,78 @@ class _ProcSession extends Session {
   late final int _agentConn = ++b._conns;
   final List<Uint8List> _held = [];
 
+  // The exit status the conduit reported (frame 5), which wins over its
+  // process's: a launcher that confined itself loses its own.
+  int? _reported;
+
   void _toConn(Uint8List f) {
     if (_ready) {
-      _conn?.stdin.add(f);
+      _conn?.add(f);
     } else {
       _held.add(f);
     }
   }
+
   final _fromConn = FrameReader(), _fromTerm = FrameReader();
 
   Future<void> _start(int rows, int cols) async {
-    status = 'Connecting…';
+    status = local ? 'Starting the local shell…' : 'Connecting…';
     changed();
     try {
       _term = await Process.start(b.termPath, ['$rows', '$cols']);
-      final args = ['--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (host.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', b.pylondPath], host.target];
-      _conn = await Process.start(b.pylonPath, args, environment: b._env);
+      _conn = await _connect();
     } catch (e) {
-      status = 'Cannot start the Pylon core: $e';
+      status = local ? 'Cannot start the local shell: $e' : 'Cannot start the Pylon core: $e';
       // `this.`: a bare exitCode here is dart:io's (this process's status).
       this.exitCode = 255;
+      _term?.kill();
       changed();
       return;
     }
+    if (_closed) {
+      _conn?.close();
+      _term?.kill();
+      return;
+    }
     _term!.stdout.listen(_onTerm);
-    _conn!.stdout.listen((d) {
+    _conn!.output.listen((d) {
       for (final (t, p) in _fromConn.add(d)) {
         if (t == 1) {
           _term?.stdin.add(frame(1, p));
-        } else if (t == 3) {
+        } else if (t == 3 && !local) {
           _agentRequest(Uint8List.fromList(p));
         } else if (t == 4 && !_ready) {
           _ready = true;
           for (final f in _held) {
-            _conn?.stdin.add(f);
+            _conn?.add(f);
           }
           _held.clear();
+        } else if (t == 5 && p.length == 1) {
+          _reported = p[0];
         }
       }
     });
     // The core's own messages (prompts, refusals) are text for the
     // principal; shown escaped, never interpreted.
-    _conn!.stderr.transform(utf8.decoder).listen((s) {
-      status = (status.startsWith('Connecting') ? '' : status) + s;
+    _conn!.messages.listen((s) {
+      status = (_starting ? '' : status) + s;
       changed();
     });
     _conn!.exitCode.then((c) {
-      this.exitCode = c;
-      _term?.stdin.close();
+      this.exitCode = _reported ?? c;
+      _term?.stdin.close().catchError((_) {});
       changed();
     });
     resize(rows, cols);
   }
 
+  bool get _starting => status.startsWith('Connecting') || status.startsWith('Starting');
+
   Future<void> _agentRequest(Uint8List req) async {
     final a = b.agent;
     // No agent: an empty failure message (SSH_AGENT_FAILURE).
     final reply = a == null ? null : await a(_agentConn, req);
-    _conn?.stdin.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
+    _conn?.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
   }
 
   void _onTerm(List<int> d) {
@@ -179,7 +281,7 @@ class _ProcSession extends Session {
         final s = Screen.decode(p);
         if (s != null) {
           screen = s;
-          if (status.startsWith('Connecting')) status = '';
+          if (_starting) status = '';
         }
       } else if (t == 2) {
         _toConn(frame(1, p)); // fixed-format replies go back to the host
@@ -204,8 +306,10 @@ class _ProcSession extends Session {
 
   @override
   void close() {
-    b.agentClose?.call(_agentConn);
-    _conn?.kill();
+    _closed = true;
+    if (!local) b.agentClose?.call(_agentConn);
+    _conn?.close();
+    _term?.stdin.close().catchError((_) {});
     _term?.kill();
   }
 }

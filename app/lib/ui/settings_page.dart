@@ -58,6 +58,18 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ]),
         ),
+        if (desktopLayout && st.backend.hasLocalShell) ...[
+          const Section('Local shell'),
+          Card2(
+            padding: EdgeInsets.zero,
+            child: SwitchListTile(
+              title: const Text('Give the local shell the network'),
+              subtitle: const Text("Off: it has none. On: it shares this computer's network, so it can also reach Pylon's local forwards and abstract sockets (X11, D-Bus). Applies to new local shells.", style: TextStyle(color: P.muted)),
+              value: st.localShareNet,
+              onChanged: (v) => setState(() => st.localShareNet = v),
+            ),
+          ),
+        ],
       ]),
     );
   }

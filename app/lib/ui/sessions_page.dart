@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../backend/model.dart';
+import '../backend/select.dart';
 import '../theme.dart';
 import 'app_state.dart';
 import 'terminal_page.dart';
@@ -10,23 +11,34 @@ class SessionsPage extends StatelessWidget {
   const SessionsPage({super.key, required this.st});
   final AppState st;
 
+  void _show(BuildContext context, Host h) {
+    final inTab = st.openInTab;
+    if (inTab != null) {
+      inTab(h);
+      Navigator.popUntil(context, (r) => r.isFirst);
+    } else {
+      Navigator.push(context, MaterialPageRoute(builder: (_) => TerminalPage(st: st, host: h)));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final live = st.sessions.entries.where((e) => e.value.exitCode == null).toList();
+    final live = st.live.where((s) => !s.local).toList();
+    final local = st.sessionFor(Host.local());
     return SafeArea(
       child: ListView(padding: const EdgeInsets.fromLTRB(12, 16, 12, 24), children: [
         const Padding(padding: EdgeInsets.only(left: 8), child: Text('Sessions', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w600))),
-        const Section('On this device'),
+        Section('On $deviceName'),
         if (live.isEmpty) const Padding(padding: EdgeInsets.all(8), child: Text('No live sessions.', style: TextStyle(color: P.muted))),
-        for (final e in live)
+        for (final s in live)
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: Card2(
               border: P.tealLine,
-              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => TerminalPage(st: st, host: e.key))),
+              onTap: st.openInTab != null ? null : () => _show(context, s.host),
               child: Row(children: [
-                Expanded(child: Text(e.value.title.isNotEmpty ? visible(e.value.title) : e.key.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
-                Chip2(e.key.mode == Mode.pylon ? 'Pylon · live' : 'SSH · live'),
+                Expanded(child: Text(s.title.isNotEmpty ? visible(s.title) : s.host.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
+                Chip2(s.host.mode == Mode.pylon ? 'Pylon · live' : 'SSH · live'),
               ]),
             ),
           ),
@@ -35,6 +47,22 @@ class SessionsPage extends StatelessWidget {
           padding: EdgeInsets.all(8),
           child: Text("Sessions pylond keeps for you appear when you connect to their host; resuming one takes a fresh login, so a stolen phone can't do it alone.", style: TextStyle(color: P.muted, fontSize: 13, height: 1.5)),
         ),
+        if (st.backend.hasLocalShell) ...[
+          Section('On $deviceName only'),
+          Card2(
+            color: P.purpleDeep,
+            border: P.purpleLine,
+            onTap: () => _show(context, Host.local()),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                const Expanded(child: Text('Local shell', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: P.localText))),
+                Text(local != null ? 'Live' : (deviceName == 'this phone' ? 'This phone' : 'This computer'), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: P.purple)),
+              ]),
+              const SizedBox(height: 6),
+              const Text('Separate sandbox, no access to your keys', style: TextStyle(fontSize: 13, color: P.localMuted)),
+            ]),
+          ),
+        ],
       ]),
     );
   }

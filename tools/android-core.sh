@@ -2,6 +2,7 @@
 # Builds the Resid core for Android and puts it where the APK packs it:
 #   app/android/app/src/main/jniLibs/arm64-v8a/libpylon.so       (connection)
 #   app/android/app/src/main/jniLibs/arm64-v8a/libpylon_term.so  (emulator)
+#   app/android/app/src/main/jniLibs/arm64-v8a/libpylon_local.so (local shell launcher)
 #   app/assets/pylond/pylond-x86_64, pylond-aarch64               (for servers)
 #   app/assets/pylond/pylond.release, pylond.proof                (SPEC 8.2)
 # Needs residc and AArch64 compiler-rt builtins (Resid's
@@ -25,10 +26,12 @@ OUT=build/android
 mkdir -p "$OUT" "$LIBS" "$ASSETS"
 residc cli/pylon.resid --target aarch64-linux-android -o "$OUT/pylon"
 residc cli/pylon_term.resid --target aarch64-linux-android -o "$OUT/pylon_term"
+residc cli/pylon_local.resid --target aarch64-linux-android -o "$OUT/pylon_local"
 residc cli/pylond.resid --target aarch64 -o "$OUT/pylond-aarch64"
 residc cli/pylond.resid -o "$OUT/pylond-x86_64"
 cp "$OUT/pylon" "$LIBS/libpylon.so"
 cp "$OUT/pylon_term" "$LIBS/libpylon_term.so"
+cp "$OUT/pylon_local" "$LIBS/libpylon_local.so"
 rm -f "$ASSETS"/pylond-* "$ASSETS"/pylond.release "$ASSETS"/pylond.proof
 if [ -n "${PYLOND_RELEASE_DIR:-}" ]; then
     residc tools/release/release.resid -o "$OUT/pylon-release"
