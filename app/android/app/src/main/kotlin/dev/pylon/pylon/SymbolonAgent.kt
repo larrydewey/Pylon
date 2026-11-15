@@ -1,5 +1,6 @@
 package dev.pylon.pylon
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -12,22 +13,34 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Symbolon's SSH agent service (SPEC 7.3), bound and called with the agent
- * protocol's messages unchanged: one transaction (code [CALL]) carries a
- * whole request message as a byte array and returns the whole reply. The
- * service protects itself with a signature-level permission and checks
+ * Symbolon's SSH agent service (SPEC 7.3), called with the agent protocol's
+ * messages unchanged. Each terminal session is one agent connection (a
+ * number of Pylon's choosing), so a session-bind holds for the signature
+ * that follows it:
+ *
+ *   CALL  conn, request -> 0, reply | 1, PendingIntent | -1
+ *   WAIT  conn          -> 0, reply | -1
+ *   CLOSE conn
+ *
+ * A 1 means Symbolon needs the principal's consent: Pylon, in front, starts
+ * Symbolon's consent sheet from the PendingIntent and then WAITs for the
+ * reply. A -1 is answered to the core as the agent's failure message.
+ *
+ * The service protects itself with a signature-level permission and checks
  * the caller; here, Pylon checks the service: only the Symbolon package
  * signed by a pinned certificate is bound, so another app cannot pose as
  * the agent and collect what Pylon asks it to sign.
  *
- * Calls block (a signature waits for the principal's consent in
- * Symbolon's own sheet): never on the main thread.
+ * Calls block: never on the main thread.
  */
 class SymbolonAgent(private val ctx: Context) {
     companion object {
         const val PACKAGE = "dev.symbolon.app"
         const val ACTION = "dev.symbolon.action.SSH_AGENT"
         const val CALL = IBinder.FIRST_CALL_TRANSACTION
+        const val WAIT = IBinder.FIRST_CALL_TRANSACTION + 1
+        const val CLOSE = IBinder.FIRST_CALL_TRANSACTION + 2
+        val FAILURE = byteArrayOf(0, 0, 0, 1, 5)
         const val DESCRIPTOR = "dev.symbolon.ISshAgent"
 
         /** SHA-256 of Symbolon's release signing certificates (lower-case hex), set at build time. */
@@ -67,22 +80,44 @@ class SymbolonAgent(private val ctx: Context) {
         return binder
     }
 
-    /** One agent message in, the reply message out; null when there is no agent. */
-    fun call(request: ByteArray): ByteArray? {
+    private fun <T> transact(code: Int, fill: (Parcel) -> Unit, read: (Parcel) -> T): T? {
         val b = bind() ?: return null
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         return try {
             data.writeInterfaceToken(DESCRIPTOR)
-            data.writeByteArray(request)
-            if (!b.transact(CALL, data, reply, 0)) return null
+            fill(data)
+            if (!b.transact(code, data, reply, 0)) return null
             reply.readException()
-            reply.createByteArray()
+            read(reply)
         } catch (e: Exception) {
             null
         } finally {
             data.recycle()
             reply.recycle()
         }
+    }
+
+    /**
+     * One agent message in, the reply message out; null when there is no
+     * agent. [consent] starts Symbolon's consent sheet (on the main thread,
+     * with Pylon in front) when the request needs the principal.
+     */
+    fun call(conn: Long, request: ByteArray, consent: (PendingIntent) -> Boolean): ByteArray? {
+        val first = transact(CALL, { it.writeLong(conn); it.writeByteArray(request) }) { r ->
+            when (r.readInt()) {
+                0 -> Pair(r.createByteArray(), null)
+                1 -> Pair(null, PendingIntent.readPendingIntentOrNullFromParcel(r))
+                else -> Pair(FAILURE, null)
+            }
+        } ?: return null
+        first.first?.let { return it }
+        val pi = first.second ?: return FAILURE
+        if (!consent(pi)) return FAILURE
+        return transact(WAIT, { it.writeLong(conn) }) { r -> if (r.readInt() == 0) r.createByteArray() else FAILURE } ?: FAILURE
+    }
+
+    fun close(conn: Long) {
+        transact(CLOSE, { it.writeLong(conn) }) { }
     }
 }

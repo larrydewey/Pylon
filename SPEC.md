@@ -299,16 +299,35 @@ own activity, with `FLAG_SECURE` and overlay protection
 
 The interface, exactly (v1): Pylon binds `Intent("dev.symbolon.action.SSH_AGENT")`
 in package `dev.symbolon.app`, only after checking that package's sole
-signer against the Symbolon release certificates Pylon pins (SHA-256);
-each call is one `transact(FIRST_CALL_TRANSACTION)` whose data parcel
-holds the interface token `dev.symbolon.ISshAgent` and one byte array,
-a whole agent request message (length prefix included), and whose reply
-parcel holds no exception and one byte array, the whole reply message.
-Calls block until the principal answers the consent sheet; Pylon never
-makes them on its main thread. In the core the agent is then reached
+signer against the Symbolon release certificates Pylon pins (SHA-256).
+Every data parcel starts with the interface token `dev.symbolon.ISshAgent`
+and a `long` connection number of Pylon's choosing: one per terminal
+session, so a `session-bind` holds for the signature that follows it.
+Every reply parcel starts with no exception.
+
+| Transaction | Data | Reply |
+|---|---|---|
+| `CALL` (`FIRST_CALL_TRANSACTION`) | conn, `byte[]` request message (length prefix included) | `int 0`, `byte[]` reply message; or `int 1`, `PendingIntent`; or `int -1` |
+| `WAIT` (`+1`) | conn | `int 0`, `byte[]` reply message (waits up to 6 minutes); or `int -1` |
+| `CLOSE` (`+2`) | conn | nothing |
+
+Identities and binds are answered at once. A signature needs the
+principal: the reply is a `PendingIntent` for Symbolon's consent
+activity, which Pylon, in front because the principal is using it,
+starts (a background service may not start an activity on current
+Android, and should not), then `WAIT`s for the answer. `-1` (refused,
+failed, or a caller Symbolon does not list) reaches the core as the
+agent's failure message. Calls block; Pylon never makes them on its main
+thread, and `CLOSE`s the connection when the session ends (Symbolon also
+ends connections idle for 30 seconds). In the core the agent is reached
 through the app (`PYLON_AGENT=app` with `--app`): requests leave as
 frames of type 3 and replies return as frames of type 3, and the app
 sends nothing else until the core's ready frame (type 4).
+
+The consent sheet shows the calling app by its label and package, named
+from its verified signature, and the server's host key fingerprint the
+session is bound to; Pylon's own host trust (section 8) decides the server,
+since Symbolon holds no `known_hosts` for it.
 
 ### 7.4 Desktop
 

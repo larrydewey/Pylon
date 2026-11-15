@@ -25,7 +25,8 @@ Future<Backend> makeBackend() async {
       await File('$pylond/pylond-$arch').writeAsBytes(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes), flush: true);
     }
     return ProcessBackend.at('$bin/libpylon.so', '$bin/libpylon_term.so', pylond, '$files/pylon',
-        agent: (req) async => await platform.invokeMethod<Uint8List>('agent', req));
+        agent: (conn, req) async => await platform.invokeMethod<Uint8List>('agent', {'conn': conn, 'request': req}),
+        agentClose: (conn) => platform.invokeMethod('agentClose', conn));
   }
   final env = Platform.environment;
   if (env['PYLON_DEMO'] == '1') return DemoBackend();

@@ -20,12 +20,18 @@ class ProcessBackend implements Backend {
 
   /// Explicit paths (Android: the native library directory for the core,
   /// a directory of pylond builds per machine type).
-  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent});
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose});
 
   /// Where the core's agent requests go when it has no SSH_AUTH_SOCK
-  /// (Android: Symbolon's agent service, SPEC 7.3). Gets one agent-protocol
-  /// message and returns the reply message, or null when there is no agent.
-  Future<Uint8List?> Function(Uint8List request)? agent;
+  /// (Android: Symbolon's agent service, SPEC 7.3). Gets a session's
+  /// connection number and one agent-protocol message, and returns the
+  /// reply message, or null when there is no agent.
+  Future<Uint8List?> Function(int conn, Uint8List request)? agent;
+
+  /// Ends a session's agent connection.
+  void Function(int conn)? agentClose;
+
+  int _conns = 0;
 
   final String pylonPath, termPath;
 
@@ -97,6 +103,7 @@ class _ProcSession extends Session {
   // Until the core says the terminal is ready (frame 4) it reads nothing
   // but agent replies: keys and sizes wait here.
   bool _ready = false;
+  late final int _agentConn = ++b._conns;
   final List<Uint8List> _held = [];
 
   void _toConn(Uint8List f) {
@@ -155,7 +162,7 @@ class _ProcSession extends Session {
   Future<void> _agentRequest(Uint8List req) async {
     final a = b.agent;
     // No agent: an empty failure message (SSH_AGENT_FAILURE).
-    final reply = a == null ? null : await a(req);
+    final reply = a == null ? null : await a(_agentConn, req);
     _conn?.stdin.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
   }
 
@@ -190,6 +197,7 @@ class _ProcSession extends Session {
 
   @override
   void close() {
+    b.agentClose?.call(_agentConn);
     _conn?.kill();
     _term?.kill();
   }
