@@ -253,6 +253,10 @@ except socket.timeout:
         python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
     check "pylon protocol: a terminal that roams mid-session" 0 "interactive ok" \
         env PYLON_TEST_REBIND_AFTER=60 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+    check "pylon protocol: re-attach from a new client (screen and shell kept)" 0 "reattach ok" \
+        python3 "$(dirname "$HOSTILE")/attach_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+    check "pylon protocol: one session daemon serves every client" 0 "1" \
+        bash -c "pgrep -fc 'pylond-.* serve'"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
         "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
     pkill -f "pylond-.* serve" 2>/dev/null

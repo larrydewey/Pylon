@@ -20,9 +20,12 @@ pub Str push_command(Str hash) {
         + "test \"$(sha256sum \"$f.tmp\" | cut -c1-64)\" = " + hash + " && chmod 500 \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\" && echo PYLOND-OK";
 }
 
-// The command that starts it: the hash checked again, then exec.
-pub Str run_command(Str hash, Int idle) {
-    return "f=\"$HOME/.cache/pylon/pylond-" + hash + "\"; test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --idle " + f"{idle}";
+// The command that starts it: the hash checked again, then exec, with a
+// 0700 per-user directory for the session daemon's control socket
+// (pylond refuses one it does not own or that others can enter).
+pub Str run_command(Str hash, Int idle, Bool ephemeral) {
+    return "f=\"$HOME/.cache/pylon/pylond-" + hash + "\"; r=\"${XDG_RUNTIME_DIR:-/tmp}/pylon-$(id -u)\"; (umask 077; mkdir -p \"$r\") && "
+        + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + if (ephemeral) { " --ephemeral" } else { "" };
 }
 
 pub type Pushed = { Conn c; Str err; };
@@ -42,11 +45,11 @@ pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
 pub type Started = { Conn c; Boot b; BootC bc; Str err; };
 
 @requires(network, declassify)
-pub Started start_pylond(Conn c0, Str hash, Int idle) {
+pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral) {
     BootC bc = boot_client_new();
     Chan ch = open_session(c0);
     if (!chan_ok(ch)) { return Started {.c = ch.c, .b = boot_finish(bc, []), .bc = bc, .err = ch.err}; }
-    Chan ex = exec(capturing(ch), run_command(hash, idle));
+    Chan ex = exec(capturing(ch), run_command(hash, idle, ephemeral));
     Chan sent = send_data(ex, boot_hello(bc));
     Chan got = await_bytes(sent, boot_reply_len());
     if (!chan_ok(got) || got.inbox.len() < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }
@@ -202,3 +205,56 @@ Int exit_of(List(List(Int)) xs, Int sid, Int i) {
     if (xs[i][0] == sid) { return xs[i][1]; }
     return exit_of(xs, sid, i + 1);
 }
+
+// ============================================================================
+// Sessions pylond keeps
+// ============================================================================
+
+// Each item: [id, attached, rows, cols, idle seconds, title bytes...].
+pub type Listed = { Link l; Bool ok; List(List(Int)) items; };
+
+// LIST until a SESSIONS answer for the nonce arrives (ten tries, 300 ms apart).
+@requires(network, declassify, clock(readonly))
+pub Listed list_sessions(Link l, Int tries, Int now) {
+    if (tries >= 10) { return Listed {.l = l, .ok = false, .items = []}; }
+    Int nonce = 1000 + tries;
+    Link l1 = ask_sessions(l, nonce, now);
+    List(Int) ready = resid_tcp_poll([l1.udp], [1], 300);
+    Drained g = drain(l1, clock.monotonic_ns(), 64, []);
+    List(Int) got = answer(events(g.l).sessions, nonce, 0);
+    if (got.len() > 0) { return Listed {.l = events_taken(g.l), .ok = true, .items = items_of(got, 1, got[0], [])}; }
+    return list_sessions(g.l, tries + 1, clock.monotonic_ns());
+}
+
+List(Int) answer(List(List(Int)) xs, Int nonce, Int i) {
+    if (i >= xs.len()) { return []; }
+    if (xs[i].len() >= 2 && xs[i][0] == nonce) { return xs[i][1..xs[i].len()]; }
+    return answer(xs, nonce, i + 1);
+}
+
+List(List(Int)) items_of(List(Int) b, Int at, Int n, List(List(Int)) acc) {
+    if (n <= 0 || at + 14 > b.len()) { return acc; }
+    Int tl = b[at + 13];
+    if (at + 14 + tl > b.len()) { return acc; }
+    List(Int) it = [be32(b, at), b[at + 4], b[at + 5] * 256 + b[at + 6], b[at + 7] * 256 + b[at + 8], be32(b, at + 9)].concat(b[at + 14..at + 14 + tl]);
+    return items_of(b, at + 14 + tl, n - 1, acc.concat([it]));
+}
+
+// The most recently used detached session, else the most recently used
+// one (its client may be gone without a word: it is taken over), or -1.
+pub Int detached(List(List(Int)) items, Int i) {
+    if (i >= items.len()) { return if (items.len() > 0) { items[0][0] } else { -1 }; }
+    if (items[i][1] == 0) { return items[i][0]; }
+    return detached(items, i + 1);
+}
+
+pub Bool print_sessions(List(List(Int)) items, Int i) {
+    if (i == 0) { println(if (items.len() == 0) { "no sessions" } else { "ID      STATE     SIZE      IDLE  TITLE" }); }
+    if (i >= items.len()) { return true; }
+    List(Int) it = items[i];
+    Str state = if (it[1] == 1) { "attached" } else { "detached" };
+    println(pad(f"{it[0]}", 8) + pad(state, 10) + pad(f"{it[3]}x{it[2]}", 10) + pad(f"{it[4]}s", 6) + display_text(it[5..it.len()]));
+    return print_sessions(items, i + 1);
+}
+
+Str pad(Str s, Int n) { return if (str_len(s) >= n) { s + " " } else { pad(s + " ", n) }; }

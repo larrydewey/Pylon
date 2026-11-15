@@ -15,6 +15,13 @@
 //   PING   6
 //   SHELL  7 | sid (4) | rows (2) | cols (2)                 client -> pylond
 //   RESIZE 9 | sid (4) | rows (2) | cols (2)                 client -> pylond
+//   ATTACH 10 | sid (4) | session (4) | rows (2) | cols (2)  client -> pylond
+//   LIST   11 | nonce (4)                                    client -> pylond
+//   SESSIONS 12 | nonce (4) | count (1) | count x            pylond -> client
+//            (session (4) | attached (1) | rows (2) | cols (2) | idle s (4) |
+//             title length (1) | title)
+// LIST and SESSIONS are not acknowledged: the client asks again until it
+// has an answer for its nonce.
 // Reliability is go-back-N: a sender keeps its unacknowledged bytes and,
 // after 300 ms without progress, sends them again from the first one; a
 // receiver takes only the next byte it expects. The window is 256 KiB.
@@ -49,16 +56,26 @@ pub type St = { Int id; Int fd; Int acked; List(Int) unacked; Int next; Int recv
     Bool ext; List(Int) inbox; Int code; };
 
 // What happened that the program must act on: terminals asked for
-// ([sid, rows, cols]), resizes ([sid, rows, cols]) and terminal exits
-// ([sid, code]).
-pub type Ev = { List(List(Int)) shells; List(List(Int)) resizes; List(List(Int)) exits; };
+// ([sid, rows, cols]), resizes ([sid, rows, cols]), terminal exits
+// ([sid, code]), attaches ([sid, session, rows, cols]), session lists
+// asked for ([nonce]) and received ([nonce, payload...]).
+pub type Ev = { List(List(Int)) shells; List(List(Int)) resizes; List(List(Int)) exits; List(List(Int)) attaches; List(List(Int)) lists; List(List(Int)) sessions; };
 
 pub type Link = {
     Bool server; Int udp; List(Int) addr; Int port; SessionKeys k; Int tx_ctr; Window win;
     List(St) streams; Int next_sid; Int last_rx; Int last_tx; Str err; Ev ev;
 };
 
-Ev ev_none() { return Ev {.shells = [], .resizes = [], .exits = []}; }
+Ev ev_none() { return Ev {.shells = [], .resizes = [], .exits = [], .attaches = [], .lists = [], .sessions = []}; }
+
+// One event added: kind 0 shell, 1 resize, 2 exit, 3 attach, 4 list, 5 sessions.
+Link ev_add(Link l, Int kind, List(Int) v) {
+    Ev e = l.ev;
+    Ev n = Ev {.shells = if (kind == 0) { e.shells.concat([v]) } else { e.shells }, .resizes = if (kind == 1) { e.resizes.concat([v]) } else { e.resizes },
+        .exits = if (kind == 2) { e.exits.concat([v]) } else { e.exits }, .attaches = if (kind == 3) { e.attaches.concat([v]) } else { e.attaches },
+        .lists = if (kind == 4 && e.lists.len() < 4) { e.lists.concat([v]) } else { e.lists }, .sessions = if (kind == 5) { e.sessions.concat([v]) } else { e.sessions }};
+    return with_ev(l, n);
+}
 
 pub Link link_new(Bool server, Int udp, List(Int) addr, Int port, SessionKeys k, Int now) {
     return Link {.server = server, .udp = udp, .addr = addr, .port = port, .k = k, .tx_ctr = 0, .win = window_new(),
@@ -186,6 +203,22 @@ pub Link open_shell(Link l, Int rows, Int cols, Int now) {
         .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev};
 }
 
+// Attach to a session pylond keeps (the client): ATTACH, then an
+// external stream whose first bytes repaint the session's screen.
+@requires(network, declassify)
+pub Link attach(Link l, Int session, Int rows, Int cols, Int now) {
+    Int sid = l.next_sid;
+    List(Int) f = [10].concat(u32_be(sid)).concat(u32_be(session)).concat(u16(rows)).concat(u16(cols));
+    Link l2 = send_frame(l, f, now);
+    Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, -1, now)]));
+    return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev};
+}
+
+// Ask pylond for its sessions (answered with SESSIONS for this nonce).
+@requires(network, declassify)
+pub Link ask_sessions(Link l, Int nonce, Int now) { return send_frame(l, [11].concat(u32_be(nonce)), now); }
+
 // The client's terminal changed size. Sent twice: it is not acknowledged,
 // and the latest size is sent again with every keepalive (resend_size).
 @requires(network, declassify)
@@ -310,14 +343,20 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
     if (t == 7) { return if (l.server && i < 0 && f.len() == 9 && sid % 2 == 1) { on_shell(l, sid, f, now) } else { l }; }
     if (t == 9) {
         Bool ok = l.server && i >= 0 && f.len() == 9 && l.streams[i].ext;
-        return if (ok) { with_ev(l, Ev {.shells = l.ev.shells, .resizes = l.ev.resizes.concat([[sid, f[5] * 256 + f[6], f[7] * 256 + f[8]]]), .exits = l.ev.exits}) } else { l };
+        return if (ok) { ev_add(l, 1, [sid, f[5] * 256 + f[6], f[7] * 256 + f[8]]) } else { l };
     }
+    if (t == 10) {
+        Bool ok = l.server && i < 0 && f.len() == 13 && sid % 2 == 1;
+        return if (ok) { ev_add(with_streams(l, l.streams.concat([st_new(sid, -1, now)])), 3, [sid, be32(f, 5), f[9] * 256 + f[10], f[11] * 256 + f[12]]) } else { l };
+    }
+    if (t == 11) { return if (l.server && f.len() == 5) { ev_add(l, 4, [sid]) } else { l }; }
+    if (t == 12) { return if (!l.server) { ev_add(l, 5, [sid].concat(f[5..f.len()])) } else { l }; }
     if (i < 0) { return if (t == 2 || t == 4) { send_frame(l, f_rst(sid), now) } else { l }; }
     St s = l.streams[i];
     if (t == 5) {
         _ = if (s.ext) { true } else { resid_tcp_close(s.fd) };
         Link gone = with_streams(l, drop(l.streams, i));
-        return if (s.ext) { with_ev(gone, Ev {.shells = gone.ev.shells, .resizes = gone.ev.resizes, .exits = gone.ev.exits.concat([[sid, -1]])}) } else { gone };
+        return if (s.ext) { ev_add(gone, 2, [sid, -1]) } else { gone };
     }
     if (f.len() < 13) { return l; }
     Int off = be64(f, 5);
@@ -348,7 +387,7 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
         Bool first = here && !s.fin_in;
         St s2 = st_fin_in(s, s.fin_in || here, code);
         Link l1 = if (here || s.fin_in) { send_frame(with_streams(l, put(l.streams, i, s2)), f_ack(sid, off + 1), now) } else { l };
-        Link l2 = if (first && s.ext && !l.server) { with_ev(l1, Ev {.shells = l1.ev.shells, .resizes = l1.ev.resizes, .exits = l1.ev.exits.concat([[sid, code]])}) } else { l1 };
+        Link l2 = if (first && s.ext && !l.server) { ev_add(l1, 2, [sid, code]) } else { l1 };
         return finish(l2, i);
     }
     return l;
@@ -384,8 +423,7 @@ Link on_open(Link l, Int sid, List(Int) f, Int now) {
 Link on_shell(Link l, Int sid, List(Int) f, Int now) {
     Int rows = f[5] * 256 + f[6];
     Int cols = f[7] * 256 + f[8];
-    Link l2 = with_streams(l, l.streams.concat([st_new(sid, -1, now)]));
-    return with_ev(l2, Ev {.shells = l2.ev.shells.concat([[sid, rows, cols]]), .resizes = l2.ev.resizes, .exits = l2.ev.exits});
+    return ev_add(with_streams(l, l.streams.concat([st_new(sid, -1, now)])), 0, [sid, rows, cols]);
 }
 
 // The program could not serve an external stream: RST, and forget it.
@@ -432,18 +470,36 @@ pub Drained drain(Link l, Int now, Int budget, List(List(Int)) other) {
     if (budget <= 0) { return Drained {.l = l, .other = other}; }
     List(Int) d = resid_udp_recv_from(l.udp, 2048);
     if (d.len() < 6) { return Drained {.l = l, .other = other}; }
-    List(Int) pkt = d[6..d.len()];
-    if (data_idx(pkt) != l.k.my_idx || !l.k.ok) { return drain(l, now, budget - 1, other.concat([d])); }
-    DataIn o = data_open(l.k, pkt);
-    if (!o.ok) { return drain(l, now, budget - 1, other); }
+    if (!for_link(l, d)) { return drain(l, now, budget - 1, other.concat([d])); }
+    return drain(link_input(l, d, now), now, budget - 1, other);
+}
+
+// Whether a received datagram ([addr, port, packet...]) is a data packet
+// for this link's keys.
+pub Bool for_link(Link l, List(Int) d) { return d.len() > 6 && l.k.ok && data_idx(d[6..d.len()]) == l.k.my_idx; }
+
+// One received datagram for this link: opened, checked against the replay
+// window, and its frame handled; dropped silently when it fails.
+@requires(network, declassify)
+pub Link link_input(Link l, List(Int) d, Int now) {
+    DataIn o = data_open(l.k, d[6..d.len()]);
+    if (!o.ok) { return l; }
     Seen sn = window_take(l.win, o.ctr);
-    if (!sn.fresh) { return drain(l, now, budget - 1, other); }
+    if (!sn.fresh) { return l; }
     // Roaming: pylond follows the client to the address it now sends from.
     List(Int) addr = if (l.server) { d[0..4] } else { l.addr };
     Int port = if (l.server) { d[4] * 256 + d[5] } else { l.port };
     Link l2 = Link {.server = l.server, .udp = l.udp, .addr = addr, .port = port, .k = l.k, .tx_ctr = l.tx_ctr, .win = sn.w,
         .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = l.last_tx, .err = l.err, .ev = l.ev};
-    return drain(on_frame(l2, o.payload, now), now, budget - 1, other);
+    return on_frame(l2, o.payload, now);
+}
+
+// Every stream's external end (pylond detaching a client: its terminals
+// stay, their streams go).
+pub List(Int) ext_sids(Link l) { return ext_acc(l.streams, 0, []); }
+List(Int) ext_acc(List(St) ss, Int i, List(Int) acc) {
+    if (i >= ss.len()) { return acc; }
+    return ext_acc(ss, i + 1, if (ss[i].ext) { acc.concat([ss[i].id]) } else { acc });
 }
 
 // A keepalive after 10 s of sending nothing (keeps NAT bindings and the
