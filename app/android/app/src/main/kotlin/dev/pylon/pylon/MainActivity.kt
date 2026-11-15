@@ -14,6 +14,8 @@ import io.flutter.plugin.common.MethodChannel
  * unless the principal turns that off (SPEC 15).
  */
 class MainActivity : FlutterActivity() {
+    private val agent by lazy { SymbolonAgent(applicationContext) }
+
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
@@ -29,6 +31,15 @@ class MainActivity : FlutterActivity() {
                         "files" to filesDir.absolutePath,
                     )
                 )
+                "agent" -> {
+                    val req = call.arguments as? ByteArray
+                    if (req == null) { result.success(null) } else {
+                        Thread {
+                            val r = agent.call(req)
+                            runOnUiThread { result.success(r) }
+                        }.start()
+                    }
+                }
                 "secure" -> {
                     val on = call.arguments as? Boolean ?: true
                     runOnUiThread {

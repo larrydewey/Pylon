@@ -17,6 +17,10 @@ android {
     // The Resid core ships as executables named lib*.so (jniLibs/arm64-v8a,
     // copied there by tools/android-core.sh); they must be extracted to
     // nativeLibraryDir to be executable.
+    buildFeatures {
+        buildConfig = true
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -31,6 +35,9 @@ android {
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
         // flag during build.
+        // Symbolon's release certificates (SHA-256, comma-separated): the only
+        // agent service Pylon binds (SPEC 7.3). Empty: no agent on Android.
+        buildConfigField("String", "SYMBOLON_CERTS", "\"" + (project.findProperty("symbolonCerts") ?: "") + "\"")
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

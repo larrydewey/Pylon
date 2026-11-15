@@ -38,6 +38,7 @@ List(Int) read_exact(Int fd, Int n, List(Int) acc) {
 // needs to read the consent sheet, so the deadline is generous (5 min).
 @requires(network)
 AgentReply call(Int fd, Int t, List(Int) body) {
+    if (fd == app_agent()) { return app_call(t, body); }
     if (!resid_unix_send(fd, agent_msg(t, body))) { return AgentReply {.t = -1, .body = []}; }
     _ = resid_unix_deadline(fd, 300000);
     List(Int) h = read_exact(fd, 4, []);
@@ -48,8 +49,40 @@ AgentReply call(Int fd, Int t, List(Int) body) {
     return AgentReply {.t = b[0], .body = b[1..n]};
 }
 
+// The agent reached through the app (PYLON_AGENT=app, with --app): on
+// Android the agent is Symbolon's service, which the app binds (SPEC
+// 7.3). Each request leaves as a frame of type 3 on standard output and
+// its reply comes back as a frame of type 3 on standard input, the agent
+// protocol's messages unchanged. Other frames arriving meanwhile (keys,
+// sizes, before the terminal exists) are dropped.
+pub Int app_agent() { return -2; }
+
+AgentReply app_call(Int t, List(Int) body) {
+    _ = print_bytes([3].concat(u32_be(body.len() + 5)).concat(agent_msg(t, body)));
+    List(Int) m = app_reply([]);
+    Int n = if (m.len() >= 4) { be32(m, 0) } else { -1 };
+    if (n < 1 || n > 262144 || m.len() != 4 + n) { return AgentReply {.t = -1, .body = []}; }
+    return AgentReply {.t = m[4], .body = m[5..4 + n]};
+}
+
+// The payload of the next type-3 frame on standard input, or [] at its end.
+List(Int) app_reply(List(Int) buf) {
+    if (buf.len() >= 5) {
+        Int n = be32(buf, 1);
+        if (n > 300000) { return []; }
+        if (buf.len() >= 5 + n) {
+            if (buf[0] == 3) { return buf[5..5 + n]; }
+            return app_reply(buf[5 + n..buf.len()]);
+        }
+    }
+    List(Int) more = resid_read_some(65536);
+    if (more.len() == 0) { return []; }
+    return app_reply(buf.concat(more));
+}
+
 @requires(network, environment)
 pub Int agent_connect() {
+    if (environment.get("PYLON_AGENT") == "app") { return app_agent(); }
     Str path = environment.get("SSH_AUTH_SOCK");
     if (str_len(path) == 0) { return -1; }
     return resid_unix_connect(path);

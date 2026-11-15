@@ -143,7 +143,7 @@ Authed login(Str user, Str host, Opts o, Int via) {
     List(List(Int)) pinned = pinned_for(host_token(host, o.port));
     Int agent = agent_connect();
     Conn none = conn_new(-1);
-    if (agent < 0) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
+    if (agent == -1) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
     List(Ident) ids = agent_ids(agent);
     if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
@@ -302,7 +302,7 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
         Int pick = detached(found.items, 0);
         _ = if (pick >= 0) { eprintln("pylon: attaching to session " + f"{pick}") } else { true };
         Link l1 = if (pick >= 0) { attach(found.l, pick, rows, cols, clock.monotonic_ns()) } else { open_shell(found.l, rows, cols, clock.monotonic_ns()) };
-        _ = if (app) { false } else { resid_term_raw() };
+        _ = if (app) { print_bytes(app_frame(4, [])) } else { resid_term_raw() };
         Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk, .app = App {.on = app, .buf = []}}, ls);
         _ = if (app) { false } else { resid_term_restore() };
         return code;
@@ -357,7 +357,7 @@ Chan run_shell(Chan ch, Str term0, Bool obfuscate, Bool app) {
     Int rows = if (app) { 24 } else { resid_term_rows() };
     Chan s = shell(ch, term, cols, rows);
     if (!chan_ok(s)) { return s; }
-    _ = if (app) { false } else { resid_term_raw() };
+    _ = if (app) { print_bytes(app_frame(4, [])) } else { resid_term_raw() };
     Chan done = interact(if (app) { capturing(s) } else { s }, cols, rows, false, keys_new(obfuscate), App {.on = app, .buf = []});
     _ = if (app) { false } else { resid_term_restore() };
     return done;

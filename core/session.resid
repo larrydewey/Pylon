@@ -283,7 +283,10 @@ pub Int wait_ms(Keys k, Int now) {
 // Ends when the server closes the channel.
 // App mode (`pylon --app`): no terminal. Standard input carries frames,
 // type (1) | length (4) | payload: 1 keys, 2 a size (rows (2) | cols (2));
-// the host's output leaves as frames of type 1 on standard output.
+// the host's output leaves as frames of type 1 on standard output. Frame 4
+// (empty) says the terminal is ready: until then the app sends nothing but
+// replies to agent requests (frames 3, core/agent.resid), and holds keys
+// and sizes.
 pub type App = { Bool on; List(Int) buf; };
 
 pub App app_off() { return App {.on = false, .buf = []}; }

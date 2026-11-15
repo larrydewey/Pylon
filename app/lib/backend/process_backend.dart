@@ -20,7 +20,12 @@ class ProcessBackend implements Backend {
 
   /// Explicit paths (Android: the native library directory for the core,
   /// a directory of pylond builds per machine type).
-  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home);
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent});
+
+  /// Where the core's agent requests go when it has no SSH_AUTH_SOCK
+  /// (Android: Symbolon's agent service, SPEC 7.3). Gets one agent-protocol
+  /// message and returns the reply message, or null when there is no agent.
+  Future<Uint8List?> Function(Uint8List request)? agent;
 
   final String pylonPath, termPath;
 
@@ -32,7 +37,7 @@ class ProcessBackend implements Backend {
 
   String get _pylon => pylonPath;
   String get _hostsFile => '$home/app_hosts.json';
-  Map<String, String> get _env => {'PYLON_HOME': home};
+  Map<String, String> get _env => {'PYLON_HOME': home, if (agent != null) 'PYLON_AGENT': 'app'};
 
   @override
   bool get demo => false;
@@ -88,6 +93,19 @@ class _ProcSession extends Session {
 
   final ProcessBackend b;
   Process? _conn, _term;
+
+  // Until the core says the terminal is ready (frame 4) it reads nothing
+  // but agent replies: keys and sizes wait here.
+  bool _ready = false;
+  final List<Uint8List> _held = [];
+
+  void _toConn(Uint8List f) {
+    if (_ready) {
+      _conn?.stdin.add(f);
+    } else {
+      _held.add(f);
+    }
+  }
   final _fromConn = FrameReader(), _fromTerm = FrameReader();
 
   Future<void> _start(int rows, int cols) async {
@@ -107,7 +125,17 @@ class _ProcSession extends Session {
     _term!.stdout.listen(_onTerm);
     _conn!.stdout.listen((d) {
       for (final (t, p) in _fromConn.add(d)) {
-        if (t == 1) _term?.stdin.add(frame(1, p));
+        if (t == 1) {
+          _term?.stdin.add(frame(1, p));
+        } else if (t == 3) {
+          _agentRequest(Uint8List.fromList(p));
+        } else if (t == 4 && !_ready) {
+          _ready = true;
+          for (final f in _held) {
+            _conn?.stdin.add(f);
+          }
+          _held.clear();
+        }
       }
     });
     // The core's own messages (prompts, refusals) are text for the
@@ -124,6 +152,13 @@ class _ProcSession extends Session {
     resize(rows, cols);
   }
 
+  Future<void> _agentRequest(Uint8List req) async {
+    final a = b.agent;
+    // No agent: an empty failure message (SSH_AGENT_FAILURE).
+    final reply = a == null ? null : await a(req);
+    _conn?.stdin.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
+  }
+
   void _onTerm(List<int> d) {
     for (final (t, p) in _fromTerm.add(d)) {
       if (t == 1) {
@@ -133,7 +168,7 @@ class _ProcSession extends Session {
           if (status.startsWith('Connecting')) status = '';
         }
       } else if (t == 2) {
-        _conn?.stdin.add(frame(1, p)); // fixed-format replies go back to the host
+        _toConn(frame(1, p)); // fixed-format replies go back to the host
       } else if (t == 3) {
         title = String.fromCharCodes(p);
       } else if (t == 4) {
@@ -144,12 +179,12 @@ class _ProcSession extends Session {
   }
 
   @override
-  void input(List<int> bytes) => _conn?.stdin.add(frame(1, bytes));
+  void input(List<int> bytes) => _toConn(frame(1, bytes));
 
   @override
   void resize(int rows, int cols) {
     final p = [(rows >> 8) & 255, rows & 255, (cols >> 8) & 255, cols & 255];
-    _conn?.stdin.add(frame(2, p));
+    _toConn(frame(2, p));
     _term?.stdin.add(frame(2, p));
   }
 

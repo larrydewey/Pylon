@@ -175,6 +175,8 @@ check "interactive shell: type, resize, paste, exit status" 0 "interactive ok" \
     python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
 check "app mode: a session over framed pipes" 0 "app ok" \
     python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
+check "app mode: the agent reached through the app (Android's path)" 0 "agent through the app" \
+    python3 "$(dirname "$HOSTILE")/app_drive.py" --bridge-agent "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
 check "app mode: the emulator process (confined)" 0 "term process ok" \
     python3 "$(dirname "$HOSTILE")/term_proc.py" "$(dirname "$PYLON")/pylon-term"
 FLUTTER="${FLUTTER:-$(command -v flutter || echo /home/user/tools/flutter/bin/flutter)}"

@@ -297,6 +297,19 @@ paths share one code path in the core. The consent sheet is Symbolon's
 own activity, with `FLAG_SECURE` and overlay protection
 (`setHideOverlayWindows`) against A4.
 
+The interface, exactly (v1): Pylon binds `Intent("dev.symbolon.action.SSH_AGENT")`
+in package `dev.symbolon.app`, only after checking that package's sole
+signer against the Symbolon release certificates Pylon pins (SHA-256);
+each call is one `transact(FIRST_CALL_TRANSACTION)` whose data parcel
+holds the interface token `dev.symbolon.ISshAgent` and one byte array,
+a whole agent request message (length prefix included), and whose reply
+parcel holds no exception and one byte array, the whole reply message.
+Calls block until the principal answers the consent sheet; Pylon never
+makes them on its main thread. In the core the agent is then reached
+through the app (`PYLON_AGENT=app` with `--app`): requests leave as
+frames of type 3 and replies return as frames of type 3, and the app
+sends nothing else until the core's ready frame (type 4).
+
 ### 7.4 Desktop
 
 On Linux, Windows and macOS the core speaks the same protocol to
