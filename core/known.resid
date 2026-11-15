@@ -1,6 +1,13 @@
 // Pinned host keys (SPEC 6.1.3), phase 0: a local file of lines
 //
-//   HOST:PORT ALG BASE64
+//   HOST:PORT ALG BASE64 [pinned=YYYY-MM-DD] [by=DEVICE]
+//
+// and an append-only history of what happened to pins (SPEC 6.2):
+//
+//   YYYY-MM-DD EVENT HOST:PORT FINGERPRINT [DETAIL]
+//
+// Pinning a host replaces whatever was pinned for it: after a key change
+// the old key is no longer trusted.
 //
 // in $PYLON_HOME/known_hosts (default ~/.config/pylon). In phase 1 these
 // become Symbolon `pylon-host` vault items, synchronized and MAC'd
@@ -38,10 +45,110 @@ List(List(Int)) pins_acc(List(Str) lines, Str token, Int i, List(List(Int)) acc)
     return pins_acc(lines, token, i + 1, if (good) { acc.concat([blob]) } else { acc });
 }
 
-@requires(filesystem, environment)
-pub Bool pin(Str token, List(Int) blob) {
+// A pin with when and where it was made ("" when the line does not say).
+pub type Pin = { List(Int) blob; Str when; Str by; };
+
+@requires(filesystem(readonly), environment)
+pub List(Pin) pins_for(Str token) {
+    Str path = pylon_home() + "/known_hosts";
+    if (!filesystem.exists(path)) { return []; }
+    return pin_acc(str_split(filesystem.read_all(path), "\n"), token, 0, []);
+}
+
+List(Pin) pin_acc(List(Str) lines, Str token, Int i, List(Pin) acc) {
+    if (i >= lines.len()) { return acc; }
+    List(Str) f = str_split(str_trim(lines[i]), " ");
+    Bool hit = f.len() >= 3 && f[0] == token;
+    List(Int) blob = if (hit) { base64_decode(f[2]) } else { [] };
+    Option(PubKey) k = if (hit) { key_of_blob(blob) } else { None };
+    Bool good = match k { None => false, Some(x) => x.alg == f[1] };
+    Pin p = Pin {.blob = blob, .when = field(f, "pinned=", 3), .by = field(f, "by=", 3)};
+    return pin_acc(lines, token, i + 1, if (good) { acc.concat([p]) } else { acc });
+}
+
+Str field(List(Str) f, Str key, Int i) {
+    if (i >= f.len()) { return ""; }
+    if (str_starts_with(f[i], key)) { return str_slice(f[i], str_len(key), str_len(f[i])); }
+    return field(f, key, i + 1);
+}
+
+// Pin `blob` for `token`, replacing any key pinned for it before.
+@requires(filesystem, environment, clock(readonly))
+pub Bool pin(Str token, List(Int) blob, Str by) {
     Str dir = pylon_home();
     _ = filesystem.create_dir(dir);
     Str path = dir + "/known_hosts";
-    return filesystem.append_bytes(path, bytes_of(token + " " + key_line(blob) + "\n"));
+    List(Str) old = if (filesystem.exists(path)) { str_split(filesystem.read_all(path), "\n") } else { [] };
+    List(Pin) before = pins_for(token);
+    Str day = today();
+    Str line = token + " " + key_line(blob) + " pinned=" + day + " by=" + safe_word(by);
+    Str kept = str_join(other_lines(old, token, 0, []), "\n");
+    Bool ok = filesystem.write_all(path, (if (str_len(kept) > 0) { kept + "\n" } else { "" }) + line + "\n");
+    Str ev = if (before.len() == 0) { "pinned" } else { if (pin_has(before, blob, 0)) { "pinned-again" } else { "re-pinned" } };
+    _ = history(ev, token, fingerprint(blob), if (ev == "re-pinned") { "replacing " + fingerprint(before[0].blob) } else { "" });
+    return ok;
 }
+
+Bool pin_has(List(Pin) ps, List(Int) b, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (same_bytes(ps[i].blob, b)) { return true; }
+    return pin_has(ps, b, i + 1);
+}
+
+List(Str) other_lines(List(Str) ls, Str token, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    Str t = str_trim(ls[i]);
+    Bool drop = str_len(t) == 0 || str_starts_with(t, token + " ");
+    return other_lines(ls, token, i + 1, if (drop) { acc } else { acc.concat([t]) });
+}
+
+// One line of pin history.
+@requires(filesystem, environment, clock(readonly))
+pub Bool history(Str event, Str token, Str fpr, Str detail) {
+    Str dir = pylon_home();
+    _ = filesystem.create_dir(dir);
+    return filesystem.append_bytes(dir + "/pin_history", bytes_of(today() + " " + event + " " + token + " " + fpr + (if (str_len(detail) > 0) { " " + detail } else { "" }) + "\n"));
+}
+
+@requires(filesystem(readonly), environment)
+pub List(Str) history_lines(Str token) {
+    Str path = pylon_home() + "/pin_history";
+    if (!filesystem.exists(path)) { return []; }
+    return hist_acc(str_split(filesystem.read_all(path), "\n"), token, 0, []);
+}
+
+List(Str) hist_acc(List(Str) ls, Str token, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(ls[i], " ");
+    Bool hit = f.len() >= 3 && (str_len(token) == 0 || f[2] == token);
+    return hist_acc(ls, token, i + 1, if (hit) { acc.concat([ls[i]]) } else { acc });
+}
+
+// Letters, digits, '.', '-' and '_' only (a device name in a pin line).
+Str safe_word(Str s) { return sw_acc(s, 0, ""); }
+Str sw_acc(Str s, Int i, Str acc) {
+    if (i >= str_len(s) || i >= 64) { return if (str_len(acc) > 0) { acc } else { "this-device" }; }
+    Int c = str_char_at(s, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 95;
+    return sw_acc(s, i + 1, if (ok) { acc + str_slice(s, i, i + 1) } else { acc });
+}
+
+// Today's UTC date as YYYY-MM-DD (days to civil date, after Hinnant).
+@requires(clock(readonly))
+pub Str today() { return civil(clock.now_sec() / 86400); }
+
+pub Str civil(Int days) {
+    Int z = days + 719468;
+    Int era = (if (z >= 0) { z } else { z - 146096 }) / 146097;
+    Int doe = z - era * 146097;
+    Int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    Int y0 = yoe + era * 400;
+    Int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    Int mp = (5 * doy + 2) / 153;
+    Int d = doy - (153 * mp + 2) / 5 + 1;
+    Int m = if (mp < 10) { mp + 3 } else { mp - 9 };
+    Int y = if (m <= 2) { y0 + 1 } else { y0 };
+    return f"{y}-" + two(m) + "-" + two(d);
+}
+
+Str two(Int v) { return if (v < 10) { "0" + f"{v}" } else { f"{v}" }; }

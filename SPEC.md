@@ -586,8 +586,17 @@ than 3 minutes. Streams carry on.
 Limits of v1: `-L` forwards only over the Pylon protocol (`-D`/`-R` stay
 on SSH), an IPv4 literal host, no padding to 64 bytes, no cookie
 (`mac2`), no resume over UDP alone with a ticket (re-attach always takes
-a new SSH login, which is stricter than 10.4 requires), no Landlock or
-seccomp (8.4).
+a new SSH login, which is stricter than 10.4 requires).
+
+Confinement (8.4) as built: the daemon forks a PTY broker (the only
+process that can start the login shell; masters come back over a socket),
+then confines itself before reading any datagram: Landlock (all rights
+beneath `$HOME` and the runtime directory, reading beneath `/etc`, never
+execute) and a seccomp allowlist of its event loop's system calls. Both
+are per thread, so the runtime continues the daemon in a forked,
+single-threaded child; the original process only waits on it. Without
+Landlock pylond refuses to serve unless the client passes
+`--allow-unconfined` for that host.
 
 ## 10. Sessions, screen sync and re-attach
 

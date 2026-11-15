@@ -38,7 +38,7 @@ Opts parse(Int i, Opts o) {
     }
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--attach" || a == "--sessions" || a == "--ephemeral") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if ((a == "-L" || a == "-D" || a == "-R") && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds.concat([str_slice(a, 1, 2) + " " + args.get(i + 1)]), .rest = [], .err = ""}); }
@@ -63,7 +63,8 @@ Int usage() {
     eprintln("       pylon --pylond FILE [-N -L ...] USER@HOST   a terminal or -L forwards over the");
     eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
-    eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
+    eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
+    eprintln("       pylon history [HOST]                    what happened to pins");
     return 2;
 }
 
@@ -83,7 +84,7 @@ Conn dial(Str host, Int port) {
     return c;
 }
 
-@requires(network, filesystem, environment, declassify)
+@requires(network, filesystem, environment, declassify, clock(readonly))
 Int cmd_pin(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Str host = o.rest[0];
@@ -99,7 +100,7 @@ Int cmd_pin(Opts o, Int via) {
         eprintln("       which differs from the fingerprint you gave (" + want + ").");
         return 1;
     }
-    if (!pin(host_token(host, o.port), h.host.blob)) { eprintln("pylon: cannot write " + pylon_home() + "/known_hosts"); return 1; }
+    if (!pin(host_token(host, o.port), h.host.blob, environment.get("HOSTNAME"))) { eprintln("pylon: cannot write " + pylon_home() + "/known_hosts"); return 1; }
     println("pinned " + host_token(host, o.port) + " " + h.host.alg + " " + h.fingerprint);
     return 0;
 }
@@ -134,7 +135,7 @@ Int cmd_run(Opts o, Int via) {
 // Connect, verify the host under its pins, and authenticate through the
 // agent: the steps every command shares. Not ok, with the reason, on any
 // failure (the connection is closed then).
-@requires(network, filesystem, environment, declassify)
+@requires(network, filesystem, environment, declassify, clock(readonly))
 Authed login(Str user, Str host, Opts o, Int via) {
     List(List(Int)) pinned = pinned_for(host_token(host, o.port));
     Int agent = agent_connect();
@@ -145,13 +146,42 @@ Authed login(Str user, Str host, Opts o, Int via) {
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
     Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
-    if (!conn_ok(h.c)) { _ = resid_tcp_close(c.fd); return Authed {.c = h.c, .ok = false, .why = h.c.err}; }
+    if (!conn_ok(h.c)) {
+        _ = resid_tcp_close(c.fd);
+        Bool changed = str_contains(h.c.err, "HOST KEY HAS CHANGED");
+        Str token = host_token(host, o.port);
+        _ = if (changed) { history("refused", token, h.fingerprint, "a key other than the pinned one") } else { true };
+        return Authed {.c = h.c, .ok = false, .why = if (changed) { h.c.err + pin_details(pins_for(token), 0, "") } else { h.c.err }};
+    }
     Authed a = authenticate(h.c, agent, user, ids);
     _ = resid_unix_close(agent);
     if (!a.ok) { _ = disconnect(a.c, "authentication failed"); return a; }
     // Session traffic may idle for a long time: no read deadline now.
     _ = resid_tcp_deadline(a.c.fd, 0);
     return a;
+}
+
+// What was pinned, when and from which device (SPEC 6.2).
+Str pin_details(List(Pin) ps, Int i, Str acc) {
+    if (i >= ps.len()) { return acc; }
+    Str when = if (str_len(ps[i].when) > 0) { " on " + ps[i].when } else { "" };
+    Str by = if (str_len(ps[i].by) > 0) { " from " + ps[i].by } else { "" };
+    return pin_details(ps, i + 1, acc + "\nPinned: " + fingerprint(ps[i].blob) + when + by);
+}
+
+// pylon history [HOST[:PORT]]: what happened to pins (SPEC 6.2).
+@requires(filesystem(readonly), environment)
+Int cmd_history(Opts o) {
+    Str token = if (o.rest.len() == 1) { if (str_contains(o.rest[0], ":")) { str_to_lower(o.rest[0]) } else { host_token(o.rest[0], o.port) } } else { "" };
+    List(Str) ls = history_lines(token);
+    _ = print_lines(ls, 0);
+    return if (ls.len() == 0) { 1 } else { 0 };
+}
+
+Bool print_lines(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    println(display_text(bytes_of(ls[i])));
+    return print_lines(ls, i + 1);
 }
 
 // "USER@HOST:PATH" split, or user "" when malformed.
@@ -168,7 +198,7 @@ Remote parse_remote(Str s) {
 }
 
 // pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL
-@requires(network, filesystem, environment, declassify)
+@requires(network, filesystem, environment, declassify, clock(readonly))
 Int cmd_get(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Remote r = parse_remote(o.rest[0]);
@@ -187,7 +217,7 @@ Int cmd_get(Opts o, Int via) {
 }
 
 // pylon put [-p PORT] LOCAL USER@HOST:REMOTE
-@requires(network, filesystem, environment, declassify)
+@requires(network, filesystem, environment, declassify, clock(readonly))
 Int cmd_put(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Str local = o.rest[0];
@@ -222,7 +252,7 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     Str hash = hex_encode(sha256_bytes(bin));
     Pushed p = push_pylond(c, bin, hash);
     if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return 1; }
-    Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"));
+    Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"));
     if (str_len(st.err) > 0) { eprintln("pylon: " + st.err); return 1; }
     _ = disconnect(st.c, "pylond started");
     Int udp = resid_udp_open();
@@ -313,6 +343,7 @@ Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
 @requires(network, filesystem, environment, declassify, terminal, clock)
 Int dispatch(Str verb, Opts o, Int via) {
     if (verb == "pin") { return cmd_pin(o, via); }
+    if (verb == "history") { return cmd_history(o); }
     if (verb == "get") { return cmd_get(o, via); }
     if (verb == "put") { return cmd_put(o, via); }
     return cmd_run(o, via);
@@ -359,9 +390,10 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pin" || verb == "get" || verb == "put";
+    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
+    if (verb == "history") { return cmd_history(o); }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
 }

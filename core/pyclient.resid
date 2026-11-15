@@ -23,9 +23,9 @@ pub Str push_command(Str hash) {
 // The command that starts it: the hash checked again, then exec, with a
 // 0700 per-user directory for the session daemon's control socket
 // (pylond refuses one it does not own or that others can enter).
-pub Str run_command(Str hash, Int idle, Bool ephemeral) {
+pub Str run_command(Str hash, Int idle, Bool ephemeral, Bool unconfined) {
     return "f=\"$HOME/.cache/pylon/pylond-" + hash + "\"; r=\"${XDG_RUNTIME_DIR:-/tmp}/pylon-$(id -u)\"; (umask 077; mkdir -p \"$r\") && "
-        + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + if (ephemeral) { " --ephemeral" } else { "" };
+        + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + (if (ephemeral) { " --ephemeral" } else { "" }) + (if (unconfined) { " --allow-unconfined" } else { "" });
 }
 
 pub type Pushed = { Conn c; Str err; };
@@ -45,11 +45,11 @@ pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
 pub type Started = { Conn c; Boot b; BootC bc; Str err; };
 
 @requires(network, declassify)
-pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral) {
+pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined) {
     BootC bc = boot_client_new();
     Chan ch = open_session(c0);
     if (!chan_ok(ch)) { return Started {.c = ch.c, .b = boot_finish(bc, []), .bc = bc, .err = ch.err}; }
-    Chan ex = exec(capturing(ch), run_command(hash, idle, ephemeral));
+    Chan ex = exec(capturing(ch), run_command(hash, idle, ephemeral, unconfined));
     Chan sent = send_data(ex, boot_hello(bc));
     Chan got = await_bytes(sent, boot_reply_len());
     if (!chan_ok(got) || got.inbox.len() < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }

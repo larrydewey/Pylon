@@ -83,6 +83,20 @@ check "used publickey-hostbound"               0 "" \
 start_sshd "HostKey $WORK/host_other"
 check "changed host key is refused"            1 "HOST KEY HAS CHANGED" \
     "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "the refusal names the old pin and its date" 1 "Pinned: $(fp host_ed25519.pub) on $(date -u +%Y-%m-%d)" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "re-pinning replaces the old key"         0 "pinned" \
+    "$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_other.pub)"
+check "the new key works"                       0 "after-repin" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo after-repin"
+start_sshd "HostKey $WORK/host_ed25519"
+check "the replaced key is no longer trusted"   1 "HOST KEY HAS CHANGED" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "pin history records the change"         0 "re-pinned 127.0.0.1:$PORT $(fp host_other.pub) replacing $(fp host_ed25519.pub)" \
+    "$PYLON" history 127.0.0.1:$PORT
+check "pin history records refusals"           0 "refused 127.0.0.1:$PORT $(fp host_other.pub)" \
+    "$PYLON" history 127.0.0.1:$PORT
+"$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_ed25519.pub)" > /dev/null
 
 # --- ciphers -----------------------------------------------------------------
 for c in chacha20-poly1305@openssh.com aes256-gcm@openssh.com aes128-gcm@openssh.com; do
@@ -106,6 +120,8 @@ for t in ecdsa rsa; do
     check "host key $t"                        0 "host-$t" \
         "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo host-$t"
 done
+start_sshd "HostKey $WORK/host_ed25519"
+"$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_ed25519.pub)" > /dev/null
 
 # --- user key types ----------------------------------------------------------
 start_sshd "HostKey $WORK/host_ed25519"
@@ -262,8 +278,12 @@ except socket.timeout:
         env PYLON_TEST_REBIND_AFTER=60 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
     check "pylon protocol: re-attach from a new client (screen and shell kept)" 0 "reattach ok" \
         python3 "$(dirname "$HOSTILE")/attach_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
-    check "pylon protocol: one session daemon serves every client" 0 "1" \
+    # One daemon for every client: the confined daemon, its terminal
+    # broker, and the original process waiting on the daemon.
+    check "pylon protocol: one session daemon serves every client" 0 "3" \
         bash -c "pgrep -fc 'pylond-.* serve'"
+    check "pylond: confined (seccomp filter, no new privileges)" 0 "NoNewPrivs:	1 Seccomp:	2" \
+        bash -c "for p in \$(pgrep -f 'pylond-[0-9a-f]* serve'); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
         "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
     pkill -f "pylond-.* serve" 2>/dev/null
