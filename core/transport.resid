@@ -157,22 +157,34 @@ pub Str disconnect_reason(List(Int) p) {
 // The next packet that is not a transport-level message: IGNORE, DEBUG
 // and UNIMPLEMENTED are dropped, GLOBAL_REQUEST is refused (Pylon asks
 // for no server features this way), EXT_INFO is recorded, a KEXINIT
-// starts a rekey, and DISCONNECT ends the connection.
+// starts a rekey, and DISCONNECT ends the connection. It waits for as many
+// packets as that takes: for request/reply steps.
 @requires(network, declassify)
 pub Pkt next_msg(Conn c0) {
+    Pkt k = next_once(c0);
+    if (!conn_ok(k.c) || k.p.len() > 0) { return k; }
+    return next_msg(k.c);
+}
+
+// Exactly one packet: a connection-level message, or (handled here, with
+// an empty payload returned) a transport-level one. Event loops use this,
+// so one readable socket never makes them wait for a second packet that
+// may not come (OpenSSH's host-keys announcement after login, keepalives).
+@requires(network, declassify)
+pub Pkt next_once(Conn c0) {
     Pkt k = recv_packet(c0);
     if (!conn_ok(k.c)) { return k; }
     Int t = k.p[0];
-    if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return next_msg(k.c); }
+    if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return Pkt {.c = k.c, .p = []}; }
     if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
-    if (t == msg_ext_info()) { return next_msg(ext_info(k.c, k.p)); }
+    if (t == msg_ext_info()) { return Pkt {.c = ext_info(k.c, k.p), .p = []}; }
     if (t == msg_global_request()) {
         GotText name = rd_text(rd_at(k.p, 1));
         GotInt want = rd_bool(name.r);
         Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_request_failure()]) } else { k.c };
-        return next_msg(c2);
+        return Pkt {.c = c2, .p = []};
     }
-    if (t == msg_kexinit()) { return next_msg(rekey(k.c, k.p)); }
+    if (t == msg_kexinit()) { return Pkt {.c = rekey(k.c, k.p), .p = []}; }
     return k;
 }
 

@@ -34,19 +34,21 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Host keys | `ssh-ed25519`, `ecdsa-sha2-nistp256/384`, `rsa-sha2-512/256` (RSA ≥ 2048) |
 | Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` |
 | Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound |
-| Sessions | exec with stdout, stderr (escaped) and exit status; flow control; server-initiated rekey |
+| Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; server-initiated rekey |
+| Keystroke timing | obfuscated by default: 20 ms ticks, one-size chaff (PING or IGNORE), checked on the wire; `--no-obfuscate-keystrokes` opts out |
+| Port forwarding | `-N -L [127.0.0.1:]PORT:HOST:HOSTPORT`, loopback binds only, many connections per session |
 | Host trust | pinned keys only (`pylon pin HOST FINGERPRINT`) |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-24 interoperability and hostile-server cases in `tests/interop.sh`,
+32 interoperability, interactive, timing, forwarding and hostile-server
+cases in `tests/interop.sh`,
 known-answer tests for the key derivation in `tests/kex_test.resid`, and
 a mutation fuzzer in `tests/fuzz_proxy.py`.
 
-Next (SPEC 17): interactive shells (needs a non-blocking stdin read in the
-Resid runtime), the hybrid post-quantum key exchanges (needs ML-KEM in
-Resid's standard library), then the Android app. Open compiler warning:
-SPEC Appendix A, I4.
+Next (SPEC 17): ProxyJump and SFTP, the hybrid post-quantum key exchanges
+(needs ML-KEM in Resid's standard library), then the Android app. Open
+compiler warnings: SPEC Appendix A, I6.
 
 ## Build and use
 
@@ -65,7 +67,9 @@ build/pylon alice@example.org uptime
 ```
 
 Options: `-p PORT`, `--allow-no-strict` (per-connection exception for
-servers without the Terrapin fix). Pinned keys live in
+servers without the Terrapin fix), `--no-obfuscate-keystrokes`, `-N -L
+[127.0.0.1:]PORT:HOST:HOSTPORT` (repeatable). With no COMMAND, `pylon
+USER@HOST` opens an interactive shell. Pinned keys live in
 `$PYLON_HOME/known_hosts` (default `~/.config/pylon/known_hosts`).
 
 ## Tests

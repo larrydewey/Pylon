@@ -127,6 +127,32 @@ check "interactive shell: type, resize, paste, exit status" 0 "interactive ok" \
 check "interactive without a terminal is refused" 2 "needs a terminal" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' < /dev/null"
 
+# --- keystroke timing on the wire (SPEC 5) -------------------------------------
+# A recording proxy on another port, pinned with the same key.
+TPORT=$((PORT + 2))
+grep "^127.0.0.1:$PORT " "$PYLON_HOME/known_hosts" | sed "s/^127.0.0.1:$PORT /127.0.0.1:$TPORT /" >> "$PYLON_HOME/known_hosts"
+TIMING="$(dirname "$HOSTILE")/timing_check.py"
+check "keystrokes: fixed 20 ms ticks, one size, chaff" 0 "timing obfuscated" \
+    python3 "$TIMING" $PORT $TPORT -- "$PYLON" -p {port} "$USER_NAME@127.0.0.1"
+check "keystrokes: opting out shows plain timing" 0 "plain timing as expected" \
+    python3 "$TIMING" --expect-plain $PORT $TPORT -- "$PYLON" --no-obfuscate-keystrokes -p {port} "$USER_NAME@127.0.0.1"
+
+# --- local port forwarding ----------------------------------------------------
+mkdir -p www && head -c 5242880 /dev/urandom > www/big.bin && echo forwarded-ok > www/small.txt
+WPORT=$((PORT + 3)); LPORT=$((PORT + 4))
+( cd www && exec python3 -m http.server $WPORT --bind 127.0.0.1 ) > /dev/null 2>&1 & WEB=$!
+"$PYLON" -p $PORT -N -L $LPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1" 2> fwd.log & FWD=$!
+for _ in $(seq 50); do grep -q forwarding fwd.log && break; sleep 0.1; done
+check "forward: a small file through -L"       0 "forwarded-ok" \
+    curl -s "http://127.0.0.1:$LPORT/small.txt"
+check "forward: 5 MiB intact (flow control)"  0 "$(sha256sum www/big.bin | cut -d' ' -f1)" \
+    bash -c "curl -s http://127.0.0.1:$LPORT/big.bin | sha256sum"
+check "forward: four connections at once"      0 "4 of 4" \
+    bash -c "for i in 1 2 3 4; do curl -s http://127.0.0.1:$LPORT/small.txt > c\$i.out & done; wait; echo \"\$(cat c?.out | grep -c forwarded-ok) of 4\""
+kill $FWD $WEB 2>/dev/null; wait $FWD $WEB 2>/dev/null
+check "forward: refuses a non-loopback bind"   2 "only loopback" \
+    "$PYLON" -p $PORT -N -L 0.0.0.0:$LPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1"
+
 # --- an agent with no acceptable key -----------------------------------------
 ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger
 check "unknown user key fails cleanly"         1 "accepted none" \

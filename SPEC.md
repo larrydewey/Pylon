@@ -685,7 +685,7 @@ content.
 
 | Phase | Content |
 |---|---|
-| 0 | SSH transport core in Resid: profile of 5 (key exchange `curve25519-sha256` only until Resid has ML-KEM), host verification against pinned keys, agent authentication with session binding, exec and shell channels; `pylon` CLI; interop tests against OpenSSH. *Done except interactive shells and `Secret(T)` keying material.* |
+| 0 | SSH transport core in Resid: profile of 5 (key exchange `curve25519-sha256` only until Resid has ML-KEM), host verification against pinned keys, agent authentication with session binding, exec and shell channels; `pylon` CLI; interop tests against OpenSSH. *Done: exec and interactive shells with keystroke obfuscation, local forwarding, `Secret(T)` keying material.* |
 | 1 | Android app: host list, terminal emulator, Symbolon IPC, host trust of 6 with sync, SFTP, forwards, ProxyJump. |
 | 1b | Without Symbolon (7.6): hardware keys, external agents, imported key files, with the warning. |
 | 2 | `pylond`: delivery (8) with reproducible, logged releases; Pylon protocol (9); persistent sessions with signed re-attach, screen sync and scrollback (10); Pylon streams (11); formal models and external review. Linux desktop app. |
@@ -739,14 +739,29 @@ Implementation findings in the phase-0 code, fixed with this revision:
 - **I4** Encoding K as an mpint branches on its leading bytes in common
   implementations (OpenSSH's included), a timing signal of the kind the
   Raccoon attack exploited in TLS. Pylon hashes all 64 possible
-  encodings and keeps the right results with `ct_select`, its condition
-  from `ct_nonzero` over K's bytes, so nothing branches on, indexes by or
-  publishes any part of K (known-answer tests in `tests/kex_test.resid`
-  cover every shape). Resid gained `ct_nonzero` and its key-entropy
-  analysis (E0270) now counts `ct_select` as a selection of its arms, so
-  the compiler verifies the cipher keys rest on the exchange's draw; a
-  masked xor (`a ^ ((a ^ c) & m)`) is still, correctly, not trusted,
-  since it can cancel.
+  encodings and keeps the right results with `ct_pick_bytes` (Resid
+  `lib/word.resid`), its condition from `ct_nonzero` over K's bytes, so
+  nothing branches on, indexes by or publishes any part of K
+  (known-answer tests in `tests/kex_test.resid` cover every shape).
+  Resid gained `ct_nonzero`, `ct_pick_bytes` and `@selects`, and its
+  key-entropy check (E0270) now counts a constant-time choice as a
+  selection of its arms: the derivation, checked on its own, verifies
+  as resting on the exchange's draw. A masked xor is still, correctly,
+  not trusted, since it can cancel.
+- **I6** *Open.* E0270 still warns at Pylon's top-level calls (29
+  sites). The cause is the check's precision, not the keys: a keying
+  requirement records one level of field path, so `seal`'s need for
+  `Dir.key` becomes, at `send_packet`, a need for all of `Conn.tx`, and
+  where a `Conn` is rebuilt from its fields, for every field of the
+  record (the socket number, the receive buffer). Either Resid's check
+  follows multi-level paths, or Pylon threads cipher state outside the
+  connection record; both are planned.
+- **I7** An event loop could wait on a second packet that never came:
+  after a transport-level message (OpenSSH's host-keys announcement),
+  the reader looked for the next connection message before returning,
+  so a forwarding session stalled for 30 seconds and then failed.
+  Event loops now handle exactly one packet per readable socket
+  (`next_once`); request/reply steps keep waiting (`next_msg`).
 - **I5** The parsers had no fuzz targets. `tests/fuzz_proxy.py` mutates a
   real sshd's byte stream (bit flips, deletions, insertions, in the
   cleartext handshake and in encrypted traffic) and requires every run to

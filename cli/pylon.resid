@@ -18,8 +18,9 @@ import "../core/agent.resid";
 import "../core/auth.resid";
 import "../core/session.resid";
 import "../core/known.resid";
+import "../core/forward.resid";
 
-type Opts = { Int port; Bool no_strict; Bool no_obfuscate; List(Str) rest; Str err; };
+type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; List(Str) fwds; List(Str) rest; Str err; };
 
 @requires(args)
 Opts parse(Int i, Opts o) {
@@ -27,23 +28,26 @@ Opts parse(Int i, Opts o) {
     Str a = args.get(i);
     if (a == "-p" && i + 1 < args.count()) {
         Str v = args.get(i + 1);
-        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = "bad port " + v}; }
-        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = ""});
+        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = "bad port " + v}; }
+        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""});
     }
-    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .rest = [], .err = ""}); }
-    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .rest = [], .err = ""}); }
-    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = "unknown option " + a}; }
+    if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "-L" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds.concat([args.get(i + 1)]), .rest = [], .err = ""}); }
+    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = "unknown option " + a}; }
     return rest_from(i, o);
 }
 
 @requires(args)
 Opts rest_from(Int i, Opts o) {
     if (i >= args.count()) { return o; }
-    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = o.rest.concat([args.get(i)]), .err = o.err});
+    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = o.rest.concat([args.get(i)]), .err = o.err});
 }
 
 Int usage() {
     eprintln("usage: pylon [-p PORT] [--allow-no-strict] [--no-obfuscate-keystrokes] USER@HOST [COMMAND...]");
+    eprintln("       pylon [-p PORT] -N -L [127.0.0.1:]PORT:HOST:HOSTPORT [-L ...] USER@HOST");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
     return 2;
 }
@@ -81,7 +85,11 @@ Int cmd_pin(Opts o) {
 @requires(network, filesystem, environment, declassify, terminal, clock(readonly))
 Int cmd_run(Opts o) {
     if (o.rest.len() < 1) { return usage(); }
-    Bool interactive = o.rest.len() == 1;
+    if (o.fwds.len() > 0 && (!o.no_cmd || o.rest.len() != 1)) { eprintln("pylon: -L runs a forwarding-only session: give -N and no COMMAND"); return 2; }
+    List(Fwd) fs = parse_fwds(o.fwds, 0, []);
+    if (fs.len() != o.fwds.len()) { return 2; }
+    Bool interactive = o.rest.len() == 1 && !o.no_cmd;
+    if (o.no_cmd && o.fwds.len() == 0) { eprintln("pylon: -N needs at least one -L"); return 2; }
     if (interactive && !resid_term_is_tty(0)) { eprintln("pylon: an interactive shell needs a terminal; give a COMMAND to run instead"); return 2; }
     List(Str) uh = str_split(o.rest[0], "@");
     if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(uh[1]) == 0) { eprintln("pylon: give the user as USER@HOST"); return 2; }
@@ -102,12 +110,36 @@ Int cmd_run(Opts o) {
     if (!a.ok) { eprintln("pylon: " + a.why); _ = disconnect(a.c, "authentication failed"); return 1; }
     // Session traffic may idle for a long time: no read deadline now.
     _ = resid_tcp_deadline(a.c.fd, 0);
+    if (o.no_cmd) { return run_forwards(a.c, fs); }
     Chan ch = open_session(a.c);
     if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
     Chan done = if (interactive) { run_shell(ch, environment.get("TERM"), !o.no_obfuscate) } else { pump(exec(ch, command)) };
     if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
     _ = disconnect(done.c, "done");
     return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
+}
+
+List(Fwd) parse_fwds(List(Str) specs, Int i, List(Fwd) acc) {
+    if (i >= specs.len()) { return acc; }
+    Fwd f = parse_fwd(specs[i]);
+    if (f.lport == 0) { eprintln("pylon: bad -L " + specs[i] + " (want [127.0.0.1:]PORT:HOST:HOSTPORT; only loopback binds)"); return acc; }
+    return parse_fwds(specs, i + 1, acc.concat([f]));
+}
+
+@requires(network, declassify)
+Int run_forwards(Conn c, List(Fwd) fs) {
+    Mux m = mux_new(c, fs);
+    if (str_len(m.err) > 0) { eprintln("pylon: " + m.err); return 1; }
+    _ = announce(fs, 0);
+    Mux done = serve(m, 0);
+    eprintln("pylon: " + done.err);
+    return 1;
+}
+
+Bool announce(List(Fwd) fs, Int i) {
+    if (i >= fs.len()) { return true; }
+    eprintln("pylon: forwarding 127.0.0.1:" + f"{fs[i].lport}" + " -> " + fs[i].host + ":" + f"{fs[i].hport}" + " (via the server)");
+    return announce(fs, i + 1);
 }
 
 // The shell on a pty, with the local terminal in raw mode for its whole
@@ -129,7 +161,7 @@ Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock(readonly))
 Int main() {
     Bool is_pin = args.count() > 1 && args.get(1) == "pin";
-    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .rest = [], .err = ""});
+    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     return if (is_pin) { cmd_pin(o) } else { cmd_run(o) };
 }

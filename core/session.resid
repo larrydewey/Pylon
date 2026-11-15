@@ -115,12 +115,14 @@ pub Chan window_change(Chan ch, Int cols, Int rows) {
 // Receiving
 // ============================================================================
 
-// Wait for and handle one channel message.
+// Read and handle one packet (a transport-level one is handled inside
+// next_once and leaves the channel as it was).
 @requires(network, declassify)
 pub Chan step(Chan ch) {
     if (!chan_ok(ch) || ch.closed) { return ch; }
-    Pkt k = next_msg(ch.c);
+    Pkt k = next_once(ch.c);
     if (!conn_ok(k.c)) { return chan_err(ch, k.c, k.c.err); }
+    if (k.p.len() == 0) { return with_conn(ch, k.c); }
     return handle(ch, k);
 }
 

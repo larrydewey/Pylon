@@ -1,0 +1,220 @@
+// Local port forwarding (RFC 4254 7.2, SPEC 11): `pylon -N -L
+// [127.0.0.1:]PORT:HOST:HOSTPORT USER@SERVER`. Each connection to the
+// local port becomes a direct-tcpip channel to HOST:HOSTPORT as seen from
+// the server, with flow control in both directions.
+//
+// The listener binds loopback only (SPEC 11; on Android the shared
+// loopback is further restricted by the app, SPEC 11 "Local forwards on a
+// shared loopback"). Many channels share one connection, so this module
+// is a small multiplexer: channels are records in a list, found by the
+// number we gave them.
+
+import "crypto.resid";
+import "wire.resid";
+import "transport.resid";
+import "session.resid";
+
+pub type Fwd = { Int lport; Str host; Int hport; Int lfd; };
+
+// A forwarded connection's channel. id: our number. remote: the
+// server's. fd: the local socket. state: 0 opening, 1 open, 2 we sent
+// CLOSE. window / rwin / rmax: as in Chan.
+pub type FC = { Int id; Int remote; Int fd; Int window; Int rwin; Int rmax; Int state; };
+
+pub type Mux = { Conn c; List(Fwd) fwds; List(FC) chans; Int next_id; Str err; Int opened; };
+
+Int fwd_window() { return 2097152; }
+Int fwd_max_packet() { return 32768; }
+
+// "[127.0.0.1:]PORT:HOST:HOSTPORT", or a Fwd with lport 0 when malformed.
+// Only a loopback bind address is accepted.
+pub Fwd parse_fwd(Str spec) {
+    List(Str) p = str_split(spec, ":");
+    Bool bound = p.len() == 4;
+    if (!(p.len() == 3 || bound)) { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
+    if (bound && p[0] != "127.0.0.1" && p[0] != "localhost") { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
+    Int o = if (bound) { 1 } else { 0 };
+    Bool ok = str_is_int(p[o]) && str_is_int(p[o + 2]) && str_len(p[o + 1]) > 0 && str_len(p[o + 1]) < 256;
+    Int lp = if (ok) { str_parse_int(p[o]) } else { 0 };
+    Int hp = if (ok) { str_parse_int(p[o + 2]) } else { 0 };
+    if (!ok || lp < 1 || lp > 65535 || hp < 1 || hp > 65535) { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
+    return Fwd {.lport = lp, .host = p[o + 1], .hport = hp, .lfd = -1};
+}
+
+// Open the listeners; a Mux with err set when one cannot listen.
+@requires(network)
+pub Mux mux_new(Conn c, List(Fwd) fs) { return listen_all(Mux {.c = c, .fwds = [], .chans = [], .next_id = 1, .err = "", .opened = 0}, fs, 0); }
+
+@requires(network)
+Mux listen_all(Mux m, List(Fwd) fs, Int i) {
+    if (i >= fs.len()) { return m; }
+    Int l = resid_tcp_listen(fs[i].lport);
+    if (l < 0) { return with_err(m, "cannot listen on 127.0.0.1:" + f"{fs[i].lport}"); }
+    Fwd f = Fwd {.lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l};
+    return listen_all(Mux {.c = m.c, .fwds = m.fwds.concat([f]), .chans = m.chans, .next_id = m.next_id, .err = m.err, .opened = m.opened}, fs, i + 1);
+}
+
+Mux with_err(Mux m, Str e) { return Mux {.c = conn_err(m.c, e), .fwds = m.fwds, .chans = m.chans, .next_id = m.next_id, .err = e, .opened = m.opened}; }
+Mux with_c(Mux m, Conn c) {
+    if (!conn_ok(c)) { return with_err(m, c.err); }
+    return Mux {.c = c, .fwds = m.fwds, .chans = m.chans, .next_id = m.next_id, .err = m.err, .opened = m.opened};
+}
+Mux with_chans(Mux m, Conn c, List(FC) cs) {
+    if (!conn_ok(c)) { return with_err(m, c.err); }
+    return Mux {.c = c, .fwds = m.fwds, .chans = cs, .next_id = m.next_id, .err = m.err, .opened = m.opened};
+}
+
+Int find(List(FC) cs, Int id, Int i) {
+    if (i >= cs.len()) { return -1; }
+    if (cs[i].id == id) { return i; }
+    return find(cs, id, i + 1);
+}
+
+List(FC) put(List(FC) cs, Int i, FC v) { return cs[0..i].concat([v]).concat(cs[i + 1..cs.len()]); }
+List(FC) drop(List(FC) cs, Int i) { return cs[0..i].concat(cs[i + 1..cs.len()]); }
+
+FC fc_flow(FC f, Int window, Int rwin) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = window, .rwin = rwin, .rmax = f.rmax, .state = f.state}; }
+FC fc_state(FC f, Int st) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = f.window, .rwin = f.rwin, .rmax = f.rmax, .state = st}; }
+
+// ============================================================================
+// The loop
+// ============================================================================
+
+// Runs until the connection fails or the server disconnects. `limit` > 0
+// stops after that many forwarded connections have finished (for tests).
+@requires(network, declassify)
+pub Mux serve(Mux m, Int limit) {
+    if (str_len(m.err) > 0) { return m; }
+    if (limit > 0 && m.opened >= limit && m.chans.len() == 0) { return m; }
+    Bool buffered = m.c.buf.len() > 0;
+    List(Int) fds = [m.c.fd].concat(lfds(m.fwds, 0, [])).concat(cfds(m.chans, 0, []));
+    List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), if (buffered) { 0 } else { 1000 });
+    Mux a = if (buffered || (ready.len() > 0 && (ready[0] & 1) != 0)) { on_packet(m) } else { m };
+    Mux b = accept_all(a, ready, 1, 0);
+    Mux d = read_all(b, ready, 1 + m.fwds.len(), cfds(m.chans, 0, []), 0);
+    return serve(d, limit);
+}
+
+List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
+
+List(Int) lfds(List(Fwd) fs, Int i, List(Int) acc) {
+    if (i >= fs.len()) { return acc; }
+    return lfds(fs, i + 1, acc.concat([fs[i].lfd]));
+}
+
+// Local sockets worth reading: open channels the server has window for.
+List(Int) cfds(List(FC) cs, Int i, List(Int) acc) {
+    if (i >= cs.len()) { return acc; }
+    return cfds(cs, i + 1, if (cs[i].state == 1 && cs[i].rwin > 0) { acc.concat([cs[i].fd]) } else { acc });
+}
+
+// New local connections: each opens a direct-tcpip channel.
+@requires(network, declassify)
+Mux accept_all(Mux m, List(Int) ready, Int at, Int i) {
+    if (i >= m.fwds.len() || str_len(m.err) > 0) { return m; }
+    Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
+    Int fd = if (r) { resid_tcp_accept_now(m.fwds[i].lfd) } else { -1 };
+    Mux n = if (fd >= 0) { open_direct(m, m.fwds[i], fd) } else { m };
+    return accept_all(n, ready, at, i + 1);
+}
+
+@requires(network, declassify)
+Mux open_direct(Mux m, Fwd f, Int fd) {
+    Int id = m.next_id;
+    List(Int) p = [msg_channel_open()].concat(sstr("direct-tcpip")).concat(u32_be(id)).concat(u32_be(fwd_window())).concat(u32_be(fwd_max_packet()))
+        .concat(sstr(f.host)).concat(u32_be(f.hport)).concat(sstr("127.0.0.1")).concat(u32_be(0));
+    Conn c2 = send_packet(m.c, p);
+    FC fc = FC {.id = id, .remote = -1, .fd = fd, .window = fwd_window(), .rwin = 0, .rmax = 0, .state = 0};
+    Mux n = with_chans(m, c2, m.chans.concat([fc]));
+    return Mux {.c = n.c, .fwds = n.fwds, .chans = n.chans, .next_id = id + 1, .err = n.err, .opened = m.opened + 1};
+}
+
+// Local data, forwarded within each channel's window and packet size;
+// a local EOF sends EOF and CLOSE.
+@requires(network, declassify)
+Mux read_all(Mux m, List(Int) ready, Int at, List(Int) fds, Int i) {
+    if (i >= fds.len() || str_len(m.err) > 0) { return m; }
+    Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
+    Int k = chan_of_fd(m.chans, fds[i], 0);
+    Mux n = if (r && k >= 0) { read_one(m, k) } else { m };
+    return read_all(n, ready, at, fds, i + 1);
+}
+
+Int chan_of_fd(List(FC) cs, Int fd, Int i) {
+    if (i >= cs.len()) { return -1; }
+    if (cs[i].fd == fd) { return i; }
+    return chan_of_fd(cs, fd, i + 1);
+}
+
+@requires(network, declassify)
+Mux read_one(Mux m, Int k) {
+    FC f = m.chans[k];
+    Int want0 = if (f.rmax < f.rwin) { f.rmax } else { f.rwin };
+    Int want = if (want0 > 16384) { 16384 } else { want0 };
+    List(Int) d = resid_tcp_recv_some(f.fd, want);
+    if (d.len() == 0) {
+        Conn c1 = send_packet(m.c, [msg_channel_eof()].concat(u32_be(f.remote)));
+        Conn c2 = send_packet(c1, [msg_channel_close()].concat(u32_be(f.remote)));
+        return with_chans(m, c2, put(m.chans, k, fc_state(f, 2)));
+    }
+    Conn c3 = send_packet(m.c, [msg_channel_data()].concat(u32_be(f.remote)).concat(sstring(d)));
+    return with_chans(m, c3, put(m.chans, k, fc_flow(f, f.window, f.rwin - d.len())));
+}
+
+// One message from the server, dispatched by channel number.
+@requires(network, declassify)
+Mux on_packet(Mux m) {
+    Pkt k = next_once(m.c);
+    if (!conn_ok(k.c)) { return with_err(m, k.c.err); }
+    if (k.p.len() == 0) { return with_c(m, k.c); }
+    Int t = k.p[0];
+    if (t < msg_channel_open_confirmation() || t > msg_channel_failure()) { return with_c(m, k.c); }
+    GotInt rc = rd_u32(rd_at(k.p, 1));
+    Int i = if (rd_ok(rc.r)) { find(m.chans, rc.v, 0) } else { -1 };
+    if (i < 0) { return with_err(m, "the server sent a message for a channel that is not open"); }
+    FC f = m.chans[i];
+    if (t == msg_channel_open_confirmation()) {
+        GotInt theirs = rd_u32(rc.r);
+        GotInt win = rd_u32(theirs.r);
+        GotInt maxp = rd_u32(win.r);
+        if (!rd_ok(maxp.r) || f.state != 0 || maxp.v < 1) { return with_err(m, "malformed channel open confirmation"); }
+        Int rmax = if (maxp.v > fwd_max_packet()) { fwd_max_packet() } else { maxp.v };
+        FC o = FC {.id = f.id, .remote = theirs.v, .fd = f.fd, .window = f.window, .rwin = win.v, .rmax = rmax, .state = 1};
+        return with_chans(m, k.c, put(m.chans, i, o));
+    }
+    if (t == msg_channel_open_failure()) {
+        _ = resid_tcp_close(f.fd);
+        return with_chans(m, k.c, drop(m.chans, i));
+    }
+    if (t == msg_channel_data()) {
+        Got d = rd_str(rc.r);
+        if (!rd_ok(d.r) || d.v.len() > fwd_max_packet() || d.v.len() > f.window) { return with_err(m, "the server exceeded a channel's window or packet size"); }
+        _ = resid_tcp_send_bin(f.fd, d.v);
+        Int w = f.window - d.v.len();
+        Bool low = w <= fwd_window() / 2;
+        Conn c2 = if (low) { send_packet(k.c, [msg_channel_window_adjust()].concat(u32_be(f.remote)).concat(u32_be(fwd_window() - w))) } else { k.c };
+        return with_chans(m, c2, put(m.chans, i, fc_flow(f, if (low) { fwd_window() } else { w }, f.rwin)));
+    }
+    if (t == msg_channel_window_adjust()) {
+        GotInt add = rd_u32(rc.r);
+        Int w = f.rwin + add.v;
+        if (!rd_ok(add.r) || w > 4294967295) { return with_err(m, "the server sent a malformed window adjust"); }
+        return with_chans(m, k.c, put(m.chans, i, fc_flow(f, f.window, w)));
+    }
+    if (t == msg_channel_eof()) {
+        _ = resid_tcp_shutdown(f.fd);
+        return with_c(m, k.c);
+    }
+    if (t == msg_channel_close()) {
+        Conn c2 = if (f.state != 2) { send_packet(k.c, [msg_channel_close()].concat(u32_be(f.remote))) } else { k.c };
+        _ = resid_tcp_close(f.fd);
+        return with_chans(m, c2, drop(m.chans, i));
+    }
+    if (t == msg_channel_request()) {
+        GotText kind = rd_text(rc.r);
+        GotInt want = rd_bool(kind.r);
+        Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_channel_failure()].concat(u32_be(f.remote))) } else { k.c };
+        return with_c(m, c2);
+    }
+    return with_c(m, k.c);
+}

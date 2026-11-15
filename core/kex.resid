@@ -131,7 +131,7 @@ pub type Material = { List(Int) h; List(Int) iv_c; List(Int) iv_s; List(Secret(U
 
 pub type Exchanged = { Str err; Material m; PubKey host; };
 
-List(Secret(UInt(8))) no_secret() { ListBuf(Secret(UInt(8))) b = ListBuf(); return b.finish(); }
+List(Secret(UInt(8))) no_secret() { List(Secret(UInt(8))) e = []; return e; }
 
 Material no_material() { return Material {.h = [], .iv_c = [], .iv_s = [], .key_c = no_secret(), .key_s = no_secret()}; }
 
@@ -145,10 +145,11 @@ Material no_material() { return Material {.h = [], .iv_c = [], .iv_s = [], .key_
 // (OpenSSH's included) branches on K's leading bytes to build it: the
 // kind of timing difference the Raccoon attack used against TLS. Here
 // every possible encoding is hashed and the right results are selected
-// with ct_select, so nothing in the exchange branches on K, indexes by it
-// or publishes any part of it. (ct_select, rather than an xor mask, is
-// also what lets the compiler's key-entropy check (E0270) see that the
-// result is one of the candidates, each as unpredictable as K.) A shape is (z, pad): z leading zero bytes
+// with ct_pick_bytes, so nothing in the exchange branches on K, indexes
+// by it or publishes any part of it. (A whole-list constant-time choice,
+// rather than an xor mask, is also what lets the compiler's key-entropy
+// check (E0270) see that the result is one of the candidates, each as
+// unpredictable as K.) A shape is (z, pad): z leading zero bytes
 // stripped, pad whether a zero byte is prepended; K = 0 cannot occur
 // (x25519g_shared refuses it), so z < 32.
 
@@ -181,27 +182,23 @@ Secret(UInt(8)) zeros_mask(List(Secret(UInt(8))) k, Int i, Int z, Secret(UInt(8)
 }
 
 // The mpint encoding of K under the shape (z, pad).
-List(Secret(UInt(8))) encode_as(List(Secret(UInt(8))) k, Int z, Bool pad) {
+pub List(Secret(UInt(8))) encode_as(List(Secret(UInt(8))) k, Int z, Bool pad) {
     Int n = 32 - z + if (pad) { 1 } else { 0 };
     List(Int) head = if (pad) { u32_be(n).concat([0]) } else { u32_be(n) };
     return lift(head).concat(k[z..32]);
 }
 
-// cand where `take` holds, else acc, byte by byte.
+// cand where `take` holds, else acc (lib/word.resid's ct_pick_bytes:
+// ct_select byte by byte, seen by E0270 as one of the two lists).
 List(Secret(UInt(8))) pick(List(Secret(UInt(8))) acc, List(Secret(UInt(8))) cand, Secret(Bool) take) {
-    return pick_acc(acc, cand, take, 0, ListBuf());
-}
-
-List(Secret(UInt(8))) pick_acc(List(Secret(UInt(8))) a, List(Secret(UInt(8))) c, Secret(Bool) take, Int i, ListBuf(Secret(UInt(8))) out) {
-    if (i >= a.len()) { return out.finish(); }
-    return pick_acc(a, c, take, i + 1, out.push(ct_select(take, c[i], a[i])));
+    return ct_pick_bytes(take, cand, acc);
 }
 
 // Everything derived from K under one shape: H, then the four outputs of
 // RFC 4253 7.2. On the first exchange the session identifier is H itself.
 pub type Derived = { List(Secret(UInt(8))) h; List(Secret(UInt(8))) iv_c; List(Secret(UInt(8))) iv_s; List(Secret(UInt(8))) key_c; List(Secret(UInt(8))) key_s; };
 
-Derived derive_shape(List(Secret(UInt(8))) kenc, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks) {
+pub Derived derive_shape(List(Secret(UInt(8))) kenc, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks) {
     List(Secret(UInt(8))) h = sha256g(lift(hin).concat(kenc));
     List(Secret(UInt(8))) sid = if (old_sid.len() > 0) { lift(old_sid) } else { h };
     return Derived {
@@ -211,7 +208,7 @@ Derived derive_shape(List(Secret(UInt(8))) kenc, List(Int) hin, List(Int) old_si
     };
 }
 
-Derived pick_derived(Derived a, Derived c, Secret(Bool) m) {
+pub Derived pick_derived(Derived a, Derived c, Secret(Bool) m) {
     return Derived {.h = pick(a.h, c.h, m), .iv_c = pick(a.iv_c, c.iv_c, m), .iv_s = pick(a.iv_s, c.iv_s, m),
         .key_c = pick(a.key_c, c.key_c, m), .key_s = pick(a.key_s, c.key_s, m)};
 }
@@ -230,7 +227,7 @@ Derived all_shapes(List(Secret(UInt(8))) k, List(Int) hin, List(Int) old_sid, In
 // time across all shapes of its mpint encoding.
 pub Derived derive_all(List(Secret(UInt(8))) shared, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks) {
     // Start from shape (0, false) and let every shape, that one included,
-    // be picked by its mask: exactly one mask is 0xFF.
+    // be picked by its condition: exactly one holds.
     Derived start = derive_shape(encode_as(shared, 0, false), hin, old_sid, ivc, ivs, kc, ks);
     return all_shapes(shared, hin, old_sid, ivc, ivs, kc, ks, 0, start);
 }
