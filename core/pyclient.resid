@@ -24,9 +24,12 @@ pub Str push_command(Str hash) {
 // The command that starts it: the hash checked again, then exec, with a
 // 0700 per-user directory for the session daemon's control socket
 // (pylond refuses one it does not own or that others can enter).
-pub Str run_command(Str hash, Int idle, Bool ephemeral, Bool unconfined) {
+pub Str run_command(Str hash, Int idle, Bool ephemeral, Bool unconfined) { return run_command_b(hash, idle, ephemeral, unconfined, false); }
+
+// busy: a test hook (PYLON_TEST_BUSY) that starts pylond always under load.
+pub Str run_command_b(Str hash, Int idle, Bool ephemeral, Bool unconfined, Bool busy) {
     return "f=\"$HOME/.cache/pylon/pylond-" + hash + "\"; r=\"${XDG_RUNTIME_DIR:-/tmp}/pylon-$(id -u)\"; (umask 077; mkdir -p \"$r\") && "
-        + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + (if (ephemeral) { " --ephemeral" } else { "" }) + (if (unconfined) { " --allow-unconfined" } else { "" });
+        + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + (if (ephemeral) { " --ephemeral" } else { "" }) + (if (unconfined) { " --allow-unconfined" } else { "" }) + (if (busy) { " --test-busy" } else { "" });
 }
 
 // The host's machine type (`uname -m`), for picking the pylond build:
@@ -60,11 +63,14 @@ pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
 pub type Started = { Conn c; Boot b; BootC bc; Str err; };
 
 @requires(network, declassify)
-pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined) {
+pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined) { return start_pylond_b(c0, hash, idle, ephemeral, unconfined, false); }
+
+@requires(network, declassify)
+pub Started start_pylond_b(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined, Bool busy) {
     BootC bc = boot_client_new();
     Chan ch = open_session(c0);
     if (!chan_ok(ch)) { return Started {.c = ch.c, .b = boot_finish(bc, []), .bc = bc, .err = ch.err}; }
-    Chan ex = exec(capturing(ch), run_command(hash, idle, ephemeral, unconfined));
+    Chan ex = exec(capturing(ch), run_command_b(hash, idle, ephemeral, unconfined, busy));
     Chan sent = send_data(ex, boot_hello(bc));
     Chan got = await_bytes(sent, boot_reply_len());
     if (!chan_ok(got) || got.inbox.len() < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }
@@ -73,16 +79,25 @@ pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral, Bool uncon
 }
 
 // The handshake over UDP to addr:port, a few tries one second apart.
+// pylond under load answers with a cookie; the init is then sent again at
+// once with mac2 (SPEC 9.4).
 @requires(network, declassify, clock)
-pub SessionKeys connect_udp(Int udp, List(Int) addr, Int port, Boot b, Static c, Int tries) {
+pub SessionKeys connect_udp(Int udp, List(Int) addr, Int port, Boot b, Static c, Int tries) { return connect_c(udp, addr, port, b, c, tries, []); }
+
+@requires(network, declassify, clock)
+SessionKeys connect_c(Int udp, List(Int) addr, Int port, Boot b, Static c, Int tries, List(Int) cookie) {
     if (tries <= 0) { List(Secret(UInt(8))) e = []; return SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0}; }
-    Pending p = hs_init(b, c, clock.now_ns());
+    Pending p = hs_init_c(b, c, clock.now_ns(), cookie);
     _ = resid_udp_send_to(udp, addr, port, p.pkt);
     List(Int) ready = resid_tcp_poll([udp], [1], 1000);
     List(Int) d = resid_udp_recv_from(udp, 2048);
-    SessionKeys k = if (d.len() == 6 + resp_len()) { hs_finish(b, c, p, d[6..d.len()]) } else { connect_udp(udp, addr, port, b, c, 0) };
+    List(Int) got = if (d.len() == 6 + cookie_len()) { cookie_open(cookie_key(b.s_pub, b.psk), p, d[6..d.len()]) } else { [] };
+    _ = if (got.len() > 0) { eprintln("pylon: pylond is under load and sent a cookie; retrying with mac2") } else { true };
+    if (got.len() > 0) { return connect_c(udp, addr, port, b, c, tries - 1, got); }
+    List(Secret(UInt(8))) e = [];
+    SessionKeys k = if (d.len() == 6 + resp_len()) { hs_finish(b, c, p, d[6..d.len()]) } else { SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0} };
     if (k.ok) { return k; }
-    return connect_udp(udp, addr, port, b, c, tries - 1);
+    return connect_c(udp, addr, port, b, c, tries - 1, cookie);
 }
 
 // Four decimal bytes, or [] when s is not an IPv4 literal.
@@ -340,11 +355,11 @@ Str pad(Str s, Int n) { return if (str_len(s) >= n) { s + " " } else { pad(s + "
 // than 3): a fresh ephemeral X25519 and ML-KEM key, so each period's keys
 // are forward-secret on their own. pylond switches to the new keys when
 // it answers; streams carry on (what is lost in between is resent).
-pub type Rk = { Boot b; Static c; Bool waiting; Pending p; Int sent; Int every; };
+pub type Rk = { Boot b; Static c; Bool waiting; Pending p; Int sent; Int every; List(Int) cookie; };
 pub type Rekeyed = { Link l; Rk rk; };
 
 @requires(declassify)
-pub Rk rk_new(Boot b, Static c, Int every) { return Rk {.b = b, .c = c, .waiting = false, .p = Pending {.pkt = [], .ck = [], .h = [], .e = c, .kem = mlkem768_keygen(), .idx = 0}, .sent = 0, .every = every}; }
+pub Rk rk_new(Boot b, Static c, Int every) { return Rk {.b = b, .c = c, .waiting = false, .p = Pending {.pkt = [], .ck = [], .h = [], .e = c, .kem = mlkem768_keygen(), .idx = 0}, .sent = 0, .every = every, .cookie = []}; }
 
 @requires(network, declassify, clock(readonly))
 pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
@@ -352,13 +367,26 @@ pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
     List(Int) resp = if (r.waiting) { response(others, 0) } else { [] };
     SessionKeys k = if (resp.len() > 0) { hs_finish(r.b, r.c, r.p, resp) } else { SessionKeys {.ok = false, .tx = [], .rx = [], .my_idx = 0, .their_idx = 0} };
     _ = if (k.ok && r.every < 120000000000) { eprintln("pylon: new session keys (test hook)\r") } else { true };
-    if (k.ok) { return Rekeyed {.l = link_rekeyed(l, l.addr, l.port, k, now), .rk = Rk {.b = r.b, .c = r.c, .waiting = false, .p = r.p, .sent = r.sent, .every = r.every}}; }
+    if (k.ok) { return Rekeyed {.l = link_rekeyed(l, l.addr, l.port, k, now), .rk = Rk {.b = r.b, .c = r.c, .waiting = false, .p = r.p, .sent = r.sent, .every = r.every, .cookie = r.cookie}}; }
+    // A cookie (pylond is under load): the init again at once, with mac2.
+    List(Int) ck = if (r.waiting) { cookie_in(others, r, 0) } else { [] };
+    _ = if (ck.len() > 0 && r.every < 120000000000) { eprintln("pylon: a cookie for the new keys (test hook)\r") } else { true };
     // Time for new keys, or an initiation unanswered for a second.
-    Bool due = (!r.waiting && now - l.keyed >= r.every) || (r.waiting && now - r.sent > 1000000000);
+    Bool due = (!r.waiting && now - l.keyed >= r.every) || (r.waiting && now - r.sent > 1000000000) || ck.len() > 0;
     if (!due) { return Rekeyed {.l = l, .rk = r}; }
-    Pending p = hs_init(r.b, r.c, clock.now_ns());
+    List(Int) cookie = if (ck.len() > 0) { ck } else { r.cookie };
+    Pending p = hs_init_c(r.b, r.c, clock.now_ns(), cookie);
     _ = resid_udp_send_to(l.udp, l.addr, l.port, p.pkt);
-    return Rekeyed {.l = l, .rk = Rk {.b = r.b, .c = r.c, .waiting = true, .p = p, .sent = now, .every = r.every}};
+    return Rekeyed {.l = l, .rk = Rk {.b = r.b, .c = r.c, .waiting = true, .p = p, .sent = now, .every = r.every, .cookie = cookie}};
+}
+
+@requires(declassify)
+List(Int) cookie_in(List(List(Int)) xs, Rk r, Int i) {
+    if (i >= xs.len()) { return []; }
+    List(Int) d = xs[i];
+    List(Int) c = if (d.len() == 6 + cookie_len() && d[6] == 3) { cookie_open(cookie_key(r.b.s_pub, r.b.psk), r.p, d[6..d.len()]) } else { [] };
+    if (c.len() > 0) { return c; }
+    return cookie_in(xs, r, i + 1);
 }
 
 List(Int) response(List(List(Int)) xs, Int i) {

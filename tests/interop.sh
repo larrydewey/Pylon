@@ -308,7 +308,7 @@ if [ -x "$PYLOND" ]; then
         python3 -c "
 import socket, os
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5)
-s.sendto(bytes([1, 0, 0, 0]) + os.urandom(1264), ('127.0.0.1', $PPORT))
+s.sendto(bytes([1, 0, 0, 0]) + os.urandom(1280), ('127.0.0.1', $PPORT))
 s.sendto(os.urandom(64), ('127.0.0.1', $PPORT))
 try:
     s.recvfrom(4096); print('replied')
@@ -405,6 +405,29 @@ except socket.timeout:
         python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
         "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
+    # Under load pylond answers an init with a cookie and does no
+    # asymmetric work until the init comes back with mac2 (a fresh daemon
+    # started with the test hook that keeps it always under load).
+    pkill -f "pylond-.* serve" 2>/dev/null; sleep 0.5
+    ( cd www2 && exec python3 -m http.server $W2 --bind 127.0.0.1 ) > /dev/null 2>&1 & WEB2=$!
+    PYLON_TEST_BUSY=1 PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 15)):127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pc.log & PC=$!
+    for _ in $(seq 100); do grep -q "forwarding" pc.log && break; sleep 0.2; done
+    check "pylon protocol: under load, the handshake takes a cookie (mac2)" 0 "sent a cookie; retrying with mac2" cat pc.log
+    check "pylon protocol: under load, 3 MB intact while rekeying" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "sleep 2.5; curl -s -m 60 --limit-rate 600k http://127.0.0.1:$((PORT + 15))/big.bin | sha256sum"
+    check "pylon protocol: under load, rekeying with mac2" 0 "" bash -c "test \$(grep -c 'new session keys' pc.log) -ge 3"
+    check "pylond: under load, still silent without mac1" 0 "no reply" \
+        python3 -c "
+import socket, os
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5)
+s.sendto(bytes([1, 0, 0, 0]) + os.urandom(1280), ('127.0.0.1', $(sed -n 's/.*session to 127.0.0.1:\([0-9]*\).*/\1/p' pc.log)))
+try:
+    s.recvfrom(4096); print('replied')
+except socket.timeout:
+    print('no reply')"
+    check "pylon protocol: data packets padded to 64 bytes" 0 "padded" \
+        python3 "$(dirname "$HOSTILE")/pad_check.py" "$(sed -n 's/.*session to 127.0.0.1:\([0-9]*\).*/\1/p' pc.log)" -- curl -s -m 10 "http://127.0.0.1:$((PORT + 15))/small.txt"
+    kill $PC $WEB2 2>/dev/null; wait $PC $WEB2 2>/dev/null
     pkill -f "pylond-.* serve" 2>/dev/null
 else
     echo "skip pylon protocol (no $PYLOND)"

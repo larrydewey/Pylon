@@ -98,32 +98,56 @@ type Tty = { Int id; Int peer; Int sid; Int fd; Int pid; Term t; Int seen; };
 // many bytes were written, and the first error.
 type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(Int) out; Int sent; List(Int) old; Int start; Int size; List(Int) hash; Int wrote; Str err; };
 
+// Load (SPEC 9.4): the cookie secret and the one before it (replaced
+// every two minutes), and how many handshakes were answered in the
+// current one-second window. Past 8 a second (or always, with the test
+// hook) an init must carry a valid mac2 or gets a cookie instead.
+type Ck = { List(Int) cur; List(Int) prev; Int rotated; Int win; Int count; Bool always; };
+
+@requires(declassify)
+Ck ck_new(Bool always, Int now) { return Ck {.cur = random_bytes(32), .prev = random_bytes(32), .rotated = now, .win = now, .count = 0, .always = always}; }
+
+@requires(declassify)
+Ck ck_tick(Ck c, Int now) {
+    Bool rot = now - c.rotated > 120000000000;
+    Bool fresh = now - c.win > 1000000000;
+    return Ck {.cur = if (rot) { random_bytes(32) } else { c.cur }, .prev = if (rot) { c.cur } else { c.prev }, .rotated = if (rot) { now } else { c.rotated },
+        .win = if (fresh) { now } else { c.win }, .count = if (fresh) { 0 } else { c.count }, .always = c.always};
+}
+
+Ck ck_count(Ck c) { return Ck {.cur = c.cur, .prev = c.prev, .rotated = c.rotated, .win = c.win, .count = c.count + 1, .always = c.always}; }
+
 type Srv = { Static s; Int udp; Int port; Int ctl; List(Peer) peers; List(Tty) ttys; Int next_id; Int broker;
-    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; Str home; List(Xf) xfs; };
+    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; Str home; List(Xf) xfs; Ck ck; };
 
 Srv sv_peers(Srv v, List(Peer) ps) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = ps, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_ttys(Srv v, List(Tty) ts) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = ts, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_next(Srv v, Int next_id) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_xfs(Srv v, List(Xf) xs) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = xs};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = xs, .ck = v.ck};
+}
+
+Srv sv_ck(Srv v, Ck c) {
+    return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = c};
 }
 
 Srv sv_seen(Srv v, Int t) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t, .home = v.home, .xfs = v.xfs};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t, .home = v.home, .xfs = v.xfs, .ck = v.ck};
 }
 
 Peer pr_link(Peer p, Link l) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = l, .stamp = p.stamp, .born = p.born, .lsn = p.lsn}; }
@@ -205,12 +229,21 @@ Srv handshake(Srv v, List(Int) d, Int now) {
     Int i = mac1_peer(v.peers, pkt, 0);
     if (i < 0) { return v; }
     Peer p = v.peers[i];
+    // Under load: no asymmetric work without a cookie for this source.
+    Ck c = ck_tick(v.ck, now);
+    List(Int) src = d[0..6];
+    Bool load = c.always || c.count >= 8;
+    Bool ok2 = mac2_ok(cookie_of(c.cur, src), pkt) || mac2_ok(cookie_of(c.prev, src), pkt);
+    if (load && !ok2) {
+        _ = resid_udp_send_to(v.udp, d[0..4], d[4] * 256 + d[5], cookie_reply(cookie_key(p.b.s_pub, p.b.psk), pkt, cookie_of(c.cur, src)));
+        return sv_ck(v, c);
+    }
     Answered a = hs_respond(p.b, v.s, pkt);
-    if (!a.keys.ok || !newer(a.stamp, p.stamp, 0)) { return v; }
+    if (!a.keys.ok || !newer(a.stamp, p.stamp, 0)) { return sv_ck(v, ck_count(c)); }
     Int port = d[4] * 256 + d[5];
     _ = resid_udp_send_to(v.udp, d[0..4], port, a.resp);
     Peer p2 = Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = true, .l = link_rekeyed(p.l, d[0..4], port, a.keys, now), .stamp = a.stamp, .born = p.born, .lsn = p.lsn};
-    return sv_seen(sv_peers(v, put_peer(v.peers, i, p2)), now);
+    return sv_ck(sv_seen(sv_peers(v, put_peer(v.peers, i, p2)), now), ck_count(c));
 }
 
 Int mac1_peer(List(Peer) ps, List(Int) pkt, Int i) {
@@ -637,25 +670,27 @@ Int hang_up(List(Tty) ts, Int i) {
 // Start
 // ============================================================================
 
-type Args = { Str run; Int idle; Int keep; Bool ephemeral; Bool unconfined; Bool ok; };
+type Args = { Str run; Int idle; Int keep; Bool ephemeral; Bool unconfined; Bool ok; Bool busy; };
 
 @requires(args)
 Args parse(Int i, Args a) {
     if (i >= args.count()) { return a; }
     Str f = args.get(i);
     Bool num = i + 1 < args.count() && str_is_int(args.get(i + 1)) && str_parse_int(args.get(i + 1)) > 0;
-    if (f == "--ephemeral") { return parse(i + 1, Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = true, .unconfined = a.unconfined, .ok = a.ok}); }
-    if (f == "--run" && i + 1 < args.count()) { return parse(i + 2, Args {.run = args.get(i + 1), .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok}); }
-    if (f == "--idle" && num) { return parse(i + 2, Args {.run = a.run, .idle = str_parse_int(args.get(i + 1)), .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok}); }
-    if (f == "--keep" && num) { return parse(i + 2, Args {.run = a.run, .idle = a.idle, .keep = str_parse_int(args.get(i + 1)), .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok}); }
-    if (f == "--allow-unconfined") { return parse(i + 1, Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = true, .ok = a.ok}); }
-    return Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = false};
+    if (f == "--ephemeral") { return parse(i + 1, Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = true, .unconfined = a.unconfined, .ok = a.ok, .busy = a.busy}); }
+    if (f == "--run" && i + 1 < args.count()) { return parse(i + 2, Args {.run = args.get(i + 1), .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok, .busy = a.busy}); }
+    if (f == "--idle" && num) { return parse(i + 2, Args {.run = a.run, .idle = str_parse_int(args.get(i + 1)), .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok, .busy = a.busy}); }
+    if (f == "--keep" && num) { return parse(i + 2, Args {.run = a.run, .idle = a.idle, .keep = str_parse_int(args.get(i + 1)), .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok, .busy = a.busy}); }
+    // A test hook: always under load, so every handshake needs a cookie.
+    if (f == "--test-busy") { return parse(i + 1, Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = a.ok, .busy = true}); }
+    if (f == "--allow-unconfined") { return parse(i + 1, Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = true, .ok = a.ok, .busy = a.busy}); }
+    return Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = false, .busy = a.busy};
 }
 
 @requires(args, network, environment, declassify, clock(readonly), process, filesystem)
 Int main() {
     if (args.count() < 2 || args.get(1) != "serve") { eprintln("usage: pylond serve --run DIR [--idle SECONDS] [--keep SECONDS] [--ephemeral]"); return 2; }
-    Args a = parse(2, Args {.run = "", .idle = 600, .keep = 604800, .ephemeral = false, .unconfined = false, .ok = true});
+    Args a = parse(2, Args {.run = "", .idle = 600, .keep = 604800, .ephemeral = false, .unconfined = false, .ok = true, .busy = false});
     if (!a.ok || str_len(a.run) == 0) { eprintln("usage: pylond serve --run DIR [--idle SECONDS] [--keep SECONDS] [--ephemeral]"); return 2; }
     Str addr = server_addr();
     if (str_len(addr) == 0) { eprintln("pylond: not started over SSH (no SSH_CONNECTION)"); return 2; }
@@ -684,7 +719,7 @@ Int main() {
     if (conf == 0 && !a.unconfined) { _ = resid_unix_close(ctl); eprintln("pylond: this kernel cannot confine pylond (no Landlock), so it will not serve; Pylon stays on SSH for this host (or allow an unconfined pylond for it)"); return 3; }
     Int now = clock.monotonic_ns();
     Srv v0 = Srv {.s = static_new(), .udp = udp, .port = resid_udp_port(udp), .ctl = ctl, .peers = [], .ttys = [], .next_id = 1, .broker = broker,
-        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now, .home = environment.get("HOME"), .xfs = []};
+        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now, .home = environment.get("HOME"), .xfs = [], .ck = ck_new(a.busy, now)};
     BootS served = boot_serve(hello, v0.s, v0.port);
     if (!served.boot.ok) { _ = resid_unix_close(ctl); eprintln("pylond: malformed bootstrap"); return 1; }
     _ = print_bytes(served.reply);

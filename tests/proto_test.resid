@@ -97,3 +97,44 @@ test "replay window: new, repeated, old and far-behind counters" {
     expect(s5.fresh).toEqual(false);
     expect(s6.fresh).toEqual(true);
 }
+
+@requires(declassify)
+test "padding: payloads padded to multiples of 64 bytes, recovered exactly" {
+    Both b = bootstrapped();
+    Pending p = hs_init(b.cb, b.bc.c, 1000000000);
+    Answered a = hs_respond(b.sb, b.s, p.pkt);
+    SessionKeys kc = hs_finish(b.cb, b.bc.c, p, a.resp);
+    List(Int) one = data_seal(kc, 1, [2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 97]);
+    List(Int) empty = data_seal(kc, 2, [6]);
+    List(Int) big = data_seal(kc, 3, random_bytes(1113));
+    expect(one.len()).toEqual(16 + 64 + 16);
+    expect(empty.len()).toEqual(16 + 64 + 16);
+    expect(big.len()).toEqual(16 + 1152 + 16);
+    expect(data_open(a.keys, one).payload.len()).toEqual(14);
+    expect(hex_encode(data_open(a.keys, empty).payload)).toEqual("06");
+    expect(data_open(a.keys, big).payload.len()).toEqual(1113);
+}
+
+@requires(declassify)
+test "cookie: sealed to the client, then mac2 binds the init to it" {
+    Both b = bootstrapped();
+    Both other = bootstrapped();
+    Pending p0 = hs_init(b.cb, b.bc.c, 1000000000);
+    List(Int) secret = random_bytes(32);
+    List(Int) src = [127, 0, 0, 1, 200, 10];
+    List(Int) cookie = cookie_of(secret, src);
+    // No cookie yet: mac2 is zeros and fails.
+    expect(mac2_ok(cookie, p0.pkt)).toEqual(false);
+    expect(mac1_ok(mac1_key(b.sb.s_pub, b.sb.psk), p0.pkt)).toEqual(true);
+    List(Int) reply = cookie_reply(cookie_key(b.sb.s_pub, b.sb.psk), p0.pkt, cookie);
+    expect(reply.len()).toEqual(cookie_len());
+    List(Int) got = cookie_open(cookie_key(b.cb.s_pub, b.cb.psk), p0, reply);
+    expect(hex_encode(got)).toEqual(hex_encode(cookie));
+    // Another client's key cannot open it.
+    expect(cookie_open(cookie_key(other.cb.s_pub, other.cb.psk), p0, reply).len()).toEqual(0);
+    Pending p1 = hs_init_c(b.cb, b.bc.c, 1000000001, got);
+    expect(mac2_ok(cookie, p1.pkt)).toEqual(true);
+    expect(mac2_ok(cookie_of(secret, [127, 0, 0, 2, 200, 10]), p1.pkt)).toEqual(false);
+    expect(mac1_ok(mac1_key(b.sb.s_pub, b.sb.psk), p1.pkt)).toEqual(true);
+    expect(hs_respond(b.sb, b.s, p1.pkt).keys.ok).toEqual(true);
+}

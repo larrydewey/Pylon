@@ -304,7 +304,7 @@ Up pylon_up(Conn c, Str host, Str path, List(Str) pflags) {
     Str hash = hex_encode(sha256_bytes(bin));
     Pushed p = push_pylond(ar.c, bin, hash);
     if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
-    Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"));
+    Started st = start_pylond_b(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"), environment.get("PYLON_TEST_BUSY") == "1");
     if (str_len(st.err) > 0) { eprintln("pylon: " + st.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
     _ = disconnect(st.c, "pylond started");
     Int udp = resid_udp_open();

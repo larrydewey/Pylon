@@ -566,20 +566,38 @@ messages.)
 Handshake, `h0 = SHA-256("pylon/1 IKpsk-hybrid")`, Noise-style chaining:
 
 ```
-init  1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(timestamp) (28) | mac1 (16)      1268 bytes
+init  1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(timestamp) (28) | mac1 (16) | mac2 (16)   1284 bytes
       ck ← HKDF(ck, DH(e_c, S)); ck ← HKDF(ck, DH(c, S)); (ck, k) ← HKDF2(ck, psk)
 resp  2 | idx_s (4) | idx_c (4) | e_s (32) | ct_e (1088) | AEAD() (16) | mac1 (16)   1164 bytes
       ck ← HKDF(ck, DH(e_s, e_c)); ck ← HKDF(ck, DH(e_s, c)); ck ← HKDF(ck, K_kem_e);
       (ck, k) ← HKDF2(ck, psk)
 keys  (initiator→responder, responder→initiator) = HKDF2(ck, "")
-mac1  HMAC-SHA256(SHA-256("pylon/1 mac1" | S | psk), packet without mac1)[0..16]
+mac1  HMAC-SHA256(SHA-256("pylon/1 mac1" | S | psk), packet before mac1)[0..16]
+mac2  HMAC-SHA256(cookie, packet before mac2)[0..16], or zeros without a cookie
 ```
 
 A fresh ML-KEM-768 key per handshake gives each session key post-quantum
 forward secrecy. `pylond` answers only an init with a valid mac1 and a
 timestamp newer than the last accepted one; anything else gets no reply.
 
-Data: `4 | receiver_idx (4) | counter (8, LE) | ChaCha20-Poly1305(frame)`,
+Under load (more than 8 handshakes answered in the current second;
+`--test-busy` keeps a daemon there for tests), an init with a valid mac1
+but no valid mac2 for its source gets a cookie reply instead, before any
+asymmetric work:
+
+```
+cookie  3 | 0 0 0 | idx_c (4) | nonce (12) | ChaCha20-Poly1305(cookie (16)) (32)   52 bytes
+        cookie = HMAC-SHA256(R, source address | port)[0..16], R random, replaced every 2 minutes
+        sealed under SHA-256("pylon/1 cookie" | S | psk), associated data the init's mac1
+```
+
+The client sends the init again at once with mac2 under that cookie
+(pylond accepts the current and the previous R), and keeps the cookie for
+its rekeying handshakes. Only a bootstrapped client can open a cookie,
+and pylond still sends nothing to a packet without a valid mac1.
+
+Data: `4 | receiver_idx (4) | counter (8, LE) | ChaCha20-Poly1305(length (2)
+| frame | zeros)`, the plaintext padded to a multiple of 64 bytes (9.4),
 2048-slot replay window, roaming to the source of the latest
 authenticated packet. Frames, one per datagram:
 
@@ -660,8 +678,7 @@ pylond switches keys when it answers and refuses data under keys older
 than 3 minutes. Streams carry on.
 
 Limits of v1: an IPv4 literal host, files of up to 64 MiB (held in
-memory whole) with printable-ASCII remote paths, no padding to 64 bytes, no cookie
-(`mac2`), no resume over UDP alone with a ticket (re-attach always takes
+memory whole) with printable-ASCII remote paths, no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).
 
 Confinement (8.4) as built: the daemon forks a PTY broker (the only

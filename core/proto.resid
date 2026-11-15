@@ -13,7 +13,7 @@
 // exchange was classical; the SSH channel authenticates who sent what.
 //
 // Handshake (UDP; HKDF(ck, x) = HMAC-SHA256 chaining as in Noise):
-//   init   1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(ts) (28) | mac1 (16)
+//   init   1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(ts) (28) | mac1 (16) | mac2 (16)
 //          h <- H(h | e_c | ek_e); ck <- HKDF(ck, DH(e_c, S)); ck <- HKDF(ck,
 //          DH(c, S)); (ck, k) <- HKDF2(ck, psk); ts sealed under k, aad h
 //   resp   2 | idx_s (4) | idx_c (4) | e_s (32) | ct_e (1088) | AEAD() (16) | mac1 (16)
@@ -26,7 +26,8 @@
 // S | psk), packet)[0..16]: a packet without it is dropped before any
 // other work (SPEC G11).
 //
-// Data   4 | idx_receiver (4) | counter (8, LE) | ChaCha20-Poly1305(payload)
+// Data   4 | idx_receiver (4) | counter (8, LE) | ChaCha20-Poly1305(length (2) |
+//        payload | zeros to a multiple of 64 bytes)
 
 import "crypto.resid";
 import "word.resid";
@@ -129,10 +130,58 @@ pub List(Int) mac1_key(List(Int) s_pub, List(Secret(UInt(8))) psk) {
 
 pub List(Int) mac1_of(List(Int) key, List(Int) body) { return hmac_bytes(Sha256, key, body)[0..16]; }
 
+// mac1 ends a response; in an init, mac2 (16 bytes) follows it.
 pub Bool mac1_ok(List(Int) key, List(Int) pkt) {
-    if (pkt.len() < 17) { return false; }
-    List(Int) want = mac1_of(key, pkt[0..pkt.len() - 16]);
-    return ct_equal(want, pkt[pkt.len() - 16..pkt.len()]);
+    if (pkt.len() < 33) { return false; }
+    Int end = if (pkt[0] == 1) { pkt.len() - 16 } else { pkt.len() };
+    List(Int) want = mac1_of(key, pkt[0..end - 16]);
+    return ct_equal(want, pkt[end - 16..end]);
+}
+
+// ============================================================================
+// Cookies under load (mac2, as in WireGuard)
+// ============================================================================
+
+// pylond under load answers an init that passed mac1 with a cookie
+// instead of doing any asymmetric work; the client sends the init again
+// with mac2 = HMAC(cookie, init up to mac2)[0..16]. The cookie is
+// HMAC(R, source address and port)[0..16], R a random secret pylond
+// replaces every two minutes, so it proves only that the client receives
+// at the address it sends from. The reply is sealed under a key derived
+// from the client's bootstrap secret, with the init's mac1 as associated
+// data:
+//   cookie  3 | 0 0 0 | idx_c (4) | nonce (12) | AEAD(cookie) (32)     52 bytes
+pub Int cookie_len() { return 52; }
+
+@requires(declassify)
+pub List(Int) cookie_key(List(Int) s_pub, List(Secret(UInt(8))) psk) {
+    return ints_of(declassify(secret_join(sha256g(lift(bytes_of("pylon/1 cookie").concat(s_pub)).concat(psk))), "cookie key: a hash of the bootstrap secret, sealing cookies under load"));
+}
+
+// The cookie for a source ([a, b, c, d, port_hi, port_lo]).
+pub List(Int) cookie_of(List(Int) secret, List(Int) src) { return hmac_bytes(Sha256, secret, src)[0..16]; }
+
+pub Bool mac2_ok(List(Int) cookie, List(Int) pkt) {
+    if (pkt.len() < 33 || cookie.len() != 16) { return false; }
+    return ct_equal(hmac_bytes(Sha256, cookie, pkt[0..pkt.len() - 16])[0..16], pkt[pkt.len() - 16..pkt.len()]);
+}
+
+@requires(declassify)
+pub List(Int) cookie_reply(List(Int) ckey, List(Int) init, List(Int) cookie) {
+    List(Int) nonce = random_bytes(12);
+    List(Int) mac1 = init[init.len() - 32..init.len() - 16];
+    return [3, 0, 0, 0].concat(init[4..8]).concat(nonce).concat(seal_pub(lift(ckey), nonce, cookie, mac1));
+}
+
+// The cookie in a reply to our init p, or [].
+@requires(declassify)
+pub List(Int) cookie_open(List(Int) ckey, Pending p, List(Int) pkt) {
+    List(Secret(UInt(8))) none = [];
+    if (pkt.len() != cookie_len() || pkt[0] != 3 || rd32(pkt, 4) != p.idx || p.pkt.len() != init_len()) { return []; }
+    List(Int) mac1 = p.pkt[p.pkt.len() - 32..p.pkt.len() - 16];
+    Option(List(Secret(UInt(8)))) c = chacha20poly1305g_decrypt(lift(ckey), pkt[8..20], pkt[20..52], mac1);
+    List(Secret(UInt(8))) cv = c else { none };
+    return if (cv.len() == 16) { pub_plain(cv) } else { [] };
 }
 
 // Session keys and indices once a handshake completes.
@@ -155,7 +204,11 @@ List(Int) seal_pub(List(Secret(UInt(8))) k, List(Int) nonce, List(Int) pt, List(
 pub List(Int) stamp(Int ns) { return u64_be(ns / 1000000000).concat(u32_be(ns % 1000000000)); }
 
 @requires(declassify)
-pub Pending hs_init(Boot b, Static c, Int now_ns) {
+pub Pending hs_init(Boot b, Static c, Int now_ns) { return hs_init_c(b, c, now_ns, []); }
+
+// An init with mac2 from a cookie pylond sent (zeros without one).
+@requires(declassify)
+pub Pending hs_init_c(Boot b, Static c, Int now_ns, List(Int) cookie) {
     Static e = static_new();
     MlkemKeys kem = mlkem768_keygen();
     Int idx = be32(random_bytes(4), 0) & 2147483647;
@@ -168,11 +221,12 @@ pub Pending hs_init(Boot b, Static c, Int now_ns) {
     List(Int) enc = seal_pub(t.b, zero_nonce(), stamp(now_ns), h2);
     List(Int) h3 = hpub(h2.concat(enc));
     List(Int) body = [1, 0, 0, 0].concat(le32(idx)).concat(e.pub).concat(kem.ek).concat(enc);
-    List(Int) pkt = body.concat(mac1_of(mac1_key(b.s_pub, b.psk), body));
-    return Pending {.pkt = pkt, .ck = t.a, .h = h3, .e = e, .kem = kem, .idx = idx};
+    List(Int) m1 = body.concat(mac1_of(mac1_key(b.s_pub, b.psk), body));
+    List(Int) m2 = if (cookie.len() == 16) { hmac_bytes(Sha256, cookie, m1)[0..16] } else { [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+    return Pending {.pkt = m1.concat(m2), .ck = t.a, .h = h3, .e = e, .kem = kem, .idx = idx};
 }
 
-pub Int init_len() { return 4 + 4 + 32 + 1184 + 28 + 16; }
+pub Int init_len() { return 4 + 4 + 32 + 1184 + 28 + 16 + 16; }
 pub Int resp_len() { return 4 + 4 + 4 + 32 + 1088 + 16 + 16; }
 
 // The responder's view of an init (mac1 already checked by the caller).
@@ -247,10 +301,17 @@ List(Int) nonce_of(Int ctr) { return [0, 0, 0, 0].concat(le64(ctr)); }
 List(Int) le64(Int v) { return le32(v & 4294967295).concat(le32((v >> 32) & 2147483647)); }
 Int rd64(List(Int) b, Int i) { return rd32(b, i) | (rd32(b, i + 4) << 32); }
 
+// The plaintext is length (2) | payload | zeros, padded to a multiple of
+// 64 bytes (SPEC 9.4), so sizes on the wire say little about what moves.
 @requires(declassify)
 pub List(Int) data_seal(SessionKeys k, Int ctr, List(Int) payload) {
-    return [4, 0, 0, 0].concat(le32(k.their_idx)).concat(le64(ctr)).concat(seal_pub(k.tx, nonce_of(ctr), payload, []));
+    Int n = payload.len() + 2;
+    Int padded = ((n + 63) / 64) * 64;
+    List(Int) pt = [(payload.len() >> 8) & 255, payload.len() & 255].concat(payload).concat(zeros(padded - n, []));
+    return [4, 0, 0, 0].concat(le32(k.their_idx)).concat(le64(ctr)).concat(seal_pub(k.tx, nonce_of(ctr), pt, []));
 }
+
+List(Int) zeros(Int n, List(Int) acc) { if (n <= 0) { return acc; } return zeros(n - 1, acc.concat([0])); }
 
 // The receiver index of a data packet, or -1.
 pub Int data_idx(List(Int) pkt) { return if (pkt.len() >= 32 && pkt[0] == 4) { rd32(pkt, 4) } else { -1 }; }
@@ -263,10 +324,10 @@ pub DataIn data_open(SessionKeys k, List(Int) pkt) {
     if (pkt.len() < 32 || pkt[0] != 4 || rd32(pkt, 4) != k.my_idx) { return DataIn {.ok = false, .ctr = 0, .payload = []}; }
     Int ctr = rd64(pkt, 8);
     Option(List(Secret(UInt(8)))) pt = chacha20poly1305g_decrypt(k.rx, nonce_of(ctr), pkt[16..pkt.len()], []);
-    return match pt {
-        None => DataIn {.ok = false, .ctr = 0, .payload = []},
-        Some(x) => DataIn {.ok = true, .ctr = ctr, .payload = pub_plain(x)},
-    };
+    List(Int) b = match pt { None => [], Some(x) => pub_plain(x) };
+    Int n = if (b.len() >= 64 && b.len() % 64 == 0) { b[0] * 256 + b[1] } else { -1 };
+    if (n < 0 || n + 2 > b.len()) { return DataIn {.ok = false, .ctr = 0, .payload = []}; }
+    return DataIn {.ok = true, .ctr = ctr, .payload = b[2..2 + n]};
 }
 
 // A replay window over the last 2048 counters: slot ctr % 2048 holds the

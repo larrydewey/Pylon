@@ -40,13 +40,14 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Port forwarding | `-N` with `-L [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT` (SOCKS5, host names validated), `-R [localhost:]RPORT:HOST:HOSTPORT` (server binds loopback; only requested ports, each to its own destination); loopback binds only |
 | Files | `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3); a local file is never replaced without `--force`; server messages shown escaped; over the Pylon protocol (`--pylond FILE`) resumable with `--resume` (per-chunk hashes, the whole file's hash checked) |
 | Jump hosts | `-J USER@JUMP[:PORT]` on any command: the jump host is verified under its own pins, the target under its own, end to end through a direct-tcpip channel; no agent forwarding |
-| Pylon protocol (experimental) | `--pylond FILE USER@HOST` (a terminal) or `--pylond FILE -N -L/-D/-R ...`: pushes `pylond` over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel, closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; silent to unauthenticated datagrams (SPEC 9.7) |
+| Pylon protocol (experimental) | `--pylond FILE USER@HOST` (a terminal) or `--pylond FILE -N -L/-D/-R ...`: pushes `pylond` over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel, closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; packets padded to 64 bytes; silent to unauthenticated datagrams, and under load a cookie (`mac2`) before any asymmetric work (SPEC 9.7) |
 | Host trust | pinned keys (`pylon pin HOST FINGERPRINT`; re-pinning replaces the old key) or host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked); a changed key names the old pin; `pylon history [HOST]` |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-72 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
-ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying),
+119 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
+-L/-D/-R forwards, resumable files, cookies under load, padding),
 post-quantum and hostile-server cases in `tests/interop.sh`,
 known-answer tests for the key derivation in `tests/kex_test.resid`, and
 a mutation fuzzer in `tests/fuzz_proxy.py`.
@@ -85,7 +86,7 @@ USER@HOST` opens an interactive shell. Pinned keys live in
 ```sh
 tests/interop.sh build/pylon      # needs sshd, ssh-keygen, ssh-agent, python3
 residc test tests/kex_test.resid  # key derivation known answers
-residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, replay
+residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, replay, padding, cookies
 residc test tests/term_test.resid  # the terminal emulator core
 
 # Fuzzing through a mutating proxy in front of a running sshd (port 2222),
