@@ -145,8 +145,10 @@ Material no_material() { return Material {.h = [], .iv_c = [], .iv_s = [], .key_
 // (OpenSSH's included) branches on K's leading bytes to build it: the
 // kind of timing difference the Raccoon attack used against TLS. Here
 // every possible encoding is hashed and the right results are selected
-// with masks, so nothing in the exchange branches on K, indexes by it or
-// publishes any part of it. A shape is (z, pad): z leading zero bytes
+// with ct_select, so nothing in the exchange branches on K, indexes by it
+// or publishes any part of it. (ct_select, rather than an xor mask, is
+// also what lets the compiler's key-entropy check (E0270) see that the
+// result is one of the candidates, each as unpredictable as K.) A shape is (z, pad): z leading zero bytes
 // stripped, pad whether a zero byte is prepended; K = 0 cannot occur
 // (x25519g_shared refuses it), so z < 32.
 
@@ -185,14 +187,14 @@ List(Secret(UInt(8))) encode_as(List(Secret(UInt(8))) k, Int z, Bool pad) {
     return lift(head).concat(k[z..32]);
 }
 
-// acc where mask is 0x00, cand where it is 0xFF, byte by byte.
-List(Secret(UInt(8))) pick(List(Secret(UInt(8))) acc, List(Secret(UInt(8))) cand, Secret(UInt(8)) mask) {
-    return pick_acc(acc, cand, mask, 0, ListBuf());
+// cand where `take` holds, else acc, byte by byte.
+List(Secret(UInt(8))) pick(List(Secret(UInt(8))) acc, List(Secret(UInt(8))) cand, Secret(Bool) take) {
+    return pick_acc(acc, cand, take, 0, ListBuf());
 }
 
-List(Secret(UInt(8))) pick_acc(List(Secret(UInt(8))) a, List(Secret(UInt(8))) c, Secret(UInt(8)) m, Int i, ListBuf(Secret(UInt(8))) out) {
+List(Secret(UInt(8))) pick_acc(List(Secret(UInt(8))) a, List(Secret(UInt(8))) c, Secret(Bool) take, Int i, ListBuf(Secret(UInt(8))) out) {
     if (i >= a.len()) { return out.finish(); }
-    return pick_acc(a, c, m, i + 1, out.push(a[i] ^ ((a[i] ^ c[i]) & m)));
+    return pick_acc(a, c, take, i + 1, out.push(ct_select(take, c[i], a[i])));
 }
 
 // Everything derived from K under one shape: H, then the four outputs of
@@ -209,7 +211,7 @@ Derived derive_shape(List(Secret(UInt(8))) kenc, List(Int) hin, List(Int) old_si
     };
 }
 
-Derived pick_derived(Derived a, Derived c, Secret(UInt(8)) m) {
+Derived pick_derived(Derived a, Derived c, Secret(Bool) m) {
     return Derived {.h = pick(a.h, c.h, m), .iv_c = pick(a.iv_c, c.iv_c, m), .iv_s = pick(a.iv_s, c.iv_s, m),
         .key_c = pick(a.key_c, c.key_c, m), .key_s = pick(a.key_s, c.key_s, m)};
 }
@@ -219,8 +221,8 @@ Derived all_shapes(List(Secret(UInt(8))) k, List(Int) hin, List(Int) old_sid, In
     if (z >= 32) { return acc; }
     Derived d0 = derive_shape(encode_as(k, z, false), hin, old_sid, ivc, ivs, kc, ks);
     Derived d1 = derive_shape(encode_as(k, z, true), hin, old_sid, ivc, ivs, kc, ks);
-    Derived a1 = pick_derived(acc, d0, shape_mask(k, z, false));
-    Derived a2 = pick_derived(a1, d1, shape_mask(k, z, true));
+    Derived a1 = pick_derived(acc, d0, ct_nonzero(shape_mask(k, z, false)));
+    Derived a2 = pick_derived(a1, d1, ct_nonzero(shape_mask(k, z, true)));
     return all_shapes(k, hin, old_sid, ivc, ivs, kc, ks, z + 1, a2);
 }
 

@@ -121,6 +121,12 @@ ssh-add -q -D; ssh-add -q user_ed25519
 check "4 MiB of output"                        0 "4194304" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'head -c 4194304 /dev/zero' | wc -c"
 
+# --- interactive shell on a pty -----------------------------------------------
+check "interactive shell: type, resize, paste, exit status" 0 "interactive ok" \
+    python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
+check "interactive without a terminal is refused" 2 "needs a terminal" \
+    bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' < /dev/null"
+
 # --- an agent with no acceptable key -----------------------------------------
 ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger
 check "unknown user key fails cleanly"         1 "accepted none" \

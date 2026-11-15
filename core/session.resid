@@ -1,7 +1,6 @@
-// The connection protocol (RFC 4254): one session channel running a
-// command, with flow control and the exit status. Phase 0 runs exec
-// sessions (`pylon HOST COMMAND`); interactive shells need the
-// non-blocking standard input of SPEC 16.
+// The connection protocol (RFC 4254): one session channel, either running
+// a command (exec) or an interactive shell on a pseudo-terminal, with flow
+// control in both directions and the exit status.
 
 import "crypto.resid";
 import "wire.resid";
@@ -21,78 +20,129 @@ pub Int msg_channel_failure() { return 100; }
 
 Int our_window() { return 2097152; }
 Int our_max_packet() { return 32768; }
+Int max_window() { return 4294967295; }
 
 // remote: the server's channel number. window: what we still allow the
-// server to send before we adjust. status: the exit status, -1 unknown.
-pub type Chan = { Conn c; Int remote; Int window; Int status; Str err; };
+// server to send before we adjust. rwin / rmax: what the server allows us
+// to send, and its largest data packet. status: the exit status, -1
+// unknown. closed: the server closed the channel. raw: output passes to
+// the terminal as bytes (an interactive session on a pty); otherwise the
+// stderr stream is escaped (SPEC 12: a host cannot hide escape sequences
+// in a command's error output).
+pub type Chan = { Conn c; Int remote; Int window; Int rwin; Int rmax; Int status; Bool closed; Bool raw; Str err; };
 
-Chan chan_err(Conn c, Str e) { return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .status = -1, .err = e}; }
+Chan chan_err(Chan ch, Conn c, Str e) {
+    return Chan {.c = conn_err(c, e), .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .err = e};
+}
+
+Chan with_conn(Chan ch, Conn c) {
+    if (!conn_ok(c)) { return chan_err(ch, c, c.err); }
+    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .err = ch.err};
+}
+
+Chan with_flow(Chan ch, Conn c, Int window, Int rwin) {
+    return Chan {.c = c, .remote = ch.remote, .window = window, .rwin = rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .err = ch.err};
+}
+
+Chan with_end(Chan ch, Conn c, Int status, Bool closed) {
+    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = status, .closed = closed, .raw = ch.raw, .err = ch.err};
+}
+
+pub Bool chan_ok(Chan ch) { return str_len(ch.err) == 0; }
+
+Chan no_chan(Conn c, Str e) {
+    return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .rwin = 0, .rmax = 0, .status = -1, .closed = true, .raw = false, .err = e};
+}
 
 @requires(network, declassify)
 pub Chan open_session(Conn c0) {
     List(Int) p = [msg_channel_open()].concat(sstr("session")).concat(u32_be(0)).concat(u32_be(our_window())).concat(u32_be(our_max_packet()));
     Conn c1 = send_packet(c0, p);
     Pkt k = next_msg(c1);
-    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
-    if (k.p[0] == msg_channel_open_failure()) { return chan_err(k.c, "the server refused to open a session channel"); }
-    if (k.p[0] != msg_channel_open_confirmation()) { return chan_err(k.c, "unexpected reply to channel open"); }
+    if (!conn_ok(k.c)) { return no_chan(k.c, k.c.err); }
+    if (k.p[0] == msg_channel_open_failure()) { return no_chan(k.c, "the server refused to open a session channel"); }
+    if (k.p[0] != msg_channel_open_confirmation()) { return no_chan(k.c, "unexpected reply to channel open"); }
     GotInt ours = rd_u32(rd_at(k.p, 1));
     GotInt theirs = rd_u32(ours.r);
-    if (!rd_ok(theirs.r) || ours.v != 0) { return chan_err(k.c, "malformed channel open confirmation"); }
-    return Chan {.c = k.c, .remote = theirs.v, .window = our_window(), .status = -1, .err = ""};
+    GotInt win = rd_u32(theirs.r);
+    GotInt maxp = rd_u32(win.r);
+    if (!rd_ok(maxp.r) || ours.v != 0 || maxp.v < 1) { return no_chan(k.c, "malformed channel open confirmation"); }
+    // Never more than 32 KiB per packet, whatever the server allows.
+    Int rmax = if (maxp.v > our_max_packet()) { our_max_packet() } else { maxp.v };
+    return Chan {.c = k.c, .remote = theirs.v, .window = our_window(), .rwin = win.v, .rmax = rmax, .status = -1, .closed = false, .raw = false, .err = ""};
 }
 
-// A channel request that wants a reply.
+// A channel request that wants a reply; other channel traffic that
+// arrives first (a window adjust) is handled on the way.
 @requires(network, declassify)
 pub Chan request(Chan ch, Str kind, List(Int) data) {
     List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr(kind)).concat(sbool(true)).concat(data);
-    Conn c1 = send_packet(ch.c, p);
-    Pkt k = next_msg(c1);
-    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
-    if (k.p[0] == msg_channel_window_adjust()) { return request_wait(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""}, kind); }
-    if (k.p[0] != msg_channel_success()) { return chan_err(k.c, "the server refused the " + kind + " request"); }
-    return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
+    return request_wait(with_conn(ch, send_packet(ch.c, p)), kind);
 }
 
 @requires(network, declassify)
 Chan request_wait(Chan ch, Str kind) {
+    if (!chan_ok(ch)) { return ch; }
     Pkt k = next_msg(ch.c);
-    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
-    if (k.p[0] == msg_channel_window_adjust()) { return request_wait(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""}, kind); }
-    if (k.p[0] != msg_channel_success()) { return chan_err(k.c, "the server refused the " + kind + " request"); }
-    return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
+    if (!conn_ok(k.c)) { return chan_err(ch, k.c, k.c.err); }
+    if (k.p[0] == msg_channel_success()) { return with_conn(ch, k.c); }
+    if (k.p[0] == msg_channel_failure()) { return chan_err(ch, k.c, "the server refused the " + kind + " request"); }
+    return request_wait(handle(ch, k), kind);
 }
 
 @requires(network, declassify)
 pub Chan exec(Chan ch, Str command) { return request(ch, "exec", sstr(command)); }
 
-// Copy the channel's output to stdout (and stderr's, escaped, to
-// stderr) until the server closes it; the result carries the exit status.
-// Standard output is the principal's own command output and passes as
-// bytes; stderr goes through display_text so a host cannot hide escape
-// sequences in it.
+// A pseudo-terminal (RFC 4254 6.2) of the given size, then a shell. The
+// terminal modes are left to the server's defaults (only TTY_OP_END).
 @requires(network, declassify)
-pub Chan pump(Chan ch) {
+pub Chan shell(Chan ch, Str term, Int cols, Int rows) {
+    List(Int) pty = sstr(term).concat(u32_be(cols)).concat(u32_be(rows)).concat(u32_be(0)).concat(u32_be(0)).concat(sstring([0]));
+    Chan p = request(ch, "pty-req", pty);
+    if (!chan_ok(p)) { return p; }
+    Chan s = request(p, "shell", []);
+    return Chan {.c = s.c, .remote = s.remote, .window = s.window, .rwin = s.rwin, .rmax = s.rmax, .status = s.status, .closed = s.closed, .raw = true, .err = s.err};
+}
+
+@requires(network, declassify)
+pub Chan window_change(Chan ch, Int cols, Int rows) {
+    List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr("window-change")).concat(sbool(false))
+        .concat(u32_be(cols)).concat(u32_be(rows)).concat(u32_be(0)).concat(u32_be(0));
+    return with_conn(ch, send_packet(ch.c, p));
+}
+
+// ============================================================================
+// Receiving
+// ============================================================================
+
+// Wait for and handle one channel message.
+@requires(network, declassify)
+pub Chan step(Chan ch) {
+    if (!chan_ok(ch) || ch.closed) { return ch; }
     Pkt k = next_msg(ch.c);
-    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
+    if (!conn_ok(k.c)) { return chan_err(ch, k.c, k.c.err); }
+    return handle(ch, k);
+}
+
+@requires(network, declassify)
+Chan handle(Chan ch, Pkt k) {
     Int t = k.p[0];
     GotInt rc = rd_u32(rd_at(k.p, 1));
-    if ((t == msg_channel_data() || t == msg_channel_extended_data()) && rc.v != 0) { return chan_err(k.c, "the server sent data for a channel that is not open"); }
-    if (t == msg_channel_data()) {
-        Got d = rd_str(rc.r);
-        if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(k.c, "the server exceeded the channel's window or packet size"); }
-        _ = print_bytes(d.v);
-        return pump(adjust(Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .status = ch.status, .err = ""}));
+    if (t >= msg_channel_window_adjust() && t <= msg_channel_failure() && (!rd_ok(rc.r) || rc.v != 0)) {
+        return chan_err(ch, k.c, "the server sent a message for a channel that is not open");
     }
-    if (t == msg_channel_extended_data()) {
-        GotInt kind = rd_u32(rc.r);
+    if (t == msg_channel_data() || t == msg_channel_extended_data()) {
+        GotInt kind = if (t == msg_channel_extended_data()) { rd_u32(rc.r) } else { GotInt {.r = rc.r, .v = 0} };
         Got d = rd_str(kind.r);
-        if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(k.c, "the server exceeded the channel's window or packet size"); }
-        // Phase 0 has only line output on stderr: one trailing newline is
-        // folded into eprintln's.
-        List(Int) e = if (d.v.len() > 0 && d.v[d.v.len() - 1] == 10) { d.v[0..d.v.len() - 1] } else { d.v };
-        eprintln(display_text(e));
-        return pump(adjust(Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .status = ch.status, .err = ""}));
+        if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(ch, k.c, "the server exceeded the channel's window or packet size"); }
+        _ = if (t == msg_channel_data() || ch.raw) { print_bytes(d.v) } else { err_text(d.v) };
+        return adjust(with_flow(ch, k.c, ch.window - d.v.len(), ch.rwin));
+    }
+    if (t == msg_channel_window_adjust()) {
+        GotInt add = rd_u32(rc.r);
+        Int w = ch.rwin + add.v;
+        if (!rd_ok(add.r) || w > max_window()) { return chan_err(ch, k.c, "the server sent a malformed window adjust"); }
+        return with_flow(ch, k.c, ch.window, w);
     }
     if (t == msg_channel_request()) {
         GotText kind = rd_text(rc.r);
@@ -100,14 +150,29 @@ pub Chan pump(Chan ch) {
         GotInt code = rd_u32(want.r);
         Int st = if (kind.v == "exit-status" && rd_ok(code.r)) { code.v } else { ch.status };
         Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_channel_failure()].concat(u32_be(ch.remote))) } else { k.c };
-        return pump(Chan {.c = c2, .remote = ch.remote, .window = ch.window, .status = st, .err = ""});
+        return with_end(ch, c2, st, false);
     }
     if (t == msg_channel_close()) {
         Conn c2 = send_packet(k.c, [msg_channel_close()].concat(u32_be(ch.remote)));
-        return Chan {.c = c2, .remote = ch.remote, .window = ch.window, .status = ch.status, .err = ""};
+        return with_end(ch, c2, ch.status, true);
     }
-    // EOF, window adjusts for our (empty) send side, and the rest.
-    return pump(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = ch.status, .err = ""});
+    // EOF, replies to requests that wanted none, and anything else.
+    return with_conn(ch, k.c);
+}
+
+// Phase 0 has only line output for escaped stderr: one trailing newline
+// is folded into eprintln's.
+Bool err_text(List(Int) b) {
+    List(Int) e = if (b.len() > 0 && b[b.len() - 1] == 10) { b[0..b.len() - 1] } else { b };
+    eprintln(display_text(e));
+    return true;
+}
+
+// Copy the channel's output until the server closes it.
+@requires(network, declassify)
+pub Chan pump(Chan ch) {
+    if (!chan_ok(ch) || ch.closed) { return ch; }
+    return pump(step(ch));
 }
 
 // Give the server more window once half of it is used.
@@ -116,5 +181,106 @@ Chan adjust(Chan ch) {
     if (ch.window > our_window() / 2) { return ch; }
     Int add = our_window() - ch.window;
     Conn c2 = send_packet(ch.c, [msg_channel_window_adjust()].concat(u32_be(ch.remote)).concat(u32_be(add)));
-    return Chan {.c = c2, .remote = ch.remote, .window = our_window(), .status = ch.status, .err = ""};
+    return with_flow(ch, c2, our_window(), ch.rwin);
+}
+
+// ============================================================================
+// Sending
+// ============================================================================
+
+// Send `b` as channel data within the server's window and packet size,
+// waiting for window adjusts when the window is closed.
+@requires(network, declassify)
+pub Chan send_data(Chan ch, List(Int) b) {
+    if (!chan_ok(ch) || ch.closed || b.len() == 0) { return ch; }
+    if (ch.rwin <= 0) { return send_data(step(ch), b); }
+    Int n0 = if (b.len() < ch.rmax) { b.len() } else { ch.rmax };
+    Int n = if (n0 < ch.rwin) { n0 } else { ch.rwin };
+    Conn c2 = send_packet(ch.c, [msg_channel_data()].concat(u32_be(ch.remote)).concat(sstring(b[0..n])));
+    return send_data(with_flow(ch, c2, ch.window, ch.rwin - n), b[n..b.len()]);
+}
+
+@requires(network, declassify)
+pub Chan send_eof(Chan ch) {
+    if (!chan_ok(ch) || ch.closed) { return ch; }
+    return with_conn(ch, send_packet(ch.c, [msg_channel_eof()].concat(u32_be(ch.remote))));
+}
+
+// ============================================================================
+// Interactive
+// ============================================================================
+//
+// Keystroke timing (SPEC 5). Sent as typed, each key is its own packet and
+// the gaps between packets are the gaps between keystrokes, which leak
+// typing rhythm (and so passwords) to anyone watching the connection. As
+// OpenSSH 9.5+ does, once the principal types, Pylon sends on a fixed
+// 20 ms clock: what was typed in the last tick goes out at the tick, and
+// a tick with nothing typed sends a chaff packet of exactly the size of a
+// one-key data packet, for one to two seconds after the last keystroke.
+// Chaff is SSH2_MSG_PING when the server supports ping@openssh.com (its
+// PONG then looks like an echo), else SSH_MSG_IGNORE.
+
+Int tick_ns() { return 20000000; }
+Int msg_ping() { return 192; }
+
+// on: obfuscating. next: the next tick. until: chaff stops then.
+// pending: typed, not yet sent.
+pub type Keys = { Bool on; Int next; Int until; List(Int) pending; };
+
+pub Keys keys_new(Bool on) { return Keys {.on = on, .next = 0, .until = 0, .pending = []}; }
+
+// A chaff payload the size of a one-key CHANNEL_DATA payload (type,
+// channel, length, one byte = 10 bytes), so both seal to equal lengths.
+List(Int) chaff(Conn c) {
+    if (c.ping) { return [msg_ping()].concat(sstring(random_bytes(5))); }
+    return [msg_ignore()].concat(sstring(random_bytes(5)));
+}
+
+// Milliseconds to wait in poll: until the next tick while the clock runs,
+// else half a second (to notice terminal resizes).
+Int wait_ms(Keys k, Int now) {
+    Bool running = k.on && (k.pending.len() > 0 || now < k.until);
+    if (!running) { return 500; }
+    Int ns = k.next - now;
+    return if (ns <= 0) { 0 } else { (ns + 999999) / 1000000 };
+}
+
+// The interactive loop: the socket and the keyboard are polled together;
+// a packet already buffered is handled without waiting; the terminal's
+// size is checked at least every half second and sent when it changed.
+// Ends when the server closes the channel.
+@requires(network, declassify, terminal, clock(readonly))
+pub Chan interact(Chan ch, Int cols, Int rows, Bool in_eof, Keys k) {
+    if (!chan_ok(ch) || ch.closed) { return ch; }
+    Int now = clock.monotonic_ns();
+    Bool buffered = ch.c.buf.len() > 0;
+    List(Int) fds = if (in_eof) { [ch.c.fd] } else { [ch.c.fd, 0] };
+    List(Int) wants = if (in_eof) { [1] } else { [1, 1] };
+    List(Int) ready = resid_tcp_poll(fds, wants, if (buffered) { 0 } else { wait_ms(k, now) });
+    Bool net = buffered || (ready.len() > 0 && (ready[0] & 1) != 0);
+    Bool key = !in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
+    Chan a = if (net) { step(ch) } else { ch };
+    List(Int) got = if (key && chan_ok(a) && !a.closed) { resid_read_some(4096) } else { [] };
+    Bool now_eof = in_eof || (key && got.len() == 0);
+    Int t = clock.monotonic_ns();
+    // Without obfuscation keys go out at once; with it they wait for the
+    // tick, and typing (re)starts the clock and extends the chaff period.
+    Chan b0 = if (!k.on && got.len() > 0) { send_data(a, got) } else { a };
+    Bool idle = k.pending.len() == 0 && t >= k.until;
+    Keys k1 = if (k.on && got.len() > 0) {
+        Keys {.on = true, .next = if (idle) { t + tick_ns() } else { k.next }, .until = t + 1000000000 + (random_bytes(1)[0] * 4000000), .pending = k.pending.concat(got)}
+    } else { k };
+    // A tick that is due: the queued keys, or chaff.
+    Bool due = k1.on && (k1.pending.len() > 0 || t < k1.until) && t >= k1.next;
+    Chan b1 = if (due && k1.pending.len() > 0) { send_data(b0, k1.pending) } else {
+        if (due) { with_conn(b0, send_packet(b0.c, chaff(b0.c))) } else { b0 } };
+    Int nxt = if (t - k1.next > 5 * tick_ns()) { t + tick_ns() } else { k1.next + tick_ns() };
+    Keys k2 = if (due) { Keys {.on = true, .next = nxt, .until = k1.until, .pending = []} } else { k1 };
+    // End of input: whatever is queued, then EOF.
+    Chan b = if (now_eof && !in_eof) { send_eof(send_data(b1, k2.pending)) } else { b1 };
+    Keys k3 = if (now_eof && !in_eof) { keys_new(false) } else { k2 };
+    Int nc = resid_term_cols();
+    Int nr = resid_term_rows();
+    Chan d = if (nc != cols || nr != rows) { window_change(b, nc, nr) } else { b };
+    return interact(d, nc, nr, now_eof, k3);
 }

@@ -739,14 +739,14 @@ Implementation findings in the phase-0 code, fixed with this revision:
 - **I4** Encoding K as an mpint branches on its leading bytes in common
   implementations (OpenSSH's included), a timing signal of the kind the
   Raccoon attack exploited in TLS. Pylon hashes all 64 possible
-  encodings and selects the results with masks, so nothing branches on,
-  indexes by or publishes any part of K (known-answer tests in
-  `tests/kex_test.resid` cover every shape). *Open:* Resid's key-entropy
-  analysis (E0270, a warning during its rollout) does not yet follow a
-  masked selection between values that both depend on a secret, and so
-  reports the cipher keys as unpredictable-byte-free; a Resid change
-  that treats `a ^ ((a ^ c) & m)` (or `ct_select` over byte lists) as a
-  selection is needed to clear it.
+  encodings and keeps the right results with `ct_select`, its condition
+  from `ct_nonzero` over K's bytes, so nothing branches on, indexes by or
+  publishes any part of K (known-answer tests in `tests/kex_test.resid`
+  cover every shape). Resid gained `ct_nonzero` and its key-entropy
+  analysis (E0270) now counts `ct_select` as a selection of its arms, so
+  the compiler verifies the cipher keys rest on the exchange's draw; a
+  masked xor (`a ^ ((a ^ c) & m)`) is still, correctly, not trusted,
+  since it can cancel.
 - **I5** The parsers had no fuzz targets. `tests/fuzz_proxy.py` mutates a
   real sshd's byte stream (bit flips, deletions, insertions, in the
   cleartext handshake and in encrypted traffic) and requires every run to

@@ -1,7 +1,8 @@
 // pylon: the phase-0 command-line client (SPEC 17).
 //
-//   pylon [-p PORT] [--allow-no-strict] USER@HOST COMMAND...
-//       Run COMMAND on HOST, authenticating with the agent at
+//   pylon [-p PORT] [--allow-no-strict] USER@HOST [COMMAND...]
+//       Run COMMAND on HOST, or with no COMMAND an interactive shell on a
+//       pseudo-terminal, authenticating with the agent at
 //       SSH_AUTH_SOCK (Symbolon's `symbolon ssh-agent`, or any agent
 //       that supports session-bind@openssh.com).
 //
@@ -18,7 +19,7 @@ import "../core/auth.resid";
 import "../core/session.resid";
 import "../core/known.resid";
 
-type Opts = { Int port; Bool no_strict; List(Str) rest; Str err; };
+type Opts = { Int port; Bool no_strict; Bool no_obfuscate; List(Str) rest; Str err; };
 
 @requires(args)
 Opts parse(Int i, Opts o) {
@@ -26,22 +27,23 @@ Opts parse(Int i, Opts o) {
     Str a = args.get(i);
     if (a == "-p" && i + 1 < args.count()) {
         Str v = args.get(i + 1);
-        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .rest = [], .err = "bad port " + v}; }
-        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .rest = [], .err = ""});
+        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = "bad port " + v}; }
+        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = ""});
     }
-    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .rest = [], .err = ""}); }
-    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .rest = [], .err = "unknown option " + a}; }
+    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .rest = [], .err = ""}); }
+    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .rest = [], .err = ""}); }
+    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = [], .err = "unknown option " + a}; }
     return rest_from(i, o);
 }
 
 @requires(args)
 Opts rest_from(Int i, Opts o) {
     if (i >= args.count()) { return o; }
-    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .rest = o.rest.concat([args.get(i)]), .err = o.err});
+    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .rest = o.rest.concat([args.get(i)]), .err = o.err});
 }
 
 Int usage() {
-    eprintln("usage: pylon [-p PORT] [--allow-no-strict] USER@HOST COMMAND...");
+    eprintln("usage: pylon [-p PORT] [--allow-no-strict] [--no-obfuscate-keystrokes] USER@HOST [COMMAND...]");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
     return 2;
 }
@@ -76,14 +78,16 @@ Int cmd_pin(Opts o) {
     return 0;
 }
 
-@requires(network, filesystem, environment, declassify)
+@requires(network, filesystem, environment, declassify, terminal, clock(readonly))
 Int cmd_run(Opts o) {
-    if (o.rest.len() < 2) { return usage(); }
+    if (o.rest.len() < 1) { return usage(); }
+    Bool interactive = o.rest.len() == 1;
+    if (interactive && !resid_term_is_tty(0)) { eprintln("pylon: an interactive shell needs a terminal; give a COMMAND to run instead"); return 2; }
     List(Str) uh = str_split(o.rest[0], "@");
     if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(uh[1]) == 0) { eprintln("pylon: give the user as USER@HOST"); return 2; }
     Str user = uh[0];
     Str host = uh[1];
-    Str command = str_join(o.rest[1..o.rest.len()], " ");
+    Str command = if (interactive) { "" } else { str_join(o.rest[1..o.rest.len()], " ") };
     List(List(Int)) pinned = pinned_for(host_token(host, o.port));
     Int agent = agent_connect();
     if (agent < 0) { eprintln("pylon: no agent (set SSH_AUTH_SOCK to Symbolon's agent)"); return 1; }
@@ -100,18 +104,32 @@ Int cmd_run(Opts o) {
     _ = resid_tcp_deadline(a.c.fd, 0);
     Chan ch = open_session(a.c);
     if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
-    Chan ex = exec(ch, command);
-    if (str_len(ex.err) > 0) { eprintln("pylon: " + ex.err); return 1; }
-    Chan done = pump(ex);
+    Chan done = if (interactive) { run_shell(ch, environment.get("TERM"), !o.no_obfuscate) } else { pump(exec(ch, command)) };
     if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
     _ = disconnect(done.c, "done");
     return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
 }
 
-@requires(args, network, filesystem, environment, declassify)
+// The shell on a pty, with the local terminal in raw mode for its whole
+// life: restored on every way out (the runtime also restores it at exit
+// and on an abort).
+@requires(network, declassify, terminal, clock(readonly))
+Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
+    Str term = if (str_len(term0) > 0 && str_len(term0) < 64) { term0 } else { "xterm-256color" };
+    Int cols = resid_term_cols();
+    Int rows = resid_term_rows();
+    Chan s = shell(ch, term, cols, rows);
+    if (!chan_ok(s)) { return s; }
+    _ = resid_term_raw();
+    Chan done = interact(s, cols, rows, false, keys_new(obfuscate));
+    _ = resid_term_restore();
+    return done;
+}
+
+@requires(args, network, filesystem, environment, declassify, terminal, clock(readonly))
 Int main() {
     Bool is_pin = args.count() > 1 && args.get(1) == "pin";
-    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .rest = [], .err = ""});
+    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     return if (is_pin) { cmd_pin(o) } else { cmd_run(o) };
 }
