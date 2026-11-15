@@ -13,6 +13,7 @@ import "wire.resid";
 import "cipher.resid";
 import "hostkey.resid";
 import "kex.resid";
+import "dnssec.resid";
 
 pub Int msg_disconnect() { return 1; }
 pub Int msg_ignore() { return 2; }
@@ -224,19 +225,29 @@ Conn ext_acc(Conn c, Rd r, Int left) {
 // ============================================================================
 
 // The host trust input (SPEC 6): the keys pinned for this host, already
-// filtered by the caller's policy (certificates and SSHFP come later).
+// filtered by the caller's policy.
 // `probe` runs the exchange only to learn and verify the host's key, and
 // stops before NEWKEYS: `pylon pin` uses it to compare the key with a
 // fingerprint the principal obtained out of band.
 // `cas` are the CA keys the principal trusts for this host's name (SPEC
 // 6.1.1), `name` the host name certificates must name, `now` the time in
-// seconds since the epoch.
-pub type Trust = { List(List(Int)) pinned; Bool probe; List(List(Int)) cas; Str name; Int now; };
+// seconds since the epoch. `dns` is what DNSSEC-validated DNS says of the
+// host's SSHFP records (SPEC 6.1.2; state "" when not asked): consulted
+// only for a host with no pin, and only a secure match accepts a key.
+pub type Trust = { List(List(Int)) pinned; Bool probe; List(List(Int)) cas; Str name; Int now; Verdict dns; };
 
-pub Trust pinned_only(List(List(Int)) pinned) { return Trust {.pinned = pinned, .probe = false, .cas = [], .name = "", .now = 0}; }
-pub Trust probing() { return Trust {.pinned = [], .probe = true, .cas = [], .name = "", .now = 0}; }
+pub Trust pinned_only(List(List(Int)) pinned) { return Trust {.pinned = pinned, .probe = false, .cas = [], .name = "", .now = 0, .dns = no_dns()}; }
+pub Trust probing() { return Trust {.pinned = [], .probe = true, .cas = [], .name = "", .now = 0, .dns = no_dns()}; }
 
 pub Str probe_done() { return "probe: host key verified"; }
+
+// The plain key of a blob that may be a certificate.
+pub List(Int) plain_key_blob(List(Int) blob) {
+    GotText kind = rd_text(rd(blob));
+    if (!is_cert_alg(kind.v)) { return blob; }
+    Cert c = cert_of_blob(blob);
+    return if (c.ok) { c.key.blob } else { blob };
+}
 
 // Why a host key is refused under `t`, or "".
 pub Str trust_refusal(Trust t, List(Int) blob) {
@@ -247,10 +258,21 @@ pub Str trust_refusal(Trust t, List(Int) blob) {
         // A pinned key is trusted with or without its certificate.
         if (c.ok && pinned_has(t.pinned, c.key.blob, 0)) { return ""; }
         if (t.cas.len() > 0) { return cert_refusal(c, t.name, t.now, t.cas); }
-        return trust_refusal(Trust {.pinned = t.pinned, .probe = false, .cas = [], .name = t.name, .now = t.now}, c.key.blob);
+        return trust_refusal(Trust {.pinned = t.pinned, .probe = false, .cas = [], .name = t.name, .now = t.now, .dns = t.dns}, c.key.blob);
     }
     if (t.pinned.len() == 0) {
+        Str m = sshfp_match(t.dns, blob);
+        if (m == "match") { return ""; }
+        Str dl = if (str_len(t.dns.state) > 0) { verdict_line(t.dns) + "\n" } else { "" };
+        if (m == "mismatch") {
+            return "THE HOST KEY DOES NOT MATCH THE HOST'S DNSSEC-SIGNED SSHFP RECORDS.\n"
+                + "The connection was stopped before authenticating. The host presents\n"
+                + fingerprint(blob) + "; " + dl
+                + "Either the records are out of date or this is an interception. Compare the key\n"
+                + "with a value you get another way before you pin it: pylon pin HOST FINGERPRINT";
+        }
         return "this host is not pinned, and Pylon does not trust a key on first use.\n"
+            + dl
             + "Its key is " + fingerprint(blob) + ". Compare that with a value you get another way\n"
             + "(the host's console: ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub), then run\n"
             + "  pylon pin HOST FINGERPRINT";
@@ -279,7 +301,7 @@ pub type Handshake = { Conn c; PubKey host; Str fingerprint; };
 @requires(network, declassify)
 pub Handshake handshake(Conn c0, Trust trust, Bool allow_no_strict) {
     Conn c1 = version_exchange(c0);
-    List(Str) host_algs = (if (trust.cas.len() > 0) { our_cert_algs() } else { [] }).concat(host_key_order(key_types(trust.pinned, 0, [])));
+    List(Str) host_algs = (if (trust.cas.len() > 0) { our_cert_algs() } else { [] }).concat(host_key_order(key_types(trust.pinned, 0, []).concat(if (trust.pinned.len() == 0) { sshfp_key_types(trust.dns) } else { [] })));
     List(Int) i_c = kexinit_payload(host_algs, true);
     Conn c2 = send_packet(c1, i_c);
     // Strict kex: the server's first packet must be its KEXINIT.

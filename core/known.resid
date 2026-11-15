@@ -12,7 +12,8 @@
 // in $PYLON_HOME/known_hosts (default ~/.config/pylon). In phase 1 these
 // become Symbolon `pylon-host` vault items, synchronized and MAC'd
 // (SPEC 6.3). There is no trust on first use: a key is pinned only by
-// `pylon pin`, which requires the fingerprint obtained out of band.
+// `pylon pin`, which requires the fingerprint obtained out of band, or
+// after a DNSSEC-validated SSHFP record matched it (by=sshfp, SPEC 6.4).
 
 import "crypto.resid";
 import "wire.resid";

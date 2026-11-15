@@ -1,0 +1,57 @@
+// Out-of-band fingerprints (core/oob.resid, SPEC 6.1.4): bare values,
+// `ssh-keygen -lf` lines and the pylon-hostkey/1 QR payload.
+
+import "crypto.resid";
+import "../core/oob.resid";
+
+Str fp1() { return "SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4Wk"; }
+Str fp2() { return "SHA256:Zb1PvtoHrMXhVVg3TQ9SnT6sHstm+3KIUV549RqzP4Y"; }
+
+test "a bare fingerprint" {
+    Oob x = oob_parse(fp1());
+    assert(x.err == "" && x.fps.len() == 1 && x.fps[0] == fp1() && x.host == "", x.err);
+    Oob p = oob_parse(fp1() + "=");
+    assert(p.err == "" && p.fps[0] == fp1(), "padding accepted, normalized away");
+}
+
+test "ssh-keygen -lf lines, one or several" {
+    Oob a = oob_parse("256 " + fp1() + " root@vm (ED25519)");
+    assert(a.err == "" && a.fps.len() == 1 && a.fps[0] == fp1(), a.err);
+    Oob b = oob_parse("256 " + fp1() + " root@vm (ED25519)\n3072 " + fp2() + " root@vm (RSA)\r\n");
+    assert(b.err == "" && b.fps.len() == 2 && b.fps[1] == fp2(), b.err);
+    Oob c = oob_parse("256 " + fp1() + " a (ED25519)\n256 " + fp1() + " b (ED25519)");
+    assert(c.fps.len() == 1, "duplicates once");
+}
+
+test "refused: MD5, malformed, none, too many" {
+    assert(str_contains(oob_parse("2048 MD5:12:34:56 root@vm (RSA)").err, "MD5"), "MD5 refused");
+    assert(str_len(oob_parse("SHA256:abc").err) > 0, "too short");
+    assert(str_len(oob_parse("SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4W!").err) > 0, "bad character");
+    // The last character carries bits past 256: not the encoding of any digest.
+    assert(str_len(oob_parse("SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4Wl").err) > 0, "non-canonical");
+    assert(str_len(oob_parse("hello world").err) > 0, "no fingerprint");
+    assert(str_len(oob_parse("").err) > 0, "empty");
+    Str nine = str_join([fp1(), fp1(), fp1(), fp1(), fp1(), fp1(), fp1(), fp1(), fp1()], " ");
+    assert(oob_parse(nine).fps.len() == 1, "repeats are one");
+}
+
+test "the QR payload binds the fingerprints to a host" {
+    Oob a = oob_parse("pylon-hostkey/1 Example.ORG " + fp1() + " " + fp2());
+    assert(a.err == "" && a.host == "example.org" && a.port == 0 && a.fps.len() == 2, a.err);
+    Oob b = oob_parse("pylon-hostkey/1 db1.example.org:2222 " + fp1());
+    assert(b.err == "" && b.host == "db1.example.org" && b.port == 2222, b.err);
+    assert(payload_for("Example.org", 22, [fp1(), fp2()]) == "pylon-hostkey/1 example.org " + fp1() + " " + fp2(), "payload_for");
+    assert(payload_for("h", 2222, [fp1()]) == "pylon-hostkey/1 h:2222 " + fp1(), "payload_for with a port");
+    Oob r = oob_parse(payload_for("h.example", 2200, [fp2()]));
+    assert(r.host == "h.example" && r.port == 2200 && r.fps[0] == fp2(), "round trip");
+}
+
+test "the QR payload is strict" {
+    assert(str_len(oob_parse("pylon-hostkey/1 example.org").err) > 0, "no fingerprint");
+    assert(str_len(oob_parse("pylon-hostkey/1 example.org " + fp1() + " (ED25519)").err) > 0, "nothing but fingerprints");
+    assert(str_len(oob_parse("pylon-hostkey/1 example.org:0 " + fp1()).err) > 0, "port 0");
+    assert(str_len(oob_parse("pylon-hostkey/1 example.org:99999 " + fp1()).err) > 0, "port too large");
+    assert(str_len(oob_parse("pylon-hostkey/1 exa$mple.org " + fp1()).err) > 0, "host characters");
+    assert(str_contains(oob_parse("pylon-hostkey/2 example.org " + fp1()).err, "unknown payload version"), "version");
+    assert(str_len(oob_parse("pylon-hostkey/1 h " + str_join([fp1(), fp2(), fp1(), fp2(), fp1(), fp2(), fp1(), fp2(), fp1()], " ")).err) > 0, "at most 8");
+}

@@ -1,0 +1,111 @@
+// Out-of-band host key values (SPEC 6.1.4): what the principal pastes or
+// scans to pin a host, compared with the key the host presents.
+//
+// Accepted forms:
+//
+//   SHA256:BASE64                         a bare fingerprint
+//   256 SHA256:BASE64 root@h (ED25519)    lines of `ssh-keygen -lf`, one
+//                                          or more (every SHA256: field)
+//   pylon-hostkey/1 HOST[:PORT] SHA256:BASE64 [SHA256:BASE64 ...]
+//                                          the QR payload (SPEC 6.1.4):
+//                                          the fingerprints bound to the
+//                                          host they are for
+//
+// At most 8 fingerprints; MD5 fingerprints are refused, as is anything in
+// the payload form that is not exactly that.
+
+import "crypto.resid";
+
+// err: why the text is refused ("" when usable). host/port: from a
+// payload (host "" otherwise; port 0 when the payload names none). fps:
+// the fingerprints, normalized as `ssh-keygen -l` prints them.
+pub type Oob = { Str err; Str host; Int port; List(Str) fps; };
+
+Oob oob_err(Str e) { return Oob {.err = e, .host = "", .port = 0, .fps = []}; }
+
+pub Str payload_tag() { return "pylon-hostkey/1"; }
+
+pub Int oob_max() { return 8; }
+
+List(Str) words(Str s) {
+    Str t = str_replace(str_replace(str_replace(s, "\t", " "), "\r", " "), "\n", " ");
+    return nonempty(str_split(t, " "), 0, []);
+}
+List(Str) nonempty(List(Str) xs, Int i, List(Str) acc) {
+    if (i >= xs.len()) { return acc; }
+    return nonempty(xs, i + 1, if (str_len(xs[i]) > 0) { acc.concat([xs[i]]) } else { acc });
+}
+
+Bool b64_chars(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 43 || c == 47;
+    return ok && b64_chars(s, i + 1);
+}
+
+// "SHA256:" and 43 base64 characters (an optional "=" after) that decode
+// to 32 bytes; the normalized fingerprint, or "".
+pub Str fp_norm(Str w) {
+    if (!str_starts_with(w, "SHA256:")) { return ""; }
+    Str b = str_slice(w, 7, str_len(w));
+    Str core = if (str_len(b) == 44 && str_ends_with(b, "=")) { str_slice(b, 0, 43) } else { b };
+    if (str_len(core) != 43 || !b64_chars(core, 0)) { return ""; }
+    List(Int) d = base64_decode(core + "=");
+    if (d.len() != 32) { return ""; }
+    Str n = str_replace(base64_encode(d), "=", "");
+    return if (n == core) { "SHA256:" + n } else { "" };
+}
+
+pub Oob oob_parse(Str text) {
+    List(Str) ws = words(text);
+    if (ws.len() == 0) { return oob_err("no fingerprint given"); }
+    if (ws[0] == payload_tag()) { return payload(ws); }
+    if (str_starts_with(ws[0], "pylon-hostkey/")) { return oob_err("an unknown payload version (" + ws[0] + "); this Pylon reads " + payload_tag()); }
+    return loose(ws, 0, []);
+}
+
+Oob loose(List(Str) ws, Int i, List(Str) acc) {
+    if (i >= ws.len()) {
+        if (acc.len() == 0) { return oob_err("no SHA256: fingerprint found (give it as ssh-keygen -lf prints it)"); }
+        return Oob {.err = "", .host = "", .port = 0, .fps = acc};
+    }
+    Str w = ws[i];
+    if (str_starts_with(w, "MD5:")) { return oob_err("MD5 fingerprints are not accepted; use ssh-keygen -lf (SHA256, its default)"); }
+    if (!str_starts_with(w, "SHA256:")) { return loose(ws, i + 1, acc); }
+    Str n = fp_norm(w);
+    if (str_len(n) == 0) { return oob_err("a malformed fingerprint: " + w); }
+    if (acc.len() >= oob_max()) { return oob_err("more than " + f"{oob_max()}" + " fingerprints"); }
+    return loose(ws, i + 1, if (acc.contains(n)) { acc } else { acc.concat([n]) });
+}
+
+Oob payload(List(Str) ws) {
+    if (ws.len() < 3) { return oob_err("the payload names no host or no fingerprint"); }
+    if (ws.len() > 2 + oob_max()) { return oob_err("more than " + f"{oob_max()}" + " fingerprints"); }
+    List(Str) hp = str_split(ws[1], ":");
+    Str host = str_to_lower(hp[0]);
+    Bool port_ok = hp.len() == 1 || (hp.len() == 2 && str_is_int(hp[1]) && str_len(hp[1]) <= 5 && str_parse_int(hp[1]) >= 1 && str_parse_int(hp[1]) <= 65535);
+    if (str_len(host) == 0 || str_len(host) > 253 || !host_chars(host, 0) || !port_ok) { return oob_err("the payload's host is not HOST or HOST:PORT"); }
+    List(Str) fps = strict(ws, 2, []);
+    if (fps.len() == 0) { return oob_err("the payload holds something other than SHA256: fingerprints"); }
+    return Oob {.err = "", .host = host, .port = if (hp.len() == 2) { str_parse_int(hp[1]) } else { 0 }, .fps = fps};
+}
+
+List(Str) strict(List(Str) ws, Int i, List(Str) acc) {
+    if (i >= ws.len()) { return acc; }
+    Str n = fp_norm(ws[i]);
+    if (str_len(n) == 0) { return []; }
+    return strict(ws, i + 1, if (acc.contains(n)) { acc } else { acc.concat([n]) });
+}
+
+Bool host_chars(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95;
+    return ok && host_chars(s, i + 1);
+}
+
+// The payload for a host and its keys' fingerprints (what a host shows as
+// a QR code for the principal to scan).
+pub Str payload_for(Str host, Int port, List(Str) fps) {
+    return payload_tag() + " " + str_to_lower(host) + (if (port != 22 && port > 0) { ":" + f"{port}" } else { "" }) + " " + str_join(fps, " ");
+}
