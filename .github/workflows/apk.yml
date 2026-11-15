@@ -85,6 +85,27 @@ jobs:
             echo "SIGNED=debug" >> "$GITHUB_ENV"
           fi
 
+      - name: Signed pylond release (SPEC 8.2)
+        # The maintainers attach the release made with tools/release
+        # (pylond-x86_64, pylond-aarch64, pylond.release, pylond.proof) to
+        # the GitHub release; android-core.sh packs it once this build
+        # reproduces its code images. Without it the APK carries unsigned
+        # pylond builds, which its pylon refuses to push.
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          d="$RUNNER_TEMP/pylond-release"
+          mkdir -p "$d"
+          if gh release download "$TAG" -R "$REPO" -D "$d" -p 'pylond-x86_64' -p 'pylond-aarch64' -p 'pylond.release' -p 'pylond.proof' \
+             && [ -f "$d/pylond.release" ] && [ -f "$d/pylond.proof" ]; then
+            echo "PYLOND_RELEASE_DIR=$d" >> "$GITHUB_ENV"
+          else
+            echo "no signed pylond release attached to $TAG: the APK carries unsigned pylond builds"
+          fi
+
       - name: Core for Android
         working-directory: pylon
         env:

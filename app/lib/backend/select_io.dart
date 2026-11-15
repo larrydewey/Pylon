@@ -9,9 +9,9 @@ import 'process_backend.dart';
 const platform = MethodChannel('pylon/platform');
 
 /// The core's binaries. Android: libpylon.so and libpylon_term.so in the
-/// native library directory, the pylond builds unpacked from the app's
-/// assets, PYLON_HOME in the app's private files. Desktop: PYLON_BIN_DIR,
-/// else beside this executable, and PYLON_HOME as the command-line client
+/// native library directory, the pylond builds and their signed release
+/// unpacked from the app's assets, PYLON_HOME in the app's private files.
+/// Desktop: PYLON_BIN_DIR, else beside this executable, and PYLON_HOME as the command-line client
 /// uses it. With PYLON_DEMO=1, or no core found, the demo backend (which
 /// says so on every screen).
 Future<Backend> makeBackend() async {
@@ -20,9 +20,22 @@ Future<Backend> makeBackend() async {
     final bin = p['bin']!, files = p['files']!;
     final pylond = '$files/pylond';
     await Directory(pylond).create(recursive: true);
-    for (final arch in ['x86_64', 'aarch64']) {
-      final data = await rootBundle.load('assets/pylond/pylond-$arch');
-      await File('$pylond/pylond-$arch').writeAsBytes(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes), flush: true);
+    // The builds and their signed release (SPEC 8.2); pylon checks the
+    // release before it pushes a build, and refuses without one.
+    for (final name in ['pylond-x86_64', 'pylond-aarch64', 'pylond.release', 'pylond.proof']) {
+      final f = File('$pylond/$name');
+      Uint8List? bytes;
+      try {
+        final data = await rootBundle.load('assets/pylond/$name');
+        bytes = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+      } catch (_) {
+        bytes = null; // not in this build (an unsigned developer build)
+      }
+      if (bytes == null) {
+        if (await f.exists()) await f.delete();
+        continue;
+      }
+      await f.writeAsBytes(bytes, flush: true);
     }
     return ProcessBackend.at('$bin/libpylon.so', '$bin/libpylon_term.so', pylond, '$files/pylon',
         agent: (conn, req) async => await platform.invokeMethod<Uint8List>('agent', {'conn': conn, 'request': req}),

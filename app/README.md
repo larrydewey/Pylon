@@ -23,7 +23,9 @@ No third-party Dart packages. JetBrains Mono is bundled (OFL,
 residc ../cli/pylon.resid -o ../build/pylon
 residc ../cli/pylon_term.resid -o ../build/pylon-term
 residc ../cli/pylond.resid -o ../build/pylond
-PYLON_BIN_DIR=$PWD/../build flutter run -d linux
+# pylond goes to a host only as a signed, logged release (SPEC 8.2;
+# pylond.release and pylond.proof beside it); a local build opts out:
+PYLON_BIN_DIR=$PWD/../build flutter run -d linux --dart-define=PYLON_UNVERIFIED_PYLOND=true
 
 # the interface alone (demo data, says so on every screen)
 flutter build web && python3 -m http.server -d build/web
