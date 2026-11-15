@@ -80,8 +80,9 @@ Int peer_ns() { return 900000000000; }          // 15 minutes
 Int ephemeral_ns() { return 60000000000; }
 
 // A client: its bootstrap, mac1 key, link once it shook hands, last
-// handshake timestamp, and an id for the terminals it holds.
-type Peer = { Int id; Boot b; List(Int) mk; Bool linked; Link l; List(Int) stamp; Int born; };
+// handshake timestamp, an id for the terminals it holds, and the loopback
+// ports it asked pylond to listen on ([port, listening socket]).
+type Peer = { Int id; Boot b; List(Int) mk; Bool linked; Link l; List(Int) stamp; Int born; List(List(Int)) lsn; };
 
 // A terminal: id, the client and stream it is attached to (-1 when
 // detached), the pseudo-terminal's master, the shell's pid, the screen as
@@ -112,7 +113,8 @@ Srv sv_seen(Srv v, Int t) {
         .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t};
 }
 
-Peer pr_link(Peer p, Link l) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = l, .stamp = p.stamp, .born = p.born}; }
+Peer pr_link(Peer p, Link l) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = l, .stamp = p.stamp, .born = p.born, .lsn = p.lsn}; }
+Peer pr_lsn(Peer p, List(List(Int)) lsn) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = p.l, .stamp = p.stamp, .born = p.born, .lsn = lsn}; }
 
 Tty ty_attach(Tty t, Int peer, Int sid, Int now) { return Tty {.id = t.id, .peer = peer, .sid = sid, .fd = t.fd, .pid = t.pid, .t = t.t, .seen = now}; }
 Tty ty_term(Tty t, Term m) { return Tty {.id = t.id, .peer = t.peer, .sid = t.sid, .fd = t.fd, .pid = t.pid, .t = m, .seen = t.seen}; }
@@ -154,7 +156,7 @@ Bool newer(List(Int) a, List(Int) b, Int i) {
 Srv add_peer(Srv v, Boot b, Int now) {
     List(Secret(UInt(8))) none = [];
     SessionKeys k0 = SessionKeys {.ok = false, .tx = none, .rx = none, .my_idx = -1, .their_idx = 0};
-    Peer p = Peer {.id = v.next_id, .b = b, .mk = mac1_key(b.s_pub, b.psk), .linked = false, .l = link_new(true, v.udp, [0, 0, 0, 0], 0, k0, now), .stamp = [], .born = now};
+    Peer p = Peer {.id = v.next_id, .b = b, .mk = mac1_key(b.s_pub, b.psk), .linked = false, .l = link_new(true, v.udp, [0, 0, 0, 0], 0, k0, now), .stamp = [], .born = now, .lsn = []};
     return sv_next(sv_peers(v, v.peers.concat([p])), v.next_id + 1);
 }
 
@@ -194,7 +196,7 @@ Srv handshake(Srv v, List(Int) d, Int now) {
     if (!a.keys.ok || !newer(a.stamp, p.stamp, 0)) { return v; }
     Int port = d[4] * 256 + d[5];
     _ = resid_udp_send_to(v.udp, d[0..4], port, a.resp);
-    Peer p2 = Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = true, .l = link_rekeyed(p.l, d[0..4], port, a.keys, now), .stamp = a.stamp, .born = p.born};
+    Peer p2 = Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = true, .l = link_rekeyed(p.l, d[0..4], port, a.keys, now), .stamp = a.stamp, .born = p.born, .lsn = p.lsn};
     return sv_seen(sv_peers(v, put_peer(v.peers, i, p2)), now);
 }
 
@@ -236,7 +238,102 @@ Srv on_events(Srv v, Int i, Int now) {
     Srv c = attaches(b, i, e.attaches, 0, now);
     Srv d = resizes(c, p.id, e.resizes, 0);
     Srv f = lists(d, i, e.lists, 0, now);
-    return on_events(f, i + 1, now);
+    Srv g = listens(f, i, e.listens, 0, now);
+    return on_events(g, i + 1, now);
+}
+
+// ============================================================================
+// Remote forwards (-R)
+// ============================================================================
+
+// LISTEN: a socket on the server's loopback port (never another address).
+// A port this client holds already is confirmed again (the answer was
+// lost); one another client of the same principal holds moves to this
+// one (that client went away without a word, as with ATTACH); at most 16
+// per client.
+@requires(network, declassify)
+Srv listens(Srv v, Int pi, List(List(Int)) req, Int i, Int now) {
+    if (i >= req.len()) { return v; }
+    Int port = req[i][0];
+    Peer p = v.peers[pi];
+    Bool mine = lsn_at(p.lsn, port, 0) >= 0;
+    Int other = holder(v.peers, port, 0);
+    Srv v1 = if (!mine && other >= 0 && other != pi) { sv_peers(v, put_peer(v.peers, other, pr_lsn(v.peers[other], lsn_without(v.peers[other].lsn, port, 0, [])))) } else { v };
+    Int moved = if (!mine && other >= 0 && other != pi) { v.peers[other].lsn[lsn_at(v.peers[other].lsn, port, 0)][1] } else { -1 };
+    Bool can = port >= 1 && port <= 65535 && p.lsn.len() < 16;
+    Int fd = if (mine || moved >= 0 || !can) { moved } else { resid_tcp_listen(port) };
+    Bool ok = mine || fd >= 0;
+    Peer p1 = v1.peers[pi];
+    Peer p2 = pr_link(pr_lsn(p1, if (fd >= 0) { p1.lsn.concat([[port, fd]]) } else { p1.lsn }), answer_listen(p1.l, port, ok, now));
+    return listens(sv_peers(v1, put_peer(v1.peers, pi, p2)), pi, req, i + 1, now);
+}
+
+Int lsn_at(List(List(Int)) ls, Int port, Int i) {
+    if (i >= ls.len()) { return -1; }
+    if (ls[i][0] == port) { return i; }
+    return lsn_at(ls, port, i + 1);
+}
+
+List(List(Int)) lsn_without(List(List(Int)) ls, Int port, Int i, List(List(Int)) acc) {
+    if (i >= ls.len()) { return acc; }
+    return lsn_without(ls, port, i + 1, if (ls[i][0] == port) { acc } else { acc.concat([ls[i]]) });
+}
+
+// The client holding a port, or -1.
+Int holder(List(Peer) ps, Int port, Int i) {
+    if (i >= ps.len()) { return -1; }
+    if (lsn_at(ps[i].lsn, port, 0) >= 0) { return i; }
+    return holder(ps, port, i + 1);
+}
+
+// Every listening socket, as [fd, port] in poll order.
+List(List(Int)) all_lsn(List(Peer) ps, Int i, List(List(Int)) acc) {
+    if (i >= ps.len()) { return acc; }
+    return all_lsn(ps, i + 1, acc.concat(swap(ps[i].lsn, 0, [])));
+}
+
+List(List(Int)) swap(List(List(Int)) ls, Int i, List(List(Int)) acc) {
+    if (i >= ls.len()) { return acc; }
+    return swap(ls, i + 1, acc.concat([[ls[i][1], ls[i][0]]]));
+}
+
+List(Int) firsts(List(List(Int)) ls, Int i, List(Int) acc) {
+    if (i >= ls.len()) { return acc; }
+    return firsts(ls, i + 1, acc.concat([ls[i][0]]));
+}
+
+// A connection on a listening socket that polled ready: a stream toward
+// the client holding the port now (CONNECT), or closed when none does.
+@requires(network, declassify)
+Srv accepts(Srv v, List(List(Int)) ls, List(Int) ready, Int at, Int i, Int now) {
+    if (i >= ls.len()) { return v; }
+    Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
+    Int pi = if (r) { holder_fd(v.peers, ls[i][0], 0) } else { -1 };
+    if (pi < 0 || !v.peers[pi].linked) { return accepts(v, ls, ready, at, i + 1, now); }
+    Int fd = resid_tcp_accept_now(ls[i][0]);
+    if (fd < 0) { return accepts(v, ls, ready, at, i + 1, now); }
+    _ = resid_tcp_deadline(fd, 0);
+    Peer p = v.peers[pi];
+    return accepts(sv_peers(v, put_peer(v.peers, pi, pr_link(p, connect_back(p.l, fd, ls[i][1], now)))), ls, ready, at, i + 1, now);
+}
+
+Int holder_fd(List(Peer) ps, Int fd, Int i) {
+    if (i >= ps.len()) { return -1; }
+    if (has_fd(ps[i].lsn, fd, 0)) { return i; }
+    return holder_fd(ps, fd, i + 1);
+}
+
+Bool has_fd(List(List(Int)) ls, Int fd, Int i) {
+    if (i >= ls.len()) { return false; }
+    return ls[i][1] == fd || has_fd(ls, fd, i + 1);
+}
+
+// A client dropped: its listening sockets closed.
+@requires(network)
+Bool close_lsn(List(List(Int)) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    _ = resid_tcp_close(ls[i][1]);
+    return close_lsn(ls, i + 1);
 }
 
 @requires(network, declassify, process)
@@ -355,6 +452,7 @@ Srv links(Srv v, List(List(Int)) sfds, List(Int) ready, Int at, Int i, Int now) 
     if (i >= v.peers.len()) { return v; }
     Peer p = v.peers[i];
     Bool gone = now - (if (p.linked) { p.l.last_rx } else { p.born }) > peer_ns();
+    _ = if (gone) { close_lsn(p.lsn, 0) } else { true };
     if (gone) { return links(sv_peers(v, v.peers[0..i].concat(v.peers[i + 1..v.peers.len()])), sfds[0..i].concat(sfds[i + 1..sfds.len()]), ready, at + sfds[i].len(), i, now); }
     Link l = if (p.linked) { keepalive(retransmit(read_streams(p.l, sfds[i], ready, at, 0, now), 0, now), now) } else { p.l };
     return links(sv_peers(v, put_peer(v.peers, i, pr_link(p, l))), sfds, ready, at + sfds[i].len(), i + 1, now);
@@ -385,7 +483,8 @@ Int serve_loop(Srv v0) {
     List(List(Int)) sfds = peer_fds(v.peers, 0, []);
     List(Int) all_s = flat(sfds, 0, []);
     List(Int) tfds = tty_fds(v.ttys, 0, []);
-    List(Int) fds = [v.udp, v.ctl].concat(all_s).concat(tfds);
+    List(List(Int)) ls = all_lsn(v.peers, 0, []);
+    List(Int) fds = [v.udp, v.ctl].concat(all_s).concat(tfds).concat(firsts(ls, 0, []));
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
     Srv a = datagrams(v, now, 64);
     Srv b = control(a, ready.len() > 1 && (ready[1] & 1) != 0, now);
@@ -394,7 +493,9 @@ Int serve_loop(Srv v0) {
     // poll (control appends), so the poll's slots still line up.
     Srv d = links(c, pad_fds(sfds, c.peers.len()), ready, 2, 0, now);
     Srv e = tty_io(d, ready, 2 + all_s.len(), 0, now);
-    return serve_loop(e);
+    // Listening sockets are found again by fd: LISTEN may have moved one.
+    Srv f = accepts(e, ls, ready, 2 + all_s.len() + tfds.len(), 0, now);
+    return serve_loop(f);
 }
 
 List(List(Int)) pad_fds(List(List(Int)) s, Int n) {

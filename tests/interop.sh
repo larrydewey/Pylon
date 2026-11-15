@@ -53,6 +53,17 @@ EOF
 
 fp() { ssh-keygen -lf "$1" | cut -d' ' -f2; }
 
+# The seccomp mode of the process holding the listening socket on 127.0.0.1:$1.
+listener_seccomp() {
+    local hex ino p; hex=$(printf '%04X' "$1")
+    ino=$(awk -v a="0100007F:$hex" '$2 == a && $4 == "0A" { print $10 }' /proc/net/tcp | head -1)
+    [ -n "$ino" ] || return 1
+    for p in /proc/[0-9]*; do
+        if ls -l "$p/fd" 2>/dev/null | grep -q "socket:\[$ino\]"; then grep '^Seccomp:' "$p/status"; return 0; fi
+    done
+    return 1
+}
+
 check() {   # name expected-exit expected-output-substring command...
     local name="$1" want="$2" grepfor="$3"; shift 3
     # ONLY=REGEX runs just the matching checks (pinning always runs).
@@ -318,6 +329,24 @@ except socket.timeout:
     check "pylon protocol: SOCKS5 (-D), a name with odd bytes is refused" 97 "" \
         curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://a_b.example:$W2/"
     kill $PD 2>/dev/null; wait $PD 2>/dev/null
+    # Remote forwarding (-R) over the Pylon protocol: pylond (confined)
+    # listens on its loopback, the client connects here.
+    RP=$((PORT + 14))
+    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pR.log & PRR=$!
+    for _ in $(seq 100); do grep -q "from here" pR.log && break; sleep 0.2; done
+    check "pylon protocol: -R, the server's port reaches here" 0 "pylon-proto-ok" \
+        curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
+    check "pylon protocol: -R, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "curl -s -m 60 http://127.0.0.1:$RP/big.bin | sha256sum"
+    check "pylon protocol: -R, pylond bound loopback only" 0 "" \
+        bash -c "P=\$(printf '%04X' $RP); grep -q \" 0100007F:\$P 00000000:0000 0A\" /proc/net/tcp && ! grep -q \" 00000000:\$P 00000000:0000 0A\" /proc/net/tcp"
+    check "pylon protocol: -R, the port is held by the confined daemon" 0 "Seccomp:	2" listener_seccomp $RP
+    kill $PRR 2>/dev/null; wait $PRR 2>/dev/null
+    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pR2.log & PRR=$!
+    for _ in $(seq 100); do grep -q "from here" pR2.log && break; sleep 0.2; done
+    check "pylon protocol: -R, a new client takes the port over" 0 "pylon-proto-ok" \
+        curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
+    kill $PRR 2>/dev/null; wait $PRR 2>/dev/null
     # Roaming: the client moves to a new UDP socket mid-transfer.
     PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
     for _ in $(seq 100); do grep -q "forwarding" pr.log && break; sleep 0.2; done

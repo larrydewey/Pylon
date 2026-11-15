@@ -582,6 +582,17 @@ letters, digits, dots and hyphens) in the client and sends the address in
 an OPEN; the SOCKS client hears success when the OPEN is confirmed and
 "connection refused" when it is reset.
 
+`-R` (v1): `LISTEN 13 | port (4)` asks pylond to listen on the server's
+loopback port (never another address), answered `LISTENING 14 | port |
+ok (1)` (both unacknowledged: the client asks again until answered). A
+connection pylond accepts there becomes a server-initiated stream (even
+ids), `CONNECT 15 | sid | port (2)`, sent again until the client
+confirms it; the client connects only for a port it asked for, and only
+to the destination given for that port, else it resets the stream. At
+most 16 ports per client. A port another client of the same principal
+holds moves to the one asking (that client went away without a word, as
+with ATTACH); a client's ports close when it is dropped.
+
 Further frames (v1): `SHELL 7 | sid | rows (2) | cols (2)` starts the
 principal's login shell on a pseudo-terminal, `RESIZE 9 | sid | rows |
 cols`, `ATTACH 10 | sid | session (4) | rows | cols` joins a kept
@@ -603,8 +614,7 @@ Rekeying (9.5): the client starts a new handshake every 2 minutes;
 pylond switches keys when it answers and refuses data under keys older
 than 3 minutes. Streams carry on.
 
-Limits of v1: `-L` and `-D` forwards over the Pylon protocol (`-R` stays
-on SSH), an IPv4 literal host, no padding to 64 bytes, no cookie
+Limits of v1: an IPv4 literal host, no padding to 64 bytes, no cookie
 (`mac2`), no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).
 

@@ -261,7 +261,6 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     Bool shell = shell0 && !sessions;
     List(Int) addr = ipv4(host);
     if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return 2; }
-    if (has_remote(fs, 0)) { eprintln("pylon: the Pylon protocol (v1) carries -L and -D forwards only"); return 2; }
     // A directory holds one build per machine type: pylond-x86_64, pylond-aarch64.
     Bool dir = filesystem.is_dir(path);
     Arch ar = if (dir) { host_arch(c) } else { Arch {.c = c, .arch = "", .err = ""} };
@@ -312,11 +311,6 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     Link done = pylon_forwards(l0, ls, rebind_after, rk);
     eprintln("pylon: " + done.err);
     return 1;
-}
-
-Bool has_remote(List(Fwd) fs, Int i) {
-    if (i >= fs.len()) { return false; }
-    return fs[i].kind == 2 || has_remote(fs, i + 1);
 }
 
 List(Fwd) parse_fwds(List(Str) specs, Int i, List(Fwd) acc) {

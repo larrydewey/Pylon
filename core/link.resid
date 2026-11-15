@@ -440,7 +440,9 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
     }
     if (t == 11) { return if (l.server && f.len() == 5) { ev_add(l, 4, [sid]) } else { l }; }
     if (t == 12) { return if (!l.server) { ev_add(l, 5, [sid].concat(f[5..f.len()])) } else { l }; }
-    if (i < 0) { return if (t == 2 || t == 4) { send_frame(l, f_rst(sid), now) } else { l }; }
+    // A stream unknown here is reset, unless the program has yet to take
+    // up its CONNECT (its bytes come again once it has).
+    if (i < 0) { return if ((t == 2 || t == 4) && !pending(l.ev.connects, sid, 0)) { send_frame(l, f_rst(sid), now) } else { l }; }
     St s0 = l.streams[i];
     if (t == 5) {
         _ = if (s0.socks && s0.opening.len() > 0) { resid_tcp_send_bin(s0.fd, socks_reply(5)) } else { true };
@@ -455,6 +457,11 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
     _ = if (confirmed && s0.socks) { resid_tcp_send_bin(s0.fd, socks_reply(0)) } else { true };
     St s = if (confirmed) { st_opening(s0, [], false) } else { s0 };
     return on_stream(if (confirmed) { with_streams(l, put(l.streams, i, s)) } else { l }, t, sid, i, s, f, now);
+}
+
+Bool pending(List(List(Int)) cs, Int sid, Int i) {
+    if (i >= cs.len()) { return false; }
+    return cs[i][0] == sid || pending(cs, sid, i + 1);
 }
 
 // DATA, ACK and FIN for stream i (s).
