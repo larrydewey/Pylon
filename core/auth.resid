@@ -1,0 +1,103 @@
+// User authentication (RFC 4252) with keys held by the agent, bound to
+// the session (SPEC 7.2):
+//
+//   1. session-bind@openssh.com tells the agent which host and session
+//      the coming signature is for; the agent checks the host's
+//      signature over the session identifier itself.
+//   2. Each key is first offered without a signature (so the principal is
+//      only asked to approve a key the server will accept), then signed.
+//   3. publickey-hostbound-v00@openssh.com is used when the server
+//      supports it, so the signed data names the host key too.
+
+import "crypto.resid";
+import "wire.resid";
+import "hostkey.resid";
+import "transport.resid";
+import "agent.resid";
+
+pub Int msg_userauth_request() { return 50; }
+pub Int msg_userauth_failure() { return 51; }
+pub Int msg_userauth_success() { return 52; }
+pub Int msg_userauth_banner() { return 53; }
+pub Int msg_userauth_pk_ok() { return 60; }
+
+pub type Authed = { Conn c; Bool ok; Str why; };
+
+Authed auth_fail(Conn c, Str why) { return Authed {.c = c, .ok = false, .why = why}; }
+
+// The signature algorithm to use with a key: for RSA the strongest the
+// server lists in server-sig-algs (rsa-sha2-256 when it lists none);
+// never SHA-1 ssh-rsa.
+Str user_sig_alg(Conn c, PubKey k) {
+    if (k.kind != "rsa") { return k.alg; }
+    if (c.sig_algs.contains("rsa-sha2-512")) { return "rsa-sha2-512"; }
+    return "rsa-sha2-256";
+}
+
+Int agent_flags(Str alg) {
+    if (alg == "rsa-sha2-512") { return flag_rsa_sha2_512(); }
+    if (alg == "rsa-sha2-256") { return flag_rsa_sha2_256(); }
+    return 0;
+}
+
+Str method_of(Conn c) { return if (c.hostbound) { "publickey-hostbound-v00@openssh.com" } else { "publickey" }; }
+
+// The request up to (not including) the signature. With `signed` the
+// boolean is TRUE; this prefix, after the session identifier, is also
+// what is signed (RFC 4252 7).
+List(Int) request_body(Conn c, Str user, Str alg, List(Int) blob, Bool signed) {
+    List(Int) base = [msg_userauth_request()].concat(sstr(user)).concat(sstr("ssh-connection"))
+        .concat(sstr(method_of(c))).concat(sbool(signed)).concat(sstr(alg)).concat(sstring(blob));
+    return if (c.hostbound) { base.concat(sstring(c.host_blob)) } else { base };
+}
+
+@requires(network)
+pub Authed authenticate(Conn c0, Int agent, Str user, List(Ident) ids) {
+    Conn c = request_service(c0, "ssh-userauth");
+    if (!conn_ok(c)) { return auth_fail(c, c.err); }
+    if (!agent_bind(agent, c.host_blob, c.sid, c.host_sig)) {
+        return auth_fail(c, "the agent refused to bind to this session (session-bind@openssh.com); Symbolon's agent and OpenSSH 8.9+ support it");
+    }
+    return try_keys(c, agent, user, ids, 0);
+}
+
+@requires(network)
+Authed try_keys(Conn c, Int agent, Str user, List(Ident) ids, Int i) {
+    if (i >= ids.len()) { return auth_fail(c, "the server accepted none of the agent's keys"); }
+    Option(PubKey) ok = key_of_blob(ids[i].blob);
+    PubKey k = ok else { no_key() };
+    if (k.kind == "") { return try_keys(c, agent, user, ids, i + 1); }
+    Str alg = user_sig_alg(c, k);
+    // Offer the key without a signature first.
+    Conn c1 = send_packet(c, request_body(c, user, alg, k.blob, false));
+    Pkt r = auth_reply(c1);
+    if (!conn_ok(r.c)) { return auth_fail(r.c, r.c.err); }
+    if (r.p[0] == msg_userauth_success()) { return Authed {.c = r.c, .ok = true, .why = ""}; }
+    if (r.p[0] != msg_userauth_pk_ok()) { return try_keys(r.c, agent, user, ids, i + 1); }
+    List(Int) body = request_body(r.c, user, alg, k.blob, true);
+    List(Int) to_sign = sstring(r.c.sid).concat(body);
+    List(Int) sig = agent_sign(agent, k.blob, to_sign, agent_flags(alg));
+    if (sig.len() == 0) { return auth_fail(r.c, "the agent did not sign (refused on the consent sheet, or locked)"); }
+    // The agent's signature is checked before it is sent: a wrong one
+    // would only fail at the server, but checking here catches an agent
+    // that signs with another key.
+    if (!verify_blob(k, alg, to_sign, sig)) { return auth_fail(r.c, "the agent's signature does not verify"); }
+    Conn c2 = send_packet(r.c, body.concat(sstring(sig)));
+    Pkt r2 = auth_reply(c2);
+    if (!conn_ok(r2.c)) { return auth_fail(r2.c, r2.c.err); }
+    if (r2.p[0] == msg_userauth_success()) { return Authed {.c = r2.c, .ok = true, .why = ""}; }
+    return try_keys(r2.c, agent, user, ids, i + 1);
+}
+
+// The next authentication reply; banners are shown (escaped) on stderr.
+@requires(network)
+Pkt auth_reply(Conn c) {
+    Pkt k = next_msg(c);
+    if (!conn_ok(k.c)) { return k; }
+    if (k.p[0] == msg_userauth_banner()) {
+        Got msg = rd_str(rd_at(k.p, 1));
+        eprintln("[banner from host] " + display_text(msg.v));
+        return auth_reply(k.c);
+    }
+    return k;
+}

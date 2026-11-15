@@ -1,0 +1,97 @@
+// Public keys and signatures (RFC 4253 6.6, RFC 5656, RFC 8709, RFC 8332):
+// parsing key blobs, verifying a signature blob under a key, and
+// fingerprints. Only the profile's algorithms (SPEC 5) are accepted;
+// RSA keys must be at least 2048 bits and SHA-1 RSA is not accepted.
+
+import "crypto.resid";
+import "ecdsa.resid";
+import "ed25519.resid";
+import "rsa.resid";
+import "hash.resid";
+import "wire.resid";
+
+// kind: "ed25519", "p256", "p384" or "rsa". For EC, point is the
+// uncompressed point; for Ed25519 the 32-byte key; for RSA e and n.
+pub type PubKey = { Str kind; Str alg; List(Int) blob; List(Int) point; List(Int) e; List(Int) n; };
+
+pub PubKey no_key() { return PubKey {.kind = "", .alg = "", .blob = [], .point = [], .e = [], .n = []}; }
+
+pub Option(PubKey) key_of_blob(List(Int) blob) {
+    GotText a = rd_text(rd(blob));
+    Str alg = a.v;
+    if (alg == "ssh-ed25519") {
+        Got k = rd_str(a.r);
+        if (!rd_ok(k.r) || !rd_done(k.r) || k.v.len() != 32) { return None; }
+        return Some(PubKey {.kind = "ed25519", .alg = alg, .blob = blob, .point = k.v, .e = [], .n = []});
+    }
+    if (alg == "ecdsa-sha2-nistp256" || alg == "ecdsa-sha2-nistp384") {
+        GotText c = rd_text(a.r);
+        Got q = rd_str(c.r);
+        Str curve = str_slice(alg, 11, str_len(alg));
+        Int qlen = if (curve == "nistp256") { 65 } else { 97 };
+        if (!rd_ok(q.r) || !rd_done(q.r) || c.v != curve || q.v.len() != qlen || q.v[0] != 4) { return None; }
+        Str kind = if (curve == "nistp256") { "p256" } else { "p384" };
+        Curve cv = if (curve == "nistp256") { P256 } else { P384 };
+        if (!ec_public_ok(cv, q.v)) { return None; }
+        return Some(PubKey {.kind = kind, .alg = alg, .blob = blob, .point = q.v, .e = [], .n = []});
+    }
+    if (alg == "ssh-rsa") {
+        Got e = rd_str(a.r);
+        Got n = rd_str(e.r);
+        List(Int) nn = strip0(n.v, 0);
+        if (!rd_ok(n.r) || !rd_done(n.r) || e.v.len() == 0 || nn.len() < 256) { return None; }
+        return Some(PubKey {.kind = "rsa", .alg = alg, .blob = blob, .point = [], .e = strip0(e.v, 0), .n = nn});
+    }
+    return None;
+}
+
+// The signature algorithms a key may be used with, in our preference.
+pub List(Str) sig_algs_of(PubKey k) {
+    if (k.kind == "rsa") { return ["rsa-sha2-512", "rsa-sha2-256"]; }
+    return [k.alg];
+}
+
+// The key-type name a host key algorithm needs (rsa-sha2-* use ssh-rsa keys).
+pub Str key_type_of_alg(Str alg) { return if (str_starts_with(alg, "rsa-sha2-")) { "ssh-rsa" } else { alg }; }
+
+List(Int) left_pad(List(Int) b, Int n) {
+    if (b.len() >= n) { return b; }
+    return left_pad([0].concat(b), n);
+}
+
+// Does `sig_blob` verify over `data` under `k`, with exactly the
+// signature algorithm `alg`?
+pub Bool verify_blob(PubKey k, Str alg, List(Int) data, List(Int) sig_blob) {
+    GotText a = rd_text(rd(sig_blob));
+    Got s = rd_str(a.r);
+    if (!rd_ok(s.r) || !rd_done(s.r) || a.v != alg) { return false; }
+    if (k.kind == "ed25519") { return alg == "ssh-ed25519" && s.v.len() == 64 && verify_sig_bytes(data, s.v, k.point); }
+    if (k.kind == "p256" || k.kind == "p384") {
+        if (alg != k.alg) { return false; }
+        Int size = if (k.kind == "p256") { 32 } else { 48 };
+        Got r = rd_str(rd(s.v));
+        Got t = rd_str(r.r);
+        List(Int) rr = strip0(r.v, 0);
+        List(Int) tt = strip0(t.v, 0);
+        if (!rd_ok(t.r) || !rd_done(t.r) || rr.len() > size || tt.len() > size) { return false; }
+        List(Int) raw = left_pad(rr, size).concat(left_pad(tt, size));
+        return if (k.kind == "p256") { ecdsa_verify_raw(P256, Sha256, k.point, data, raw) } else { ecdsa_verify_raw(P384, Sha384, k.point, data, raw) };
+    }
+    if (k.kind == "rsa") {
+        RsaPub r = rsa_pub(k.n, k.e);
+        if (alg == "rsa-sha2-512") { return rsa_pkcs1_verify(Sha512, r, data, s.v); }
+        if (alg == "rsa-sha2-256") { return rsa_pkcs1_verify(Sha256, r, data, s.v); }
+    }
+    return false;
+}
+
+// SHA256:BASE64 without padding, as ssh-keygen -l prints it.
+pub Str fingerprint(List(Int) blob) {
+    return "SHA256:" + str_replace(base64_encode(sha256_bytes(blob)), "=", "");
+}
+
+// An OpenSSH public-key line: "ALG BASE64".
+pub Str key_line(List(Int) blob) {
+    GotText a = rd_text(rd(blob));
+    return a.v + " " + base64_encode(blob);
+}

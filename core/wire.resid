@@ -1,0 +1,148 @@
+// SSH wire types (RFC 4251 5): bytes, uint32, string, mpint, name-list,
+// and a total reader over them. Every reader is total: a truncated or
+// malformed input marks the reader bad (at = -1) and every later read on
+// it gives empty values, so callers check once at the end.
+
+import "crypto.resid";
+
+// ============================================================================
+// Writing
+// ============================================================================
+
+pub List(Int) u32_be(Int n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+
+pub List(Int) u64_be(Int n) {
+    return [(n >> 56) & 255, (n >> 48) & 255, (n >> 40) & 255, (n >> 32) & 255,
+            (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+pub List(Int) sstring(List(Int) b) { return u32_be(b.len()).concat(b); }
+pub List(Int) sstr(Str s) { return sstring(bytes_of(s)); }
+pub List(Int) sbool(Bool b) { return if (b) { [1] } else { [0] }; }
+
+// An mpint from big-endian magnitude bytes (RFC 4251 5): no leading
+// zeros, and a zero byte before a set top bit.
+pub List(Int) mpint(List(Int) be) {
+    List(Int) t = strip0(be, 0);
+    if (t.len() == 0) { return u32_be(0); }
+    return sstring(if (t[0] >= 128) { [0].concat(t) } else { t });
+}
+
+pub List(Int) strip0(List(Int) b, Int i) {
+    if (i < b.len() && b[i] == 0) { return strip0(b, i + 1); }
+    return b[i..b.len()];
+}
+
+pub List(Int) name_list(List(Str) names) { return sstr(str_join(names, ",")); }
+
+// ============================================================================
+// Reading
+// ============================================================================
+
+pub type Rd = { List(Int) b; Int at; };
+pub type Got = { Rd r; List(Int) v; };
+pub type GotInt = { Rd r; Int v; };
+
+pub Rd rd(List(Int) b) { return Rd {.b = b, .at = 0}; }
+pub Rd rd_at(List(Int) b, Int at) { return Rd {.b = b, .at = at}; }
+pub Bool rd_ok(Rd r) { return r.at >= 0; }
+pub Bool rd_done(Rd r) { return r.at == r.b.len(); }
+pub Rd rd_bad(Rd r) { return Rd {.b = r.b, .at = -1}; }
+
+pub Got take(Rd r, Int n) {
+    if (r.at < 0 || n < 0 || r.at + n > r.b.len()) { return Got {.r = rd_bad(r), .v = []}; }
+    return Got {.r = Rd {.b = r.b, .at = r.at + n}, .v = r.b[r.at..r.at + n]};
+}
+
+pub Int be32(List(Int) b, Int i) {
+    if (i < 0 || i + 4 > b.len()) { return -1; }
+    return (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3];
+}
+
+pub GotInt rd_byte(Rd r) {
+    Got g = take(r, 1);
+    return GotInt {.r = g.r, .v = if (rd_ok(g.r)) { g.v[0] } else { -1 }};
+}
+
+pub GotInt rd_u32(Rd r) {
+    Got g = take(r, 4);
+    return GotInt {.r = g.r, .v = if (rd_ok(g.r)) { be32(g.v, 0) } else { -1 }};
+}
+
+pub GotInt rd_bool(Rd r) {
+    GotInt g = rd_byte(r);
+    return GotInt {.r = g.r, .v = if (g.v > 0) { 1 } else { g.v }};
+}
+
+// A string (uint32 length, then the bytes), at most 256 KiB: nothing in
+// the profile needs more, and the bound keeps a hostile length cheap.
+pub Got rd_str(Rd r) {
+    GotInt n = rd_u32(r);
+    if (!rd_ok(n.r) || n.v > 262144) { return Got {.r = rd_bad(r), .v = []}; }
+    return take(n.r, n.v);
+}
+
+pub type GotText = { Rd r; Str v; };
+
+pub GotText rd_text(Rd r) {
+    Got g = rd_str(r);
+    return GotText {.r = g.r, .v = ascii_text(g.v)};
+}
+
+pub type GotNames = { Rd r; List(Str) v; };
+
+// A name-list. Names are ASCII without commas or controls (RFC 4251 5);
+// anything else makes the reader bad.
+pub GotNames rd_names(Rd r) {
+    Got g = rd_str(r);
+    if (!rd_ok(g.r) || !names_ok(g.v, 0)) { return GotNames {.r = rd_bad(r), .v = []}; }
+    if (g.v.len() == 0) { return GotNames {.r = g.r, .v = []}; }
+    return GotNames {.r = g.r, .v = str_split(ascii_text(g.v), ",")};
+}
+
+Bool names_ok(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    if (b[i] <= 32 || b[i] >= 127) { return false; }
+    return names_ok(b, i + 1);
+}
+
+// ============================================================================
+// Text
+// ============================================================================
+
+// Bytes known to be printable ASCII as text; anything else is replaced
+// by "?". For protocol names, never for display of host-chosen text.
+pub Str ascii_text(List(Int) b) { return ascii_acc(b, 0, ""); }
+
+Str ascii_acc(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    Str c = if (b[i] >= 32 && b[i] < 127) { str_from_code(b[i]) } else { "?" };
+    return ascii_acc(b, i + 1, acc + c);
+}
+
+// Host-chosen text (banners, error descriptions, prompts) made safe to
+// show on a terminal: printable ASCII and newlines pass, everything else
+// (escape sequences, other controls, non-ASCII that could hold bidi
+// overrides) is shown as \xHH. A host must not be able to drive the
+// principal's terminal through a message Pylon prints for it.
+pub Str display_text(List(Int) b) { return disp_acc(b, 0, ""); }
+
+Str disp_acc(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    Int c = b[i];
+    Str s = if ((c >= 32 && c < 127) || c == 10) { str_from_code(c) } else { "\\x" + hex_encode([c]) };
+    return disp_acc(b, i + 1, acc + s);
+}
+
+pub Bool same_bytes(List(Int) a, List(Int) b) { return a.len() == b.len() && hex_encode(a) == hex_encode(b); }
+
+pub Bool has_name(List(Str) xs, Str n) { return xs.contains(n); }
+
+// The first of `ours` (in our order of preference) that `theirs` offers,
+// or "" when none (RFC 4253 7.1: the client's preference decides).
+pub Str first_common(List(Str) ours, List(Str) theirs) {
+    for (Str n in ours) {
+        if (has_name(theirs, n)) { return n; }
+    }
+    return "";
+}

@@ -1,0 +1,117 @@
+// The connection protocol (RFC 4254): one session channel running a
+// command, with flow control and the exit status. Phase 0 runs exec
+// sessions (`pylon HOST COMMAND`); interactive shells need the
+// non-blocking standard input of SPEC 16.
+
+import "crypto.resid";
+import "wire.resid";
+import "transport.resid";
+
+pub Int msg_channel_open() { return 90; }
+pub Int msg_channel_open_confirmation() { return 91; }
+pub Int msg_channel_open_failure() { return 92; }
+pub Int msg_channel_window_adjust() { return 93; }
+pub Int msg_channel_data() { return 94; }
+pub Int msg_channel_extended_data() { return 95; }
+pub Int msg_channel_eof() { return 96; }
+pub Int msg_channel_close() { return 97; }
+pub Int msg_channel_request() { return 98; }
+pub Int msg_channel_success() { return 99; }
+pub Int msg_channel_failure() { return 100; }
+
+Int our_window() { return 2097152; }
+Int our_max_packet() { return 32768; }
+
+// remote: the server's channel number. window: what we still allow the
+// server to send before we adjust. status: the exit status, -1 unknown.
+pub type Chan = { Conn c; Int remote; Int window; Int status; Str err; };
+
+Chan chan_err(Conn c, Str e) { return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .status = -1, .err = e}; }
+
+@requires(network)
+pub Chan open_session(Conn c0) {
+    List(Int) p = [msg_channel_open()].concat(sstr("session")).concat(u32_be(0)).concat(u32_be(our_window())).concat(u32_be(our_max_packet()));
+    Conn c1 = send_packet(c0, p);
+    Pkt k = next_msg(c1);
+    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
+    if (k.p[0] == msg_channel_open_failure()) { return chan_err(k.c, "the server refused to open a session channel"); }
+    if (k.p[0] != msg_channel_open_confirmation()) { return chan_err(k.c, "unexpected reply to channel open"); }
+    GotInt ours = rd_u32(rd_at(k.p, 1));
+    GotInt theirs = rd_u32(ours.r);
+    if (!rd_ok(theirs.r) || ours.v != 0) { return chan_err(k.c, "malformed channel open confirmation"); }
+    return Chan {.c = k.c, .remote = theirs.v, .window = our_window(), .status = -1, .err = ""};
+}
+
+// A channel request that wants a reply.
+@requires(network)
+pub Chan request(Chan ch, Str kind, List(Int) data) {
+    List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr(kind)).concat(sbool(true)).concat(data);
+    Conn c1 = send_packet(ch.c, p);
+    Pkt k = next_msg(c1);
+    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
+    if (k.p[0] == msg_channel_window_adjust()) { return request_wait(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""}, kind); }
+    if (k.p[0] != msg_channel_success()) { return chan_err(k.c, "the server refused the " + kind + " request"); }
+    return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
+}
+
+@requires(network)
+Chan request_wait(Chan ch, Str kind) {
+    Pkt k = next_msg(ch.c);
+    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
+    if (k.p[0] == msg_channel_window_adjust()) { return request_wait(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""}, kind); }
+    if (k.p[0] != msg_channel_success()) { return chan_err(k.c, "the server refused the " + kind + " request"); }
+    return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
+}
+
+@requires(network)
+pub Chan exec(Chan ch, Str command) { return request(ch, "exec", sstr(command)); }
+
+// Copy the channel's output to stdout (and stderr's, escaped, to
+// stderr) until the server closes it; the result carries the exit status.
+// Standard output is the principal's own command output and passes as
+// bytes; stderr goes through display_text so a host cannot hide escape
+// sequences in it.
+@requires(network)
+pub Chan pump(Chan ch) {
+    Pkt k = next_msg(ch.c);
+    if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
+    Int t = k.p[0];
+    GotInt rc = rd_u32(rd_at(k.p, 1));
+    if (t == msg_channel_data()) {
+        Got d = rd_str(rc.r);
+        _ = print_bytes(d.v);
+        return pump(adjust(Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .status = ch.status, .err = ""}));
+    }
+    if (t == msg_channel_extended_data()) {
+        GotInt kind = rd_u32(rc.r);
+        Got d = rd_str(kind.r);
+        // Phase 0 has only line output on stderr: one trailing newline is
+        // folded into eprintln's.
+        List(Int) e = if (d.v.len() > 0 && d.v[d.v.len() - 1] == 10) { d.v[0..d.v.len() - 1] } else { d.v };
+        eprintln(display_text(e));
+        return pump(adjust(Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .status = ch.status, .err = ""}));
+    }
+    if (t == msg_channel_request()) {
+        GotText kind = rd_text(rc.r);
+        GotInt want = rd_bool(kind.r);
+        GotInt code = rd_u32(want.r);
+        Int st = if (kind.v == "exit-status" && rd_ok(code.r)) { code.v } else { ch.status };
+        Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_channel_failure()].concat(u32_be(ch.remote))) } else { k.c };
+        return pump(Chan {.c = c2, .remote = ch.remote, .window = ch.window, .status = st, .err = ""});
+    }
+    if (t == msg_channel_close()) {
+        Conn c2 = send_packet(k.c, [msg_channel_close()].concat(u32_be(ch.remote)));
+        return Chan {.c = c2, .remote = ch.remote, .window = ch.window, .status = ch.status, .err = ""};
+    }
+    // EOF, window adjusts for our (empty) send side, and the rest.
+    return pump(Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = ch.status, .err = ""});
+}
+
+// Give the server more window once half of it is used.
+@requires(network)
+Chan adjust(Chan ch) {
+    if (ch.window > our_window() / 2) { return ch; }
+    Int add = our_window() - ch.window;
+    Conn c2 = send_packet(ch.c, [msg_channel_window_adjust()].concat(u32_be(ch.remote)).concat(u32_be(add)));
+    return Chan {.c = c2, .remote = ch.remote, .window = our_window(), .status = ch.status, .err = ""};
+}

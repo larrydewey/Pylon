@@ -1,0 +1,181 @@
+// The binary packet protocol (RFC 4253 6) under the profile's AEAD
+// ciphers only (SPEC 5):
+//
+//   chacha20-poly1305@openssh.com  (PROTOCOL.chacha20poly1305)
+//   aes256-gcm@openssh.com, aes128-gcm@openssh.com  (RFC 5647)
+//
+// and "none" for the cleartext packets before the first NEWKEYS. There is
+// no MAC-and-cipher composition and no CBC/CTR mode in this file, by
+// design: what is not here cannot be negotiated.
+//
+// A direction's state is a value: sealing or opening a packet returns the
+// new state (sequence number, GCM invocation counter).
+
+import "crypto.resid";
+import "chacha.resid";
+import "aesgcm.resid";
+import "wire.resid";
+
+// kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM.
+pub type Dir = { Int kind; List(Int) key; List(Int) iv; Int seq; };
+
+pub Dir dir_none() { return Dir {.kind = 0, .key = [], .iv = [], .seq = 0}; }
+
+pub Int cipher_key_len(Str name) {
+    if (name == "chacha20-poly1305@openssh.com") { return 64; }
+    if (name == "aes256-gcm@openssh.com") { return 32; }
+    if (name == "aes128-gcm@openssh.com") { return 16; }
+    return 0;
+}
+
+pub Int cipher_iv_len(Str name) { return if (str_ends_with(name, "-gcm@openssh.com")) { 12 } else { 0 }; }
+
+pub Dir dir_new(Str name, List(Int) key, List(Int) iv, Int seq) {
+    Int k = if (name == "chacha20-poly1305@openssh.com") { 1 } else { if (str_ends_with(name, "-gcm@openssh.com")) { 2 } else { 0 } };
+    return Dir {.kind = k, .key = key, .iv = iv, .seq = seq};
+}
+
+// The same keys with the sequence number set (strict kex resets it to 0
+// at every NEWKEYS).
+pub Dir dir_seq(Dir d, Int seq) { return Dir {.kind = d.kind, .key = d.key, .iv = d.iv, .seq = seq}; }
+
+// Sequence numbers are uint32 and wrap (RFC 4253 6.4). Under strict kex
+// a wrap during the initial exchange is an error the transport checks.
+Int next_seq(Int s) { return (s + 1) & 4294967295; }
+
+Int block_of(Dir d) { return if (d.kind == 2) { 16 } else { 8 }; }
+
+// ============================================================================
+// Sealing
+// ============================================================================
+
+// Padding (RFC 4253 6): at least 4 random bytes, so that the padded part
+// is a multiple of the block size. Under AEAD the length field is not
+// part of that (it is the AAD or encrypted on its own).
+pub List(Int) frame(Dir d, List(Int) payload) {
+    Int bs = block_of(d);
+    Int counted = if (d.kind == 0) { 5 + payload.len() } else { 1 + payload.len() };
+    Int pad0 = bs - (counted % bs);
+    Int pad = if (pad0 < 4) { pad0 + bs } else { pad0 };
+    List(Int) body = [pad].concat(payload).concat(random_bytes(pad));
+    return u32_be(body.len()).concat(body);
+}
+
+pub type Sealed = { Dir d; List(Int) out; };
+
+pub Sealed seal(Dir d, List(Int) payload) {
+    List(Int) pkt = frame(d, payload);
+    if (d.kind == 0) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = pkt}; }
+    if (d.kind == 1) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = cc_seal(d.key, d.seq, pkt)}; }
+    List(Int) ct = aes_gcm_seal(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
+    Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
+    return Sealed {.d = nd, .out = pkt[0..4].concat(ct)};
+}
+
+// ============================================================================
+// chacha20-poly1305@openssh.com
+// ============================================================================
+//
+// The 64-byte key is K_2 (bytes 0..32, the payload and MAC key) then K_1
+// (32..64, the length key). The nonce is the sequence number as a uint64;
+// OpenSSH uses the original 64-bit-counter ChaCha20, which for counters
+// below 2^32 is the RFC 8439 function with the nonce 0^4 || seq_be64.
+
+List(Int) cc_nonce(Int seq) { return [0, 0, 0, 0].concat(u64_be(seq)); }
+
+List(Int) cc_seal(List(Int) key, Int seq, List(Int) pkt) {
+    List(Int) k2 = key[0..32];
+    List(Int) k1 = key[32..64];
+    List(Int) n = cc_nonce(seq);
+    List(Int) enc_len = chacha20_xor(k1, 0, n, pkt[0..4]);
+    List(Int) enc_body = chacha20_xor(k2, 1, n, pkt[4..pkt.len()]);
+    List(Int) poly_key = chacha_block(k2, 0, n)[0..32];
+    List(Int) ct = enc_len.concat(enc_body);
+    return ct.concat(poly1305(poly_key, ct));
+}
+
+// The packet length from the first four received bytes, decrypted with
+// K_1. It is used before the MAC is checked, only to know how many bytes
+// to wait for, and is bounded by the caller.
+pub Int cc_length(List(Int) key, Int seq, List(Int) first4) {
+    return be32(chacha20_xor(key[32..64], 0, cc_nonce(seq), first4), 0);
+}
+
+// ============================================================================
+// AES-GCM (RFC 5647)
+// ============================================================================
+
+// The IV is a 4-byte fixed field and an 8-byte invocation counter,
+// incremented (mod 2^64) after each packet.
+List(Int) gcm_next_iv(List(Int) iv) { return iv[0..4].concat(inc_be(iv[4..12], 7)); }
+
+List(Int) inc_be(List(Int) b, Int i) {
+    if (i < 0) { return b; }
+    Int v = (b[i] + 1) & 255;
+    List(Int) nb = b[0..i].concat([v]).concat(b[i + 1..b.len()]);
+    return if (v == 0) { inc_be(nb, i - 1) } else { nb };
+}
+
+// ============================================================================
+// Opening
+// ============================================================================
+
+// How many bytes a packet needs after its first 4 (the length field):
+// the packet body plus the tag, or -1 when the length is impossible. The
+// profile's limit is 256 KiB (SPEC 5).
+pub Int need_after_len(Dir d, List(Int) first4) {
+    Int n = if (d.kind == 1) { cc_length(d.key, d.seq, first4) } else { be32(first4, 0) };
+    if (n < 5 || n > 262144) { return -1; }
+    Int bs = block_of(d);
+    // AEAD: the padded part is aligned; cleartext: length field included.
+    Bool aligned = if (d.kind == 0) { (n + 4) % bs == 0 } else { n % bs == 0 };
+    if (!aligned) { return -1; }
+    Int tag = if (d.kind == 0) { 0 } else { 16 };
+    return n + tag;
+}
+
+pub type Opened = { Dir d; Bool ok; List(Int) payload; };
+
+Opened open_bad(Dir d) { return Opened {.d = d, .ok = false, .payload = []}; }
+
+// `pkt` is one whole packet as received: length field, body, tag.
+pub Opened open(Dir d, List(Int) pkt) {
+    if (pkt.len() < 4) { return open_bad(d); }
+    if (d.kind == 0) { return unpad(dir_seq(d, next_seq(d.seq)), pkt[4..pkt.len()]); }
+    if (pkt.len() < 4 + 16) { return open_bad(d); }
+    if (d.kind == 1) {
+        List(Int) k2 = d.key[0..32];
+        List(Int) n = cc_nonce(d.seq);
+        Int tag_at = pkt.len() - 16;
+        List(Int) poly_key = chacha_block(k2, 0, n)[0..32];
+        List(Int) want = poly1305(poly_key, pkt[0..tag_at]);
+        // The MAC is checked before anything is decrypted.
+        if (!ct_eq(want, pkt[tag_at..pkt.len()])) { return open_bad(d); }
+        List(Int) body = chacha20_xor(k2, 1, n, pkt[4..tag_at]);
+        return unpad(dir_seq(d, next_seq(d.seq)), body);
+    }
+    Option(List(Int)) pt = aes_gcm_decrypt(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
+    Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
+    return match pt {
+        None => open_bad(d),
+        Some(body) => unpad(nd, body),
+    };
+}
+
+Opened unpad(Dir nd, List(Int) body) {
+    if (body.len() < 1) { return open_bad(nd); }
+    Int pad = body[0];
+    if (pad < 4 || 1 + pad > body.len()) { return open_bad(nd); }
+    return Opened {.d = nd, .ok = true, .payload = body[1..body.len() - pad]};
+}
+
+// Constant-time equality of two tags of the same length.
+pub Bool ct_eq(List(Int) a, List(Int) b) {
+    if (a.len() != b.len()) { return false; }
+    return ct_acc(a, b, 0, 0) == 0;
+}
+
+Int ct_acc(List(Int) a, List(Int) b, Int i, Int acc) {
+    if (i >= a.len()) { return acc; }
+    return ct_acc(a, b, i + 1, acc | (a[i] ^ b[i]));
+}

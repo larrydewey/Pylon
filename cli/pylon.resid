@@ -1,0 +1,117 @@
+// pylon: the phase-0 command-line client (SPEC 17).
+//
+//   pylon [-p PORT] [--allow-no-strict] USER@HOST COMMAND...
+//       Run COMMAND on HOST, authenticating with the agent at
+//       SSH_AUTH_SOCK (Symbolon's `symbolon ssh-agent`, or any agent
+//       that supports session-bind@openssh.com).
+//
+//   pylon pin [-p PORT] HOST FINGERPRINT
+//       Pin HOST's key, but only if it matches FINGERPRINT (SHA256:...),
+//       which the principal obtained out of band (SPEC 6.1.4).
+
+import "crypto.resid";
+import "../core/wire.resid";
+import "../core/hostkey.resid";
+import "../core/transport.resid";
+import "../core/agent.resid";
+import "../core/auth.resid";
+import "../core/session.resid";
+import "../core/known.resid";
+
+type Opts = { Int port; Bool no_strict; List(Str) rest; Str err; };
+
+@requires(args)
+Opts parse(Int i, Opts o) {
+    if (i >= args.count() || o.rest.len() > 0) { return rest_from(i, o); }
+    Str a = args.get(i);
+    if (a == "-p" && i + 1 < args.count()) {
+        Str v = args.get(i + 1);
+        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .rest = [], .err = "bad port " + v}; }
+        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .rest = [], .err = ""});
+    }
+    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .rest = [], .err = ""}); }
+    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .rest = [], .err = "unknown option " + a}; }
+    return rest_from(i, o);
+}
+
+@requires(args)
+Opts rest_from(Int i, Opts o) {
+    if (i >= args.count()) { return o; }
+    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .rest = o.rest.concat([args.get(i)]), .err = o.err});
+}
+
+Int usage() {
+    eprintln("usage: pylon [-p PORT] [--allow-no-strict] USER@HOST COMMAND...");
+    eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
+    return 2;
+}
+
+@requires(network)
+Conn dial(Str host, Int port) {
+    Int fd = resid_tcp_connect(host, port);
+    Conn c = conn_new(fd);
+    if (fd < 0) { return conn_err(c, "cannot connect to " + host + ":" + f"{port}"); }
+    _ = resid_tcp_deadline(fd, 30000);
+    return c;
+}
+
+@requires(network, filesystem, environment)
+Int cmd_pin(Opts o) {
+    if (o.rest.len() != 2) { return usage(); }
+    Str host = o.rest[0];
+    Str want = o.rest[1];
+    if (!str_starts_with(want, "SHA256:")) { eprintln("pylon: the fingerprint must be SHA256:... as ssh-keygen -lf prints it"); return 2; }
+    Conn c = dial(host, o.port);
+    if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
+    Handshake h = handshake(c, Trust {.pinned = [], .probe = true}, o.no_strict);
+    _ = resid_tcp_close(c.fd);
+    if (h.c.err != probe_done()) { eprintln("pylon: " + h.c.err); return 1; }
+    if (h.fingerprint != want) {
+        eprintln("pylon: NOT pinned. " + host + " presents " + h.fingerprint);
+        eprintln("       which differs from the fingerprint you gave (" + want + ").");
+        return 1;
+    }
+    if (!pin(host_token(host, o.port), h.host.blob)) { eprintln("pylon: cannot write " + pylon_home() + "/known_hosts"); return 1; }
+    println("pinned " + host_token(host, o.port) + " " + h.host.alg + " " + h.fingerprint);
+    return 0;
+}
+
+@requires(network, filesystem, environment)
+Int cmd_run(Opts o) {
+    if (o.rest.len() < 2) { return usage(); }
+    List(Str) uh = str_split(o.rest[0], "@");
+    if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(uh[1]) == 0) { eprintln("pylon: give the user as USER@HOST"); return 2; }
+    Str user = uh[0];
+    Str host = uh[1];
+    Str command = str_join(o.rest[1..o.rest.len()], " ");
+    List(List(Int)) pinned = pinned_for(host_token(host, o.port));
+    Int agent = agent_connect();
+    if (agent < 0) { eprintln("pylon: no agent (set SSH_AUTH_SOCK to Symbolon's agent)"); return 1; }
+    List(Ident) ids = agent_ids(agent);
+    if (ids.len() == 0) { eprintln("pylon: the agent holds no keys"); return 1; }
+    Conn c = dial(host, o.port);
+    if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
+    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
+    if (!conn_ok(h.c)) { eprintln("pylon: " + h.c.err); _ = resid_tcp_close(c.fd); return 1; }
+    Authed a = authenticate(h.c, agent, user, ids);
+    _ = resid_unix_close(agent);
+    if (!a.ok) { eprintln("pylon: " + a.why); _ = disconnect(a.c, "authentication failed"); return 1; }
+    // Session traffic may idle for a long time: no read deadline now.
+    _ = resid_tcp_deadline(a.c.fd, 0);
+    Chan ch = open_session(a.c);
+    if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
+    Chan ex = exec(ch, command);
+    if (str_len(ex.err) > 0) { eprintln("pylon: " + ex.err); return 1; }
+    Chan done = pump(ex);
+    if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
+    _ = disconnect(done.c, "done");
+    return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
+}
+
+@requires(args, network, filesystem, environment)
+Int main() {
+    Bool is_pin = args.count() > 1 && args.get(1) == "pin";
+    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .rest = [], .err = ""});
+    if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
+    return if (is_pin) { cmd_pin(o) } else { cmd_run(o) };
+}

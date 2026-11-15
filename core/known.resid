@@ -1,0 +1,47 @@
+// Pinned host keys (SPEC 6.1.3), phase 0: a local file of lines
+//
+//   HOST:PORT ALG BASE64
+//
+// in $PYLON_HOME/known_hosts (default ~/.config/pylon). In phase 1 these
+// become Symbolon `pylon-host` vault items, synchronized and MAC'd
+// (SPEC 6.3). There is no trust on first use: a key is pinned only by
+// `pylon pin`, which requires the fingerprint obtained out of band.
+
+import "crypto.resid";
+import "wire.resid";
+import "hostkey.resid";
+
+@requires(environment)
+pub Str pylon_home() {
+    Str ph = environment.get("PYLON_HOME");
+    if (str_len(ph) > 0) { return ph; }
+    return environment.get("HOME") + "/.config/pylon";
+}
+
+pub Str host_token(Str host, Int port) { return str_to_lower(host) + ":" + f"{port}"; }
+
+// The pinned key blobs for `token`.
+@requires(filesystem(readonly), environment)
+pub List(List(Int)) pinned_for(Str token) {
+    Str path = pylon_home() + "/known_hosts";
+    if (!filesystem.exists(path)) { return []; }
+    return pins_acc(str_split(filesystem.read_all(path), "\n"), token, 0, []);
+}
+
+List(List(Int)) pins_acc(List(Str) lines, Str token, Int i, List(List(Int)) acc) {
+    if (i >= lines.len()) { return acc; }
+    List(Str) f = str_split(str_trim(lines[i]), " ");
+    Bool hit = f.len() >= 3 && f[0] == token;
+    List(Int) blob = if (hit) { base64_decode(f[2]) } else { [] };
+    Option(PubKey) k = if (hit) { key_of_blob(blob) } else { None };
+    Bool good = match k { None => false, Some(x) => x.alg == f[1] };
+    return pins_acc(lines, token, i + 1, if (good) { acc.concat([blob]) } else { acc });
+}
+
+@requires(filesystem, environment)
+pub Bool pin(Str token, List(Int) blob) {
+    Str dir = pylon_home();
+    _ = filesystem.create_dir(dir);
+    Str path = dir + "/known_hosts";
+    return filesystem.append_bytes(path, bytes_of(token + " " + key_line(blob) + "\n"));
+}

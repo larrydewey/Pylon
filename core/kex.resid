@@ -1,0 +1,166 @@
+// Algorithm negotiation and key exchange (RFC 4253 7-8, RFC 8731
+// curve25519-sha256, RFC 8308 ext-info, OpenSSH strict kex).
+//
+// Phase 0 implements curve25519-sha256; the hybrid post-quantum methods
+// of SPEC 5 (mlkem768x25519-sha256, sntrup761x25519-sha512) are added
+// when the Resid standard library has ML-KEM.
+
+import "crypto.resid";
+import "x25519.resid";
+import "wire.resid";
+import "hostkey.resid";
+import "cipher.resid";
+
+pub Int msg_kexinit() { return 20; }
+pub Int msg_newkeys() { return 21; }
+pub Int msg_kex_ecdh_init() { return 30; }
+pub Int msg_kex_ecdh_reply() { return 31; }
+
+pub List(Str) our_kex() { return ["curve25519-sha256", "curve25519-sha256@libssh.org"]; }
+
+pub List(Str) our_host_key_algs() {
+    return ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "rsa-sha2-512", "rsa-sha2-256"];
+}
+
+pub List(Str) our_ciphers() { return ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "aes128-gcm@openssh.com"]; }
+
+// The host key algorithms offered, with those matching a pinned key's type
+// first: offering an algorithm whose key we have not pinned would only
+// lead to a refusal after the exchange.
+pub List(Str) host_key_order(List(Str) pinned_types) {
+    return pick_algs(our_host_key_algs(), pinned_types, true, 0, []).concat(pick_algs(our_host_key_algs(), pinned_types, false, 0, []));
+}
+
+List(Str) pick_algs(List(Str) algs, List(Str) types, Bool want, Int i, List(Str) acc) {
+    if (i >= algs.len()) { return acc; }
+    Bool m = types.contains(key_type_of_alg(algs[i]));
+    return pick_algs(algs, types, want, i + 1, if (m == want) { acc.concat([algs[i]]) } else { acc });
+}
+
+// Our KEXINIT payload. "ext-info-c" asks for the server's EXT_INFO and
+// "kex-strict-c-v00@openssh.com" for strict key exchange (the Terrapin
+// countermeasure); both are pseudo-algorithms that are never chosen.
+// The MAC lists are empty: every offered cipher is an AEAD, for which
+// no MAC is negotiated.
+pub List(Int) kexinit_payload(List(Str) host_algs, Bool first) {
+    List(Str) kex = if (first) { our_kex().concat(["ext-info-c", "kex-strict-c-v00@openssh.com"]) } else { our_kex() };
+    return [msg_kexinit()].concat(random_bytes(16))
+        .concat(name_list(kex))
+        .concat(name_list(host_algs))
+        .concat(name_list(our_ciphers())).concat(name_list(our_ciphers()))
+        .concat(name_list([])).concat(name_list([]))
+        .concat(name_list(["none"])).concat(name_list(["none"]))
+        .concat(name_list([])).concat(name_list([]))
+        .concat(sbool(false)).concat(u32_be(0));
+}
+
+pub type Peer = { Bool ok; List(Str) kex; List(Str) hostkey; List(Str) c2s; List(Str) s2c; List(Str) comp_c2s; List(Str) comp_s2c; Bool follows; };
+
+pub Peer parse_kexinit(List(Int) p) {
+    Rd r0 = rd(p);
+    GotInt t = rd_byte(r0);
+    Got cookie = take(t.r, 16);
+    GotNames kex = rd_names(cookie.r);
+    GotNames hk = rd_names(kex.r);
+    GotNames c2s = rd_names(hk.r);
+    GotNames s2c = rd_names(c2s.r);
+    GotNames m1 = rd_names(s2c.r);
+    GotNames m2 = rd_names(m1.r);
+    GotNames z1 = rd_names(m2.r);
+    GotNames z2 = rd_names(z1.r);
+    GotNames l1 = rd_names(z2.r);
+    GotNames l2 = rd_names(l1.r);
+    GotInt fol = rd_bool(l2.r);
+    GotInt res = rd_u32(fol.r);
+    Bool ok = t.v == msg_kexinit() && rd_ok(res.r);
+    return Peer {.ok = ok, .kex = kex.v, .hostkey = hk.v, .c2s = c2s.v, .s2c = s2c.v, .comp_c2s = z1.v, .comp_s2c = z2.v, .follows = fol.v == 1};
+}
+
+pub type Chosen = { Str err; Str kex; Str hostkey; Str c2s; Str s2c; Bool strict; Bool ext_info; };
+
+pub Chosen choose(Peer s, List(Str) host_algs, Bool first) {
+    Str kex = first_common(our_kex(), s.kex);
+    Str hk = first_common(host_algs, s.hostkey);
+    Str c2s = first_common(our_ciphers(), s.c2s);
+    Str s2c = first_common(our_ciphers(), s.s2c);
+    Bool zc = s.comp_c2s.contains("none") && s.comp_s2c.contains("none");
+    Bool strict = first && s.kex.contains("kex-strict-s-v00@openssh.com");
+    Str err = if (!s.ok) { "malformed KEXINIT" }
+        else { if (kex == "") { "no common key exchange method (Pylon offers only curve25519-sha256)" }
+        else { if (hk == "") { "no common host key algorithm" }
+        else { if (c2s == "" || s2c == "") { "no common AEAD cipher (Pylon offers only chacha20-poly1305 and AES-GCM)" }
+        else { if (!zc) { "server requires compression" }
+        else { if (s.follows) { "server sent a guessed key exchange packet" } else { "" } } } } } };
+    return Chosen {.err = err, .kex = kex, .hostkey = hk, .c2s = c2s, .s2c = s2c, .strict = strict, .ext_info = s.kex.contains("ext-info-s")};
+}
+
+// ============================================================================
+// curve25519-sha256 (RFC 8731)
+// ============================================================================
+
+pub type Ecdh = { List(Int) priv; List(Int) pub; };
+
+pub Ecdh ecdh_new() {
+    List(Int) priv = random_bytes(32);
+    return Ecdh {.priv = priv, .pub = x25519_public(priv)};
+}
+
+pub List(Int) ecdh_init_payload(Ecdh e) { return [msg_kex_ecdh_init()].concat(sstring(e.pub)); }
+
+pub type Reply = { Bool ok; List(Int) host_blob; List(Int) q_s; List(Int) sig; };
+
+pub Reply parse_ecdh_reply(List(Int) p) {
+    GotInt t = rd_byte(rd(p));
+    Got ks = rd_str(t.r);
+    Got qs = rd_str(ks.r);
+    Got sig = rd_str(qs.r);
+    Bool ok = t.v == msg_kex_ecdh_reply() && rd_ok(sig.r) && rd_done(sig.r) && qs.v.len() == 32;
+    return Reply {.ok = ok, .host_blob = ks.v, .q_s = qs.v, .sig = sig.v};
+}
+
+pub type Exchanged = { Str err; List(Int) k; List(Int) h; PubKey host; };
+
+// The shared secret K (as the mpint encoding used in hashing) and the
+// exchange hash H, after checking the host's signature over H.
+pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg) {
+    Option(PubKey) ok = key_of_blob(r.host_blob);
+    PubKey host = ok else { no_key() };
+    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .k = [], .h = [], .host = host}; }
+    List(Int) shared = x25519_shared(e.priv, r.q_s);
+    // An all-zero shared secret means a low-order point (RFC 7748 6.1).
+    if (shared.len() != 32 || shared.sum() == 0) { return Exchanged {.err = "the server's key share is invalid", .k = [], .h = [], .host = host}; }
+    List(Int) k = mpint(shared);
+    List(Int) hin = sstr(v_c).concat(sstr(v_s)).concat(sstring(i_c)).concat(sstring(i_s))
+        .concat(sstring(r.host_blob)).concat(sstring(e.pub)).concat(sstring(r.q_s)).concat(k);
+    List(Int) h = sha256_bytes(hin);
+    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .k = [], .h = [], .host = host}; }
+    return Exchanged {.err = "", .k = k, .h = h, .host = host};
+}
+
+// ============================================================================
+// Key derivation (RFC 4253 7.2)
+// ============================================================================
+
+pub List(Int) derive(List(Int) k, List(Int) h, Int letter, List(Int) session_id, Int need) {
+    List(Int) k1 = sha256_bytes(k.concat(h).concat([letter]).concat(session_id));
+    return extend(k, h, k1, need);
+}
+
+List(Int) extend(List(Int) k, List(Int) h, List(Int) acc, Int need) {
+    if (acc.len() >= need) { return acc[0..need]; }
+    return extend(k, h, acc.concat(sha256_bytes(k.concat(h).concat(acc))), need);
+}
+
+pub type Keys = { Dir tx; Dir rx; };
+
+// The new directions after NEWKEYS. With strict kex the sequence numbers
+// start again at 0; otherwise they continue.
+pub Keys new_keys(Chosen c, Bool strict, List(Int) k, List(Int) h, List(Int) sid, Int tx_seq, Int rx_seq) {
+    List(Int) iv_c = derive(k, h, 65, sid, cipher_iv_len(c.c2s));
+    List(Int) iv_s = derive(k, h, 66, sid, cipher_iv_len(c.s2c));
+    List(Int) key_c = derive(k, h, 67, sid, cipher_key_len(c.c2s));
+    List(Int) key_s = derive(k, h, 68, sid, cipher_key_len(c.s2c));
+    Int ts = if (strict) { 0 } else { tx_seq };
+    Int rs = if (strict) { 0 } else { rx_seq };
+    return Keys {.tx = dir_new(c.c2s, key_c, iv_c, ts), .rx = dir_new(c.s2c, key_s, iv_s, rs)};
+}

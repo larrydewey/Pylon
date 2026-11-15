@@ -1,0 +1,343 @@
+// The SSH transport (RFC 4253) over a TCP socket: version exchange, the
+// first key exchange under strict kex, host verification before any
+// keyed packet is sent, server-initiated rekeying, and the packet loop's
+// handling of transport-level messages.
+//
+// Phase 0 drives the socket directly and blocks on reads. The state is a
+// value (Conn) threaded through every call, which is what lets the same
+// functions become the sans-I/O core of SPEC 4 behind the app's own
+// event loop.
+
+import "crypto.resid";
+import "wire.resid";
+import "cipher.resid";
+import "hostkey.resid";
+import "kex.resid";
+
+pub Int msg_disconnect() { return 1; }
+pub Int msg_ignore() { return 2; }
+pub Int msg_unimplemented() { return 3; }
+pub Int msg_debug() { return 4; }
+pub Int msg_service_request() { return 5; }
+pub Int msg_service_accept() { return 6; }
+pub Int msg_ext_info() { return 7; }
+pub Int msg_global_request() { return 80; }
+pub Int msg_request_failure() { return 82; }
+
+pub Str our_version() { return "SSH-2.0-Pylon_0.1"; }
+
+// sid: the session identifier (H of the first exchange). host_blob and
+// host_sig: the verified host key and its signature over sid, kept for
+// session-bind. strict: strict kex was agreed. sig_algs / hostbound: what
+// the server's EXT_INFO said. err: why the connection is unusable, or "".
+pub type Conn = {
+    Int fd; Dir tx; Dir rx; List(Int) buf; Bool eof; Str err;
+    Str v_s; List(Int) sid; List(Int) host_blob; List(Int) host_sig; Str host_alg;
+    Bool strict; List(Str) sig_algs; Bool hostbound; Bool ping;
+};
+
+pub Conn conn_err(Conn c, Str e) {
+    return Conn {.fd = c.fd, .tx = c.tx, .rx = c.rx, .buf = c.buf, .eof = c.eof, .err = e,
+        .v_s = c.v_s, .sid = c.sid, .host_blob = c.host_blob, .host_sig = c.host_sig, .host_alg = c.host_alg,
+        .strict = c.strict, .sig_algs = c.sig_algs, .hostbound = c.hostbound, .ping = c.ping};
+}
+
+Conn with_io(Conn c, Dir tx, Dir rx, List(Int) buf, Bool eof) {
+    return Conn {.fd = c.fd, .tx = tx, .rx = rx, .buf = buf, .eof = eof, .err = c.err,
+        .v_s = c.v_s, .sid = c.sid, .host_blob = c.host_blob, .host_sig = c.host_sig, .host_alg = c.host_alg,
+        .strict = c.strict, .sig_algs = c.sig_algs, .hostbound = c.hostbound, .ping = c.ping};
+}
+
+pub Conn conn_new(Int fd) {
+    return Conn {.fd = fd, .tx = dir_none(), .rx = dir_none(), .buf = [], .eof = false, .err = "",
+        .v_s = "", .sid = [], .host_blob = [], .host_sig = [], .host_alg = "",
+        .strict = false, .sig_algs = [], .hostbound = false, .ping = false};
+}
+
+pub Bool conn_ok(Conn c) { return str_len(c.err) == 0; }
+
+// ============================================================================
+// Bytes
+// ============================================================================
+
+// Read until the buffer holds at least n bytes or the peer is done.
+@requires(network)
+Conn fill(Conn c, Int n) {
+    if (c.buf.len() >= n || c.eof) { return c; }
+    List(Int) more = resid_tcp_recv_some(c.fd, 65536);
+    if (more.len() == 0) { return with_io(c, c.tx, c.rx, c.buf, true); }
+    return fill(with_io(c, c.tx, c.rx, c.buf.concat(more), false), n);
+}
+
+@requires(network)
+pub Conn send_raw(Conn c, List(Int) b) {
+    if (!conn_ok(c)) { return c; }
+    if (!resid_tcp_send_bin(c.fd, b)) { return conn_err(c, "the connection closed while sending"); }
+    return c;
+}
+
+// ============================================================================
+// Version exchange (RFC 4253 4.2)
+// ============================================================================
+
+// Lines before the version line are allowed (at most 1024, each at most
+// 255 bytes); the version must be SSH-2.0 (or 1.99, which means 2.0).
+@requires(network)
+pub Conn version_exchange(Conn c0) {
+    Conn c = send_raw(c0, bytes_of(our_version() + "\r\n"));
+    return read_version(c, 0);
+}
+
+@requires(network)
+Conn read_version(Conn c, Int lines) {
+    if (!conn_ok(c)) { return c; }
+    if (lines > 1024) { return conn_err(c, "the server sent no version line"); }
+    Int nl = index_of_nl(c.buf, 0);
+    if (nl < 0) {
+        if (c.buf.len() > 255) { return conn_err(c, "the server's banner line is too long"); }
+        if (c.eof) { return conn_err(c, "the server closed the connection before its version line"); }
+        return read_version(fill(c, c.buf.len() + 1), lines);
+    }
+    if (nl > 255) { return conn_err(c, "the server's banner line is too long"); }
+    Int end = if (nl > 0 && c.buf[nl - 1] == 13) { nl - 1 } else { nl };
+    Str line = ascii_text(c.buf[0..end]);
+    Conn rest = with_io(c, c.tx, c.rx, c.buf[nl + 1..c.buf.len()], c.eof);
+    if (!str_starts_with(line, "SSH-")) { return read_version(rest, lines + 1); }
+    if (!str_starts_with(line, "SSH-2.0-") && !str_starts_with(line, "SSH-1.99-")) { return conn_err(rest, "the server does not speak SSH 2.0"); }
+    return Conn {.fd = rest.fd, .tx = rest.tx, .rx = rest.rx, .buf = rest.buf, .eof = rest.eof, .err = "",
+        .v_s = line, .sid = [], .host_blob = [], .host_sig = [], .host_alg = "",
+        .strict = false, .sig_algs = [], .hostbound = false, .ping = false};
+}
+
+Int index_of_nl(List(Int) b, Int i) {
+    if (i >= b.len()) { return -1; }
+    if (b[i] == 10) { return i; }
+    return index_of_nl(b, i + 1);
+}
+
+// ============================================================================
+// Packets
+// ============================================================================
+
+@requires(network)
+pub Conn send_packet(Conn c, List(Int) payload) {
+    if (!conn_ok(c)) { return c; }
+    Sealed s = seal(c.tx, payload);
+    Conn c2 = with_io(c, s.d, c.rx, c.buf, c.eof);
+    return send_raw(c2, s.out);
+}
+
+pub type Pkt = { Conn c; List(Int) p; };
+
+Pkt pkt_err(Conn c, Str e) { return Pkt {.c = conn_err(c, e), .p = []}; }
+
+// The next packet's payload, whatever its type.
+@requires(network)
+pub Pkt recv_packet(Conn c0) {
+    if (!conn_ok(c0)) { return Pkt {.c = c0, .p = []}; }
+    Conn c = fill(c0, 4);
+    if (c.buf.len() < 4) { return pkt_err(c, "the server closed the connection"); }
+    Int need = need_after_len(c.rx, c.buf[0..4]);
+    if (need < 0) { return pkt_err(c, "the server sent a malformed packet"); }
+    Conn c2 = fill(c, 4 + need);
+    if (c2.buf.len() < 4 + need) { return pkt_err(c2, "the server closed the connection mid-packet"); }
+    Opened o = open(c2.rx, c2.buf[0..4 + need]);
+    if (!o.ok) { return pkt_err(c2, "a packet from the server failed authentication"); }
+    if (o.payload.len() == 0) { return pkt_err(c2, "the server sent an empty packet"); }
+    return Pkt {.c = with_io(c2, c2.tx, o.d, c2.buf[4 + need..c2.buf.len()], c2.eof), .p = o.payload};
+}
+
+// The reason a DISCONNECT gives, made safe to print.
+pub Str disconnect_reason(List(Int) p) {
+    GotInt code = rd_u32(rd_at(p, 1));
+    Got desc = rd_str(code.r);
+    return "the server disconnected: " + display_text(desc.v) + " (code " + f"{code.v}" + ")";
+}
+
+// The next packet that is not a transport-level message: IGNORE, DEBUG
+// and UNIMPLEMENTED are dropped, GLOBAL_REQUEST is refused (Pylon asks
+// for no server features this way), EXT_INFO is recorded, a KEXINIT
+// starts a rekey, and DISCONNECT ends the connection.
+@requires(network)
+pub Pkt next_msg(Conn c0) {
+    Pkt k = recv_packet(c0);
+    if (!conn_ok(k.c)) { return k; }
+    Int t = k.p[0];
+    if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return next_msg(k.c); }
+    if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
+    if (t == msg_ext_info()) { return next_msg(ext_info(k.c, k.p)); }
+    if (t == msg_global_request()) {
+        GotText name = rd_text(rd_at(k.p, 1));
+        GotInt want = rd_bool(name.r);
+        Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_request_failure()]) } else { k.c };
+        return next_msg(c2);
+    }
+    if (t == msg_kexinit()) { return next_msg(rekey(k.c, k.p)); }
+    return k;
+}
+
+// EXT_INFO (RFC 8308): server-sig-algs and publickey-hostbound@openssh.com.
+Conn ext_info(Conn c, List(Int) p) {
+    GotInt n = rd_u32(rd_at(p, 1));
+    if (!rd_ok(n.r) || n.v > 64) { return c; }
+    return ext_acc(c, n.r, n.v);
+}
+
+Conn ext_acc(Conn c, Rd r, Int left) {
+    if (left <= 0) { return c; }
+    GotText name = rd_text(r);
+    Got val = rd_str(name.r);
+    if (!rd_ok(val.r)) { return c; }
+    List(Str) algs = if (name.v == "server-sig-algs") { str_split(ascii_text(val.v), ",") } else { c.sig_algs };
+    Bool hb = c.hostbound || name.v == "publickey-hostbound@openssh.com";
+    Bool pg = c.ping || name.v == "ping@openssh.com";
+    Conn nc = Conn {.fd = c.fd, .tx = c.tx, .rx = c.rx, .buf = c.buf, .eof = c.eof, .err = c.err,
+        .v_s = c.v_s, .sid = c.sid, .host_blob = c.host_blob, .host_sig = c.host_sig, .host_alg = c.host_alg,
+        .strict = c.strict, .sig_algs = algs, .hostbound = hb, .ping = pg};
+    return ext_acc(nc, val.r, left - 1);
+}
+
+// ============================================================================
+// Key exchange
+// ============================================================================
+
+// The host trust input (SPEC 6): the keys pinned for this host, already
+// filtered by the caller's policy (certificates and SSHFP come later).
+// `probe` runs the exchange only to learn and verify the host's key, and
+// stops before NEWKEYS: `pylon pin` uses it to compare the key with a
+// fingerprint the principal obtained out of band.
+pub type Trust = { List(List(Int)) pinned; Bool probe; };
+
+pub Str probe_done() { return "probe: host key verified"; }
+
+// Why a host key is refused under `t`, or "".
+pub Str trust_refusal(Trust t, List(Int) blob) {
+    if (t.probe) { return probe_done(); }
+    if (t.pinned.len() == 0) {
+        return "this host is not pinned, and Pylon does not trust a key on first use.\n"
+            + "Its key is " + fingerprint(blob) + ". Compare that with a value you get another way\n"
+            + "(the host's console: ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub), then run\n"
+            + "  pylon pin HOST FINGERPRINT";
+    }
+    if (!pinned_has(t.pinned, blob, 0)) {
+        return "THE HOST KEY HAS CHANGED. The connection was stopped before authenticating.\n"
+            + "The host now presents " + fingerprint(blob) + ", which is not the pinned key.\n"
+            + "This is what an interception looks like. If the change is expected, verify the\n"
+            + "new key out of band and pin it again with: pylon pin HOST FINGERPRINT";
+    }
+    return "";
+}
+
+Bool pinned_has(List(List(Int)) ps, List(Int) b, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (same_bytes(ps[i], b)) { return true; }
+    return pinned_has(ps, b, i + 1);
+}
+
+pub type Handshake = { Conn c; PubKey host; Str fingerprint; };
+
+// The first key exchange. The host key is checked under `trust` after
+// its signature over H verified and before NEWKEYS is sent, so nothing
+// keyed is ever sent to an unverified host (SPEC G2). `allow_no_strict`
+// is the per-host exception of SPEC 5.
+@requires(network)
+pub Handshake handshake(Conn c0, Trust trust, Bool allow_no_strict) {
+    Conn c1 = version_exchange(c0);
+    List(Str) host_algs = host_key_order(key_types(trust.pinned, 0, []));
+    List(Int) i_c = kexinit_payload(host_algs, true);
+    Conn c2 = send_packet(c1, i_c);
+    // Strict kex: the server's first packet must be its KEXINIT.
+    Pkt k1 = recv_packet(c2);
+    if (!conn_ok(k1.c)) { return Handshake {.c = k1.c, .host = no_key(), .fingerprint = ""}; }
+    if (k1.p[0] != msg_kexinit()) { return Handshake {.c = conn_err(k1.c, "the server's first packet is not KEXINIT"), .host = no_key(), .fingerprint = ""}; }
+    Chosen ch = choose(parse_kexinit(k1.p), host_algs, true);
+    if (str_len(ch.err) > 0) { return Handshake {.c = conn_err(k1.c, ch.err), .host = no_key(), .fingerprint = ""}; }
+    if (!ch.strict && !allow_no_strict) {
+        return Handshake {.c = conn_err(k1.c, "the server does not support strict key exchange (the Terrapin fix); update it, or allow this host as an exception"), .host = no_key(), .fingerprint = ""};
+    }
+    Conn c3 = Conn {.fd = k1.c.fd, .tx = k1.c.tx, .rx = k1.c.rx, .buf = k1.c.buf, .eof = k1.c.eof, .err = "",
+        .v_s = k1.c.v_s, .sid = [], .host_blob = [], .host_sig = [], .host_alg = ch.hostkey,
+        .strict = ch.strict, .sig_algs = [], .hostbound = false, .ping = false};
+    return run_kex(c3, ch, i_c, k1.p, trust);
+}
+
+@requires(network)
+Handshake run_kex(Conn c, Chosen ch, List(Int) i_c, List(Int) i_s, Trust trust) {
+    Ecdh e = ecdh_new();
+    Conn c1 = send_packet(c, ecdh_init_payload(e));
+    Pkt r = kex_packet(c1);
+    if (!conn_ok(r.c)) { return Handshake {.c = r.c, .host = no_key(), .fingerprint = ""}; }
+    Reply rep = parse_ecdh_reply(r.p);
+    if (!rep.ok) { return Handshake {.c = conn_err(r.c, "malformed key exchange reply"), .host = no_key(), .fingerprint = ""}; }
+    Exchanged x = finish_ecdh(e, rep, our_version(), r.c.v_s, i_c, i_s, ch.hostkey);
+    if (str_len(x.err) > 0) { return Handshake {.c = conn_err(r.c, x.err), .host = x.host, .fingerprint = ""}; }
+    Str fp = fingerprint(rep.host_blob);
+    // On a rekey the host key must be the one verified at the start.
+    Bool rekeying = r.c.sid.len() > 0;
+    if (rekeying && !same_bytes(rep.host_blob, r.c.host_blob)) { return Handshake {.c = conn_err(r.c, "the host key changed during a rekey"), .host = x.host, .fingerprint = fp}; }
+    Str refuse = if (rekeying) { "" } else { trust_refusal(trust, rep.host_blob) };
+    if (str_len(refuse) > 0) { return Handshake {.c = conn_err(r.c, refuse), .host = x.host, .fingerprint = fp}; }
+    List(Int) sid = if (rekeying) { r.c.sid } else { x.h };
+    List(Int) hsig = if (rekeying) { r.c.host_sig } else { rep.sig };
+    Conn c2 = send_packet(r.c, [msg_newkeys()]);
+    Pkt nk = kex_packet(c2);
+    if (!conn_ok(nk.c)) { return Handshake {.c = nk.c, .host = x.host, .fingerprint = fp}; }
+    if (nk.p.len() != 1 || nk.p[0] != msg_newkeys()) { return Handshake {.c = conn_err(nk.c, "expected NEWKEYS"), .host = x.host, .fingerprint = fp}; }
+    Keys ks = new_keys(ch, nk.c.strict, x.k, x.h, sid, nk.c.tx.seq, nk.c.rx.seq);
+    Conn done = Conn {.fd = nk.c.fd, .tx = ks.tx, .rx = ks.rx, .buf = nk.c.buf, .eof = nk.c.eof, .err = "",
+        .v_s = nk.c.v_s, .sid = sid, .host_blob = rep.host_blob, .host_sig = hsig, .host_alg = nk.c.host_alg,
+        .strict = nk.c.strict, .sig_algs = nk.c.sig_algs, .hostbound = nk.c.hostbound, .ping = nk.c.ping};
+    return Handshake {.c = done, .host = x.host, .fingerprint = fp};
+}
+
+// A packet during the key exchange. Under strict kex anything but the
+// expected kex message ends the connection (the Terrapin countermeasure);
+// otherwise IGNORE and DEBUG are skipped.
+List(Str) key_types(List(List(Int)) ps, Int i, List(Str) acc) {
+    if (i >= ps.len()) { return acc; }
+    GotText a = rd_text(rd(ps[i]));
+    return key_types(ps, i + 1, acc.concat([a.v]));
+}
+
+@requires(network)
+Pkt kex_packet(Conn c) {
+    Pkt k = recv_packet(c);
+    if (!conn_ok(k.c)) { return k; }
+    Int t = k.p[0];
+    if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
+    if (!k.c.strict && (t == msg_ignore() || t == msg_debug())) { return kex_packet(k.c); }
+    if (t != msg_kex_ecdh_reply() && t != msg_newkeys()) { return pkt_err(k.c, "unexpected message during key exchange"); }
+    return k;
+}
+
+// A rekey the server started with its KEXINIT `i_s`.
+@requires(network)
+Conn rekey(Conn c, List(Int) i_s) {
+    List(Str) host_algs = [c.host_alg];
+    List(Int) i_c = kexinit_payload(host_algs, false);
+    Conn c1 = send_packet(c, i_c);
+    Chosen ch = choose(parse_kexinit(i_s), host_algs, false);
+    if (str_len(ch.err) > 0) { return conn_err(c1, ch.err); }
+    Handshake h = run_kex(c1, ch, i_c, i_s, Trust {.pinned = [c.host_blob], .probe = false});
+    return h.c;
+}
+
+// ============================================================================
+// Services
+// ============================================================================
+
+@requires(network)
+pub Conn request_service(Conn c, Str name) {
+    Conn c1 = send_packet(c, [msg_service_request()].concat(sstr(name)));
+    Pkt k = next_msg(c1);
+    if (!conn_ok(k.c)) { return k.c; }
+    if (k.p[0] != msg_service_accept()) { return conn_err(k.c, "the server refused the " + name + " service"); }
+    return k.c;
+}
+
+@requires(network)
+pub Bool disconnect(Conn c, Str why) {
+    Conn c1 = send_packet(c, [msg_disconnect()].concat(u32_be(11)).concat(sstr(why)).concat(sstr("")));
+    _ = resid_tcp_shutdown(c1.fd);
+    return resid_tcp_close(c1.fd);
+}

@@ -1,0 +1,96 @@
+// The client side of the SSH agent protocol (draft-ietf-sshm-ssh-agent),
+// spoken to Symbolon's agent: on desktop over SSH_AUTH_SOCK, on Android
+// over the bound service of SPEC 7.3, which carries the same messages.
+//
+// Pylon never holds a private key (SPEC G1). It asks the agent for its
+// public keys and for signatures, and before any signature it binds the
+// agent to this connection with session-bind@openssh.com (SPEC 7.2), so
+// the agent can show the principal which server is asking and refuse a
+// request for any other session.
+
+import "crypto.resid";
+import "wire.resid";
+
+pub Int agent_failure() { return 5; }
+pub Int agent_success() { return 6; }
+pub Int agent_request_identities() { return 11; }
+pub Int agent_identities_answer() { return 12; }
+pub Int agent_sign_request() { return 13; }
+pub Int agent_sign_response() { return 14; }
+pub Int agent_extension() { return 27; }
+
+pub Int flag_rsa_sha2_256() { return 2; }
+pub Int flag_rsa_sha2_512() { return 4; }
+
+List(Int) agent_msg(Int t, List(Int) body) { return u32_be(body.len() + 1).concat([t]).concat(body); }
+
+pub type AgentReply = { Int t; List(Int) body; };
+
+@requires(network)
+List(Int) read_exact(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) chunk = resid_unix_recv_some(fd, n - acc.len());
+    if (chunk.len() == 0) { return acc; }
+    return read_exact(fd, n, acc.concat(chunk));
+}
+
+// One request and its reply. The agent may take as long as the principal
+// needs to read the consent sheet, so the deadline is generous (5 min).
+@requires(network)
+AgentReply call(Int fd, Int t, List(Int) body) {
+    if (!resid_unix_send(fd, agent_msg(t, body))) { return AgentReply {.t = -1, .body = []}; }
+    _ = resid_unix_deadline(fd, 300000);
+    List(Int) h = read_exact(fd, 4, []);
+    Int n = be32(h, 0);
+    if (h.len() != 4 || n < 1 || n > 262144) { return AgentReply {.t = -1, .body = []}; }
+    List(Int) b = read_exact(fd, n, []);
+    if (b.len() != n) { return AgentReply {.t = -1, .body = []}; }
+    return AgentReply {.t = b[0], .body = b[1..n]};
+}
+
+@requires(network, environment)
+pub Int agent_connect() {
+    Str path = environment.get("SSH_AUTH_SOCK");
+    if (str_len(path) == 0) { return -1; }
+    return resid_unix_connect(path);
+}
+
+// session-bind@openssh.com: the host key, the session identifier, the
+// host's signature over it from the key exchange, and whether this is a
+// forwarded agent (never, in Pylon). True when the agent accepted it.
+@requires(network)
+pub Bool agent_bind(Int fd, List(Int) host_blob, List(Int) sid, List(Int) host_sig) {
+    List(Int) body = sstr("session-bind@openssh.com").concat(sstring(host_blob)).concat(sstring(sid)).concat(sstring(host_sig)).concat(sbool(false));
+    AgentReply r = call(fd, agent_extension(), body);
+    return r.t == agent_success();
+}
+
+pub type Ident = { List(Int) blob; Str comment; };
+
+@requires(network)
+pub List(Ident) agent_ids(Int fd) {
+    AgentReply r = call(fd, agent_request_identities(), []);
+    if (r.t != agent_identities_answer()) { return []; }
+    GotInt n = rd_u32(rd(r.body));
+    if (!rd_ok(n.r) || n.v > 1024) { return []; }
+    return ids_acc(n.r, n.v, []);
+}
+
+List(Ident) ids_acc(Rd r, Int left, List(Ident) acc) {
+    if (left <= 0) { return acc; }
+    Got b = rd_str(r);
+    Got c = rd_str(b.r);
+    if (!rd_ok(c.r)) { return acc; }
+    return ids_acc(c.r, left - 1, acc.concat([Ident {.blob = b.v, .comment = display_text(c.v)}]));
+}
+
+// A signature blob over `data` with the key `blob`, or [] when the agent
+// (or the principal, on the consent sheet) refused.
+@requires(network)
+pub List(Int) agent_sign(Int fd, List(Int) blob, List(Int) data, Int flags) {
+    AgentReply r = call(fd, agent_sign_request(), sstring(blob).concat(sstring(data)).concat(u32_be(flags)));
+    if (r.t != agent_sign_response()) { return []; }
+    Got s = rd_str(rd(r.body));
+    if (!rd_ok(s.r)) { return []; }
+    return s.v;
+}
