@@ -28,30 +28,31 @@ Int max_window() { return 4294967295; }
 // unknown. closed: the server closed the channel. raw: output passes to
 // the terminal as bytes (an interactive session on a pty); otherwise the
 // stderr stream is escaped (SPEC 12: a host cannot hide escape sequences
-// in a command's error output).
-pub type Chan = { Conn c; Int remote; Int window; Int rwin; Int rmax; Int status; Bool closed; Bool raw; Str err; };
+// in a command's error output). capture: channel data is kept in inbox
+// for the program (SFTP) instead of being written to the terminal.
+pub type Chan = { Conn c; Int remote; Int window; Int rwin; Int rmax; Int status; Bool closed; Bool raw; Bool capture; List(Int) inbox; Str err; };
 
 Chan chan_err(Chan ch, Conn c, Str e) {
-    return Chan {.c = conn_err(c, e), .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .err = e};
+    return Chan {.c = conn_err(c, e), .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .capture = ch.capture, .inbox = ch.inbox, .err = e};
 }
 
 Chan with_conn(Chan ch, Conn c) {
     if (!conn_ok(c)) { return chan_err(ch, c, c.err); }
-    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .err = ch.err};
+    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .capture = ch.capture, .inbox = ch.inbox, .err = ch.err};
 }
 
 Chan with_flow(Chan ch, Conn c, Int window, Int rwin) {
-    return Chan {.c = c, .remote = ch.remote, .window = window, .rwin = rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .err = ch.err};
+    return Chan {.c = c, .remote = ch.remote, .window = window, .rwin = rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .capture = ch.capture, .inbox = ch.inbox, .err = ch.err};
 }
 
 Chan with_end(Chan ch, Conn c, Int status, Bool closed) {
-    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = status, .closed = closed, .raw = ch.raw, .err = ch.err};
+    return Chan {.c = c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = status, .closed = closed, .raw = ch.raw, .capture = ch.capture, .inbox = ch.inbox, .err = ch.err};
 }
 
 pub Bool chan_ok(Chan ch) { return str_len(ch.err) == 0; }
 
 Chan no_chan(Conn c, Str e) {
-    return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .rwin = 0, .rmax = 0, .status = -1, .closed = true, .raw = false, .err = e};
+    return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .rwin = 0, .rmax = 0, .status = -1, .closed = true, .raw = false, .capture = false, .inbox = [], .err = e};
 }
 
 @requires(network, declassify)
@@ -69,7 +70,7 @@ pub Chan open_session(Conn c0) {
     if (!rd_ok(maxp.r) || ours.v != 0 || maxp.v < 1) { return no_chan(k.c, "malformed channel open confirmation"); }
     // Never more than 32 KiB per packet, whatever the server allows.
     Int rmax = if (maxp.v > our_max_packet()) { our_max_packet() } else { maxp.v };
-    return Chan {.c = k.c, .remote = theirs.v, .window = our_window(), .rwin = win.v, .rmax = rmax, .status = -1, .closed = false, .raw = false, .err = ""};
+    return Chan {.c = k.c, .remote = theirs.v, .window = our_window(), .rwin = win.v, .rmax = rmax, .status = -1, .closed = false, .raw = false, .capture = false, .inbox = [], .err = ""};
 }
 
 // A channel request that wants a reply; other channel traffic that
@@ -101,7 +102,7 @@ pub Chan shell(Chan ch, Str term, Int cols, Int rows) {
     Chan p = request(ch, "pty-req", pty);
     if (!chan_ok(p)) { return p; }
     Chan s = request(p, "shell", []);
-    return Chan {.c = s.c, .remote = s.remote, .window = s.window, .rwin = s.rwin, .rmax = s.rmax, .status = s.status, .closed = s.closed, .raw = true, .err = s.err};
+    return Chan {.c = s.c, .remote = s.remote, .window = s.window, .rwin = s.rwin, .rmax = s.rmax, .status = s.status, .closed = s.closed, .raw = true, .capture = false, .inbox = [], .err = s.err};
 }
 
 @requires(network, declassify)
@@ -109,6 +110,23 @@ pub Chan window_change(Chan ch, Int cols, Int rows) {
     List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr("window-change")).concat(sbool(false))
         .concat(u32_be(cols)).concat(u32_be(rows)).concat(u32_be(0)).concat(u32_be(0));
     return with_conn(ch, send_packet(ch.c, p));
+}
+
+// A channel whose data is kept for the program, and the same channel with
+// the first n kept bytes taken.
+pub Chan capturing(Chan ch) {
+    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = false, .capture = true, .inbox = ch.inbox, .err = ch.err};
+}
+
+pub Chan consume(Chan ch, Int n) {
+    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .capture = ch.capture, .inbox = ch.inbox[n..ch.inbox.len()], .err = ch.err};
+}
+
+// Step until at least n bytes are kept, the channel closes or fails.
+@requires(network, declassify)
+pub Chan await_bytes(Chan ch, Int n) {
+    if (!chan_ok(ch) || ch.inbox.len() >= n || ch.closed) { return ch; }
+    return await_bytes(step(ch), n);
 }
 
 // ============================================================================
@@ -137,6 +155,13 @@ Chan handle(Chan ch, Pkt k) {
         GotInt kind = if (t == msg_channel_extended_data()) { rd_u32(rc.r) } else { GotInt {.r = rc.r, .v = 0} };
         Got d = rd_str(kind.r);
         if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(ch, k.c, "the server exceeded the channel's window or packet size"); }
+        if (ch.capture) {
+            // Program data on stdout is kept; stderr is shown, escaped.
+            _ = if (t == msg_channel_data()) { true } else { err_text(d.v) };
+            List(Int) ib = if (t == msg_channel_data()) { ch.inbox.concat(d.v) } else { ch.inbox };
+            Chan kept = Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .capture = true, .inbox = ib, .err = ch.err};
+            return adjust(kept);
+        }
         _ = if (t == msg_channel_data() || ch.raw) { print_bytes(d.v) } else { err_text(d.v) };
         return adjust(with_flow(ch, k.c, ch.window - d.v.len(), ch.rwin));
     }

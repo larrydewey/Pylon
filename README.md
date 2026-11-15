@@ -37,16 +37,17 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; server-initiated rekey |
 | Keystroke timing | obfuscated by default: 20 ms ticks, one-size chaff (PING or IGNORE), checked on the wire; `--no-obfuscate-keystrokes` opts out |
 | Port forwarding | `-N -L [127.0.0.1:]PORT:HOST:HOSTPORT`, loopback binds only, many connections per session |
+| Files | `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3); a local file is never replaced without `--force`; server messages shown escaped |
 | Host trust | pinned keys only (`pylon pin HOST FINGERPRINT`) |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-32 interoperability, interactive, timing, forwarding and hostile-server
-cases in `tests/interop.sh`,
+40 interoperability, interactive, timing, forwarding, SFTP and
+hostile-server cases in `tests/interop.sh`,
 known-answer tests for the key derivation in `tests/kex_test.resid`, and
 a mutation fuzzer in `tests/fuzz_proxy.py`.
 
-Next (SPEC 17): ProxyJump and SFTP, the hybrid post-quantum key exchanges
+Next (SPEC 17): ProxyJump, the hybrid post-quantum key exchanges
 (needs ML-KEM in Resid's standard library), then the Android app. Open
 compiler warnings: SPEC Appendix A, I6.
 

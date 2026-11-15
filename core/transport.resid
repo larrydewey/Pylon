@@ -131,19 +131,23 @@ pub type Pkt = { Conn c; List(Int) p; };
 
 Pkt pkt_err(Conn c, Str e) { return Pkt {.c = conn_err(c, e), .p = []}; }
 
-// The next packet's payload, whatever its type.
+// The next packet's payload, whatever its type. Written with one success
+// and one failure return (not one per check), which also keeps the
+// compiler's key-entropy check precise about the connection's fields.
 @requires(network, declassify)
 pub Pkt recv_packet(Conn c0) {
     if (!conn_ok(c0)) { return Pkt {.c = c0, .p = []}; }
     Conn c = fill(c0, 4);
-    if (c.buf.len() < 4) { return pkt_err(c, "the server closed the connection"); }
-    Int need = need_after_len(c.rx, c.buf[0..4]);
-    if (need < 0) { return pkt_err(c, "the server sent a malformed packet"); }
-    Conn c2 = fill(c, 4 + need);
-    if (c2.buf.len() < 4 + need) { return pkt_err(c2, "the server closed the connection mid-packet"); }
-    Opened o = open(c2.rx, c2.buf[0..4 + need]);
-    if (!o.ok) { return pkt_err(c2, "a packet from the server failed authentication"); }
-    if (o.payload.len() == 0) { return pkt_err(c2, "the server sent an empty packet"); }
+    Int need = if (c.buf.len() < 4) { -2 } else { need_after_len(c.rx, c.buf[0..4]) };
+    Conn c2 = if (need >= 0) { fill(c, 4 + need) } else { c };
+    Bool whole = need >= 0 && c2.buf.len() >= 4 + need;
+    Opened o = if (whole) { open(c2.rx, c2.buf[0..4 + need]) } else { Opened {.d = c2.rx, .ok = false, .payload = []} };
+    Str err = if (need == -2) { "the server closed the connection" }
+        else { if (need < 0) { "the server sent a malformed packet" }
+        else { if (!whole) { "the server closed the connection mid-packet" }
+        else { if (!o.ok) { "a packet from the server failed authentication" }
+        else { if (o.payload.len() == 0) { "the server sent an empty packet" } else { "" } } } } };
+    if (str_len(err) > 0) { return Pkt {.c = conn_err(c2, err), .p = []}; }
     return Pkt {.c = with_io(c2, c2.tx, o.d, c2.buf[4 + need..c2.buf.len()], c2.eof), .p = o.payload};
 }
 

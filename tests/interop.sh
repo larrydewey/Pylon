@@ -43,6 +43,7 @@ KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 StrictModes no
 UsePAM no
+Subsystem sftp internal-sftp
 LogLevel DEBUG1
 EOF
     printf '%s\n' "$@" >> sshd_config
@@ -152,6 +153,26 @@ check "forward: four connections at once"      0 "4 of 4" \
 kill $FWD $WEB 2>/dev/null; wait $FWD $WEB 2>/dev/null
 check "forward: refuses a non-loopback bind"   2 "only loopback" \
     "$PYLON" -p $PORT -N -L 0.0.0.0:$LPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1"
+
+# --- SFTP get / put -------------------------------------------------------------
+head -c 3145728 /dev/urandom > up.bin; : > empty.bin
+RDIR="$WORK/remote"; mkdir -p "$RDIR"
+check "sftp: put 3 MiB"                        0 "3145728 bytes" \
+    "$PYLON" put -p $PORT up.bin "$USER_NAME@127.0.0.1:$RDIR/up.bin"
+check "sftp: the server has the same bytes"    0 "$(sha256sum up.bin | cut -d' ' -f1)" \
+    sha256sum "$RDIR/up.bin"
+check "sftp: get it back intact"               0 "$(sha256sum up.bin | cut -d' ' -f1)" \
+    bash -c "'$PYLON' get -p $PORT '$USER_NAME@127.0.0.1:$RDIR/up.bin' down.bin 2>/dev/null && sha256sum down.bin"
+check "sftp: refuses to replace a local file"  1 "not replaced" \
+    "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/up.bin" down.bin
+check "sftp: --force replaces it"              0 "3145728 bytes" \
+    "$PYLON" get -p $PORT --force "$USER_NAME@127.0.0.1:$RDIR/up.bin" down.bin
+check "sftp: an empty file"                    0 "0 bytes" \
+    "$PYLON" put -p $PORT empty.bin "$USER_NAME@127.0.0.1:$RDIR/empty.bin"
+check "sftp: a missing remote file"            1 "cannot open" \
+    "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/nope" nope.bin
+check "sftp: escape bytes in a name are shown escaped" 1 'x1b.31mred on the server' \
+    "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/$(printf '\033[31mred')" red.bin
 
 # --- an agent with no acceptable key -----------------------------------------
 ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger

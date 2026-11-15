@@ -19,8 +19,9 @@ import "../core/auth.resid";
 import "../core/session.resid";
 import "../core/known.resid";
 import "../core/forward.resid";
+import "../core/sftp.resid";
 
-type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; List(Str) fwds; List(Str) rest; Str err; };
+type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; List(Str) fwds; List(Str) rest; Str err; };
 
 @requires(args)
 Opts parse(Int i, Opts o) {
@@ -28,26 +29,29 @@ Opts parse(Int i, Opts o) {
     Str a = args.get(i);
     if (a == "-p" && i + 1 < args.count()) {
         Str v = args.get(i + 1);
-        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = "bad port " + v}; }
-        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""});
+        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = "bad port " + v}; }
+        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""});
     }
-    if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "-L" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds.concat([args.get(i + 1)]), .rest = [], .err = ""}); }
-    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = [], .err = "unknown option " + a}; }
+    if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "-L" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds.concat([args.get(i + 1)]), .rest = [], .err = ""}); }
+    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = "unknown option " + a}; }
     return rest_from(i, o);
 }
 
 @requires(args)
 Opts rest_from(Int i, Opts o) {
     if (i >= args.count()) { return o; }
-    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .fwds = o.fwds, .rest = o.rest.concat([args.get(i)]), .err = o.err});
+    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = o.rest.concat([args.get(i)]), .err = o.err});
 }
 
 Int usage() {
     eprintln("usage: pylon [-p PORT] [--allow-no-strict] [--no-obfuscate-keystrokes] USER@HOST [COMMAND...]");
     eprintln("       pylon [-p PORT] -N -L [127.0.0.1:]PORT:HOST:HOSTPORT [-L ...] USER@HOST");
+    eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
+    eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
     return 2;
 }
@@ -96,20 +100,8 @@ Int cmd_run(Opts o) {
     Str user = uh[0];
     Str host = uh[1];
     Str command = if (interactive) { "" } else { str_join(o.rest[1..o.rest.len()], " ") };
-    List(List(Int)) pinned = pinned_for(host_token(host, o.port));
-    Int agent = agent_connect();
-    if (agent < 0) { eprintln("pylon: no agent (set SSH_AUTH_SOCK to Symbolon's agent)"); return 1; }
-    List(Ident) ids = agent_ids(agent);
-    if (ids.len() == 0) { eprintln("pylon: the agent holds no keys"); return 1; }
-    Conn c = dial(host, o.port);
-    if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
-    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
-    if (!conn_ok(h.c)) { eprintln("pylon: " + h.c.err); _ = resid_tcp_close(c.fd); return 1; }
-    Authed a = authenticate(h.c, agent, user, ids);
-    _ = resid_unix_close(agent);
-    if (!a.ok) { eprintln("pylon: " + a.why); _ = disconnect(a.c, "authentication failed"); return 1; }
-    // Session traffic may idle for a long time: no read deadline now.
-    _ = resid_tcp_deadline(a.c.fd, 0);
+    Authed a = login(user, host, o);
+    if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
     if (o.no_cmd) { return run_forwards(a.c, fs); }
     Chan ch = open_session(a.c);
     if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
@@ -117,6 +109,81 @@ Int cmd_run(Opts o) {
     if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
     _ = disconnect(done.c, "done");
     return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
+}
+
+// Connect, verify the host under its pins, and authenticate through the
+// agent: the steps every command shares. Not ok, with the reason, on any
+// failure (the connection is closed then).
+@requires(network, filesystem, environment, declassify)
+Authed login(Str user, Str host, Opts o) {
+    List(List(Int)) pinned = pinned_for(host_token(host, o.port));
+    Int agent = agent_connect();
+    Conn none = conn_new(-1);
+    if (agent < 0) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
+    List(Ident) ids = agent_ids(agent);
+    if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
+    Conn c = dial(host, o.port);
+    if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
+    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
+    if (!conn_ok(h.c)) { _ = resid_tcp_close(c.fd); return Authed {.c = h.c, .ok = false, .why = h.c.err}; }
+    Authed a = authenticate(h.c, agent, user, ids);
+    _ = resid_unix_close(agent);
+    if (!a.ok) { _ = disconnect(a.c, "authentication failed"); return a; }
+    // Session traffic may idle for a long time: no read deadline now.
+    _ = resid_tcp_deadline(a.c.fd, 0);
+    return a;
+}
+
+// "USER@HOST:PATH" split, or user "" when malformed.
+type Remote = { Str user; Str host; Str path; };
+
+Remote parse_remote(Str s) {
+    List(Str) uh = str_split(s, "@");
+    if (uh.len() != 2 || str_len(uh[0]) == 0) { return Remote {.user = "", .host = "", .path = ""}; }
+    List(Str) hp = str_split(uh[1], ":");
+    if (hp.len() < 2 || str_len(hp[0]) == 0) { return Remote {.user = "", .host = "", .path = ""}; }
+    Str path = str_join(hp[1..hp.len()], ":");
+    if (str_len(path) == 0) { return Remote {.user = "", .host = "", .path = ""}; }
+    return Remote {.user = uh[0], .host = hp[0], .path = path};
+}
+
+// pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL
+@requires(network, filesystem, environment, declassify)
+Int cmd_get(Opts o) {
+    if (o.rest.len() != 2) { return usage(); }
+    Remote r = parse_remote(o.rest[0]);
+    Str local = o.rest[1];
+    if (str_len(r.user) == 0) { eprintln("pylon: give the source as USER@HOST:PATH"); return 2; }
+    if (filesystem.exists(local) && !o.force) { eprintln("pylon: " + local + " exists; not replaced (use --force to replace it)"); return 1; }
+    Authed a = login(r.user, r.host, o);
+    if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    Sftp s = sftp_start(open_session(a.c));
+    if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
+    Copied c = get_file(s, r.path, local);
+    if (str_len(c.s.err) > 0) { eprintln("pylon: " + c.s.err); return 1; }
+    _ = disconnect(c.s.ch.c, "done");
+    eprintln("pylon: " + f"{c.bytes}" + " bytes to " + local);
+    return 0;
+}
+
+// pylon put [-p PORT] LOCAL USER@HOST:REMOTE
+@requires(network, filesystem, environment, declassify)
+Int cmd_put(Opts o) {
+    if (o.rest.len() != 2) { return usage(); }
+    Str local = o.rest[0];
+    Remote r = parse_remote(o.rest[1]);
+    if (str_len(r.user) == 0) { eprintln("pylon: give the destination as USER@HOST:PATH"); return 2; }
+    if (!filesystem.exists(local) || filesystem.is_dir(local)) { eprintln("pylon: " + local + " is not a file"); return 1; }
+    List(Int) data = filesystem.read_bytes(local);
+    Authed a = login(r.user, r.host, o);
+    if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    Sftp s = sftp_start(open_session(a.c));
+    if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
+    Copied c = put_file(s, data, r.path);
+    if (str_len(c.s.err) > 0) { eprintln("pylon: " + c.s.err); return 1; }
+    _ = disconnect(c.s.ch.c, "done");
+    eprintln("pylon: " + f"{c.bytes}" + " bytes to " + r.host + ":" + display_text(bytes_of(r.path)));
+    return 0;
 }
 
 List(Fwd) parse_fwds(List(Str) specs, Int i, List(Fwd) acc) {
@@ -160,8 +227,12 @@ Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
 
 @requires(args, network, filesystem, environment, declassify, terminal, clock(readonly))
 Int main() {
-    Bool is_pin = args.count() > 1 && args.get(1) == "pin";
-    Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .fwds = [], .rest = [], .err = ""});
+    Str verb = if (args.count() > 1) { args.get(1) } else { "" };
+    Bool sub = verb == "pin" || verb == "get" || verb == "put";
+    Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
-    return if (is_pin) { cmd_pin(o) } else { cmd_run(o) };
+    if (verb == "pin") { return cmd_pin(o); }
+    if (verb == "get") { return cmd_get(o); }
+    if (verb == "put") { return cmd_put(o); }
+    return cmd_run(o);
 }

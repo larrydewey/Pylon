@@ -1,0 +1,175 @@
+// SFTP version 3 (draft-ietf-secsh-filexfer-02, the version OpenSSH
+// speaks) over a session channel: copying one file each way (SPEC 11).
+//
+//   pylon get USER@HOST:REMOTE LOCAL     pylon put LOCAL USER@HOST:REMOTE
+//
+// The local path is always the one the principal typed; nothing the
+// server says chooses where a file lands. A local file is never replaced
+// unless --force is given. Server messages are shown escaped. Requests
+// are sequential (one outstanding at a time), 32 KiB each.
+
+import "crypto.resid";
+import "wire.resid";
+import "transport.resid";
+import "session.resid";
+
+Int fx_init() { return 1; }
+Int fx_version() { return 2; }
+Int fx_open() { return 3; }
+Int fx_close() { return 4; }
+Int fx_read() { return 5; }
+Int fx_write() { return 6; }
+Int fx_status() { return 101; }
+Int fx_handle() { return 102; }
+Int fx_data() { return 103; }
+
+Int fx_ok() { return 0; }
+Int fx_eof() { return 1; }
+
+Int pf_read() { return 1; }
+Int pf_write() { return 2; }
+Int pf_creat() { return 8; }
+Int pf_trunc() { return 16; }
+
+Int chunk() { return 32768; }
+// The largest SFTP packet accepted from the server (a 32 KiB data reply
+// plus headers, with room to spare).
+Int max_packet() { return 262144; }
+
+// A session with its next request id.
+pub type Sftp = { Chan ch; Int id; Str err; };
+
+Sftp sftp_err(Sftp s, Str e) { return Sftp {.ch = s.ch, .id = s.id, .err = e}; }
+
+// A reply: type, request id (or the version for VERSION), the rest.
+pub type Reply = { Sftp s; Int t; Int id; List(Int) body; };
+
+Reply reply_err(Sftp s, Str e) { return Reply {.s = sftp_err(s, e), .t = -1, .id = -1, .body = []}; }
+
+@requires(network, declassify)
+pub Sftp sftp_start(Chan ch0) {
+    Chan ch = request(ch0, "subsystem", sstr("sftp"));
+    if (!chan_ok(ch)) { return Sftp {.ch = ch, .id = 1, .err = "the server has no SFTP service: " + ch.err}; }
+    Sftp s0 = Sftp {.ch = capturing(ch), .id = 1, .err = ""};
+    Sftp s1 = send(s0, [fx_init()].concat(u32_be(3)));
+    Reply r = next_reply(s1);
+    if (str_len(r.s.err) > 0) { return r.s; }
+    if (r.t != fx_version() || r.id != 3) { return sftp_err(r.s, "the server does not speak SFTP version 3"); }
+    return r.s;
+}
+
+@requires(network, declassify)
+Sftp send(Sftp s, List(Int) body) {
+    if (str_len(s.err) > 0) { return s; }
+    Chan c2 = send_data(s.ch, u32_be(body.len()).concat(body));
+    if (!chan_ok(c2)) { return Sftp {.ch = c2, .id = s.id, .err = c2.err}; }
+    return Sftp {.ch = c2, .id = s.id, .err = ""};
+}
+
+// The next whole SFTP packet from the channel.
+@requires(network, declassify)
+Reply next_reply(Sftp s) {
+    if (str_len(s.err) > 0) { return Reply {.s = s, .t = -1, .id = -1, .body = []}; }
+    Chan a = await_bytes(s.ch, 4);
+    if (!chan_ok(a) || a.inbox.len() < 4) { return reply_err(s, "the SFTP session ended"); }
+    Int n = be32(a.inbox, 0);
+    if (n < 5 || n > max_packet()) { return reply_err(s, "the server sent a malformed SFTP packet"); }
+    Chan b = await_bytes(a, 4 + n);
+    if (!chan_ok(b) || b.inbox.len() < 4 + n) { return reply_err(s, "the SFTP session ended mid-packet"); }
+    List(Int) pkt = b.inbox[4..4 + n];
+    Chan rest = consume(b, 4 + n);
+    Int id = be32(pkt, 1);
+    return Reply {.s = Sftp {.ch = rest, .id = s.id, .err = ""}, .t = pkt[0], .id = id, .body = pkt[5..pkt.len()]};
+}
+
+// A request and its reply, matched by id.
+@requires(network, declassify)
+Reply call(Sftp s, Int t, List(Int) args) {
+    Int id = s.id;
+    Sftp s1 = send(Sftp {.ch = s.ch, .id = id + 1, .err = s.err}, [t].concat(u32_be(id)).concat(args));
+    Reply r = next_reply(s1);
+    if (str_len(r.s.err) > 0) { return r; }
+    if (r.id != id) { return reply_err(r.s, "the server answered another SFTP request"); }
+    return r;
+}
+
+// What a STATUS reply says, escaped for display.
+Str status_text(List(Int) body) {
+    GotInt code = rd_u32(rd(body));
+    Got msg = rd_str(code.r);
+    Str m = if (rd_ok(msg.r) && msg.v.len() > 0) { display_text(msg.v) } else { "status " + f"{code.v}" };
+    return m;
+}
+
+Int status_code(List(Int) body) { return be32(body, 0); }
+
+@requires(network, declassify)
+Reply open_remote(Sftp s, Str path, Int flags) {
+    List(Int) attrs = if ((flags & pf_creat()) != 0) { u32_be(4).concat(u32_be(384)) } else { u32_be(0) };   // mode 0600 for a new file
+    Reply r = call(s, fx_open(), sstr(path).concat(u32_be(flags)).concat(attrs));
+    if (str_len(r.s.err) > 0) { return r; }
+    if (r.t == fx_status()) { return reply_err(r.s, "cannot open " + display_text(bytes_of(path)) + " on the server: " + status_text(r.body)); }
+    if (r.t != fx_handle()) { return reply_err(r.s, "unexpected reply to open"); }
+    return r;
+}
+
+@requires(network, declassify)
+Sftp close_remote(Sftp s, List(Int) handle) {
+    Reply r = call(s, fx_close(), sstring(handle));
+    return r.s;
+}
+
+// ============================================================================
+// get
+// ============================================================================
+
+pub type Copied = { Sftp s; Int bytes; };
+
+// REMOTE into LOCAL (created; the caller has checked it may be).
+@requires(network, declassify, filesystem)
+pub Copied get_file(Sftp s0, Str remote, Str local) {
+    Reply o = open_remote(s0, remote, pf_read());
+    if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
+    Got h = rd_str(rd(o.body));
+    if (!rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return Copied {.s = sftp_err(o.s, "the server sent a malformed handle"), .bytes = 0}; }
+    if (!filesystem.write_bytes(local, [])) { return Copied {.s = sftp_err(close_remote(o.s, h.v), "cannot write " + local), .bytes = 0}; }
+    Copied c = get_loop(o.s, h.v, local, 0);
+    return Copied {.s = if (str_len(c.s.err) > 0) { c.s } else { close_remote(c.s, h.v) }, .bytes = c.bytes};
+}
+
+@requires(network, declassify, filesystem)
+Copied get_loop(Sftp s, List(Int) handle, Str local, Int off) {
+    Reply r = call(s, fx_read(), sstring(handle).concat(u64_be(off)).concat(u32_be(chunk())));
+    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
+    if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Copied {.s = r.s, .bytes = off}; }
+    if (r.t == fx_status()) { return Copied {.s = sftp_err(r.s, "read failed: " + status_text(r.body)), .bytes = off}; }
+    Got d = rd_str(rd(r.body));
+    if (r.t != fx_data() || !rd_ok(d.r) || d.v.len() == 0 || d.v.len() > chunk()) { return Copied {.s = sftp_err(r.s, "the server sent a malformed data reply"), .bytes = off}; }
+    if (!filesystem.append_bytes(local, d.v)) { return Copied {.s = sftp_err(r.s, "cannot write " + local), .bytes = off}; }
+    return get_loop(r.s, handle, local, off + d.v.len());
+}
+
+// ============================================================================
+// put
+// ============================================================================
+
+// The bytes `data` into REMOTE (created or truncated, mode 0600 if new).
+@requires(network, declassify)
+pub Copied put_file(Sftp s0, List(Int) data, Str remote) {
+    Reply o = open_remote(s0, remote, pf_write() | pf_creat() | pf_trunc());
+    if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
+    Got h = rd_str(rd(o.body));
+    if (!rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return Copied {.s = sftp_err(o.s, "the server sent a malformed handle"), .bytes = 0}; }
+    Copied c = put_loop(o.s, h.v, data, 0);
+    return Copied {.s = if (str_len(c.s.err) > 0) { c.s } else { close_remote(c.s, h.v) }, .bytes = c.bytes};
+}
+
+@requires(network, declassify)
+Copied put_loop(Sftp s, List(Int) handle, List(Int) data, Int off) {
+    if (off >= data.len()) { return Copied {.s = s, .bytes = off}; }
+    Int n = if (data.len() - off < chunk()) { data.len() - off } else { chunk() };
+    Reply r = call(s, fx_write(), sstring(handle).concat(u64_be(off)).concat(sstring(data[off..off + n])));
+    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
+    if (r.t != fx_status() || status_code(r.body) != fx_ok()) { return Copied {.s = sftp_err(r.s, "write failed: " + status_text(r.body)), .bytes = off}; }
+    return put_loop(r.s, handle, data, off + n);
+}
