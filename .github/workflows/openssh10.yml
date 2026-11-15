@@ -59,7 +59,7 @@ jobs:
         working-directory: openssh-src
         run: |
           P="$RUNNER_TEMP/openssh"
-          autoreconf -q
+          autoreconf
           ./configure -q --prefix="$P" --without-pam --with-privsep-user=nobody --with-privsep-path="$P/var/empty"
           make -s -j"$(nproc)"
           make -s install-nokeys
