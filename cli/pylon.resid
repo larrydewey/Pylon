@@ -46,7 +46,7 @@ Int usage() {
     return 2;
 }
 
-@requires(network)
+@requires(network, declassify)
 Conn dial(Str host, Int port) {
     Int fd = resid_tcp_connect(host, port);
     Conn c = conn_new(fd);
@@ -55,7 +55,7 @@ Conn dial(Str host, Int port) {
     return c;
 }
 
-@requires(network, filesystem, environment)
+@requires(network, filesystem, environment, declassify)
 Int cmd_pin(Opts o) {
     if (o.rest.len() != 2) { return usage(); }
     Str host = o.rest[0];
@@ -76,7 +76,7 @@ Int cmd_pin(Opts o) {
     return 0;
 }
 
-@requires(network, filesystem, environment)
+@requires(network, filesystem, environment, declassify)
 Int cmd_run(Opts o) {
     if (o.rest.len() < 2) { return usage(); }
     List(Str) uh = str_split(o.rest[0], "@");
@@ -108,7 +108,7 @@ Int cmd_run(Opts o) {
     return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
 }
 
-@requires(args, network, filesystem, environment)
+@requires(args, network, filesystem, environment, declassify)
 Int main() {
     Bool is_pin = args.count() > 1 && args.get(1) == "pin";
     Opts o = parse(if (is_pin) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .rest = [], .err = ""});

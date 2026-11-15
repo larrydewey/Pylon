@@ -1,0 +1,60 @@
+// Known-answer tests for the constant-time handling of K (core/kex.resid):
+// for shared secrets of every shape (leading zero bytes, top bit set or
+// clear), H and the derived keys must equal the plain RFC 4253 7.2
+// computation over the ordinary mpint encoding.
+
+import "crypto.resid";
+import "word.resid";
+import "../core/wire.resid";
+import "../core/cipher.resid";
+import "../core/kex.resid";
+
+List(Int) key_with(Int zeros, Int first) {
+    List(Int) tail = sha256_bytes([zeros, first]);
+    List(Int) z = repeat0(zeros, []);
+    List(Int) body = z.concat([first]).concat(tail);
+    return body[0..32];
+}
+
+List(Int) repeat0(Int n, List(Int) acc) { if (n <= 0) { return acc; } return repeat0(n - 1, acc.concat([0])); }
+
+// The plain derivation, on public bytes.
+List(Int) plain_derive(List(Int) k, List(Int) h, Int letter, List(Int) sid, Int need) {
+    List(Int) k1 = sha256_bytes(k.concat(h).concat([letter]).concat(sid));
+    return plain_extend(k, h, k1, need);
+}
+
+List(Int) plain_extend(List(Int) k, List(Int) h, List(Int) acc, Int need) {
+    if (acc.len() >= need) { return acc[0..need]; }
+    return plain_extend(k, h, acc.concat(sha256_bytes(k.concat(h).concat(acc))), need);
+}
+
+@fixed_secrets
+@requires(declassify)
+Bool same_as_plain(Int zeros, Int first) {
+    List(Int) k = key_with(zeros, first);
+    List(Int) hin = sstr("transcript").concat(u32_be(zeros));
+    Derived d = derive_all(secret_bytes(k), hin, [], 12, 12, 64, 32);
+    List(Int) kenc = mpint(k);
+    List(Int) h = sha256_bytes(hin.concat(kenc));
+    Bool ok_h = hex_encode(ints_of(declassify(secret_join(d.h), "test"))) == hex_encode(h);
+    Bool ok_iv = hex_encode(ints_of(declassify(secret_join(d.iv_c), "test"))) == hex_encode(plain_derive(kenc, h, 65, h, 12));
+    Bool ok_kc = hex_encode(ints_of(declassify(secret_join(d.key_c), "test"))) == hex_encode(plain_derive(kenc, h, 67, h, 64));
+    Bool ok_ks = hex_encode(ints_of(declassify(secret_join(d.key_s), "test"))) == hex_encode(plain_derive(kenc, h, 68, h, 32));
+    return ok_h && ok_iv && ok_kc && ok_ks;
+}
+
+@requires(declassify)
+test "K with no leading zero, top bit clear" { assert(same_as_plain(0, 0x12), "shape (0, no pad)"); }
+@requires(declassify)
+test "K with no leading zero, top bit set" { assert(same_as_plain(0, 0xa5), "shape (0, pad)"); }
+@requires(declassify)
+test "K with one leading zero" { assert(same_as_plain(1, 0x7f), "shape (1, no pad)"); }
+@requires(declassify)
+test "K with one leading zero, top bit set" { assert(same_as_plain(1, 0x80), "shape (1, pad)"); }
+@requires(declassify)
+test "K with three leading zeros" { assert(same_as_plain(3, 0x01), "shape (3, no pad)"); }
+@requires(declassify)
+test "K with thirty leading zeros" { assert(same_as_plain(30, 0xff), "shape (30, pad)"); }
+@requires(declassify)
+test "K with thirty-one leading zeros" { assert(same_as_plain(31, 0x01), "shape (31, no pad)"); }

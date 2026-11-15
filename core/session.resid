@@ -28,7 +28,7 @@ pub type Chan = { Conn c; Int remote; Int window; Int status; Str err; };
 
 Chan chan_err(Conn c, Str e) { return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .status = -1, .err = e}; }
 
-@requires(network)
+@requires(network, declassify)
 pub Chan open_session(Conn c0) {
     List(Int) p = [msg_channel_open()].concat(sstr("session")).concat(u32_be(0)).concat(u32_be(our_window())).concat(u32_be(our_max_packet()));
     Conn c1 = send_packet(c0, p);
@@ -43,7 +43,7 @@ pub Chan open_session(Conn c0) {
 }
 
 // A channel request that wants a reply.
-@requires(network)
+@requires(network, declassify)
 pub Chan request(Chan ch, Str kind, List(Int) data) {
     List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr(kind)).concat(sbool(true)).concat(data);
     Conn c1 = send_packet(ch.c, p);
@@ -54,7 +54,7 @@ pub Chan request(Chan ch, Str kind, List(Int) data) {
     return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
 }
 
-@requires(network)
+@requires(network, declassify)
 Chan request_wait(Chan ch, Str kind) {
     Pkt k = next_msg(ch.c);
     if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
@@ -63,7 +63,7 @@ Chan request_wait(Chan ch, Str kind) {
     return Chan {.c = k.c, .remote = ch.remote, .window = ch.window, .status = -1, .err = ""};
 }
 
-@requires(network)
+@requires(network, declassify)
 pub Chan exec(Chan ch, Str command) { return request(ch, "exec", sstr(command)); }
 
 // Copy the channel's output to stdout (and stderr's, escaped, to
@@ -71,20 +71,23 @@ pub Chan exec(Chan ch, Str command) { return request(ch, "exec", sstr(command));
 // Standard output is the principal's own command output and passes as
 // bytes; stderr goes through display_text so a host cannot hide escape
 // sequences in it.
-@requires(network)
+@requires(network, declassify)
 pub Chan pump(Chan ch) {
     Pkt k = next_msg(ch.c);
     if (!conn_ok(k.c)) { return chan_err(k.c, k.c.err); }
     Int t = k.p[0];
     GotInt rc = rd_u32(rd_at(k.p, 1));
+    if ((t == msg_channel_data() || t == msg_channel_extended_data()) && rc.v != 0) { return chan_err(k.c, "the server sent data for a channel that is not open"); }
     if (t == msg_channel_data()) {
         Got d = rd_str(rc.r);
+        if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(k.c, "the server exceeded the channel's window or packet size"); }
         _ = print_bytes(d.v);
         return pump(adjust(Chan {.c = k.c, .remote = ch.remote, .window = ch.window - d.v.len(), .status = ch.status, .err = ""}));
     }
     if (t == msg_channel_extended_data()) {
         GotInt kind = rd_u32(rc.r);
         Got d = rd_str(kind.r);
+        if (!rd_ok(d.r) || d.v.len() > our_max_packet() || d.v.len() > ch.window) { return chan_err(k.c, "the server exceeded the channel's window or packet size"); }
         // Phase 0 has only line output on stderr: one trailing newline is
         // folded into eprintln's.
         List(Int) e = if (d.v.len() > 0 && d.v[d.v.len() - 1] == 10) { d.v[0..d.v.len() - 1] } else { d.v };
@@ -108,7 +111,7 @@ pub Chan pump(Chan ch) {
 }
 
 // Give the server more window once half of it is used.
-@requires(network)
+@requires(network, declassify)
 Chan adjust(Chan ch) {
     if (ch.window > our_window() / 2) { return ch; }
     Int add = our_window() - ch.window;

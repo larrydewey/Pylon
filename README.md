@@ -12,7 +12,9 @@ SSH side of Termux.
   [Symbolon](https://github.com/larrydewey/symbolon) (threshold keys, a
   consent sheet per signature), bound to the session and the host key
   (`session-bind@openssh.com`, `publickey-hostbound-v00@openssh.com`), so a
-  host can never obtain a signature usable elsewhere.
+  host can never obtain a signature usable elsewhere. Pylon also works
+  without Symbolon (a hardware key, another agent, or an imported key
+  file), behind an explicit warning of what that gives up (SPEC 7.6).
 - **Pylon-to-Pylon when possible.** After an SSH login, Pylon can push a
   signed, hash-verified `pylond` to the host over the same connection and
   move the session onto a roaming, post-quantum, forward-secret UDP
@@ -34,14 +36,17 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound |
 | Sessions | exec with stdout, stderr (escaped) and exit status; flow control; server-initiated rekey |
 | Host trust | pinned keys only (`pylon pin HOST FINGERPRINT`) |
+| Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
-Tested against OpenSSH 9.6 and Dropbear 2022.83: 24 interoperability and
-hostile-server cases in `tests/interop.sh`.
+Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
+24 interoperability and hostile-server cases in `tests/interop.sh`,
+known-answer tests for the key derivation in `tests/kex_test.resid`, and
+a mutation fuzzer in `tests/fuzz_proxy.py`.
 
 Next (SPEC 17): interactive shells (needs a non-blocking stdin read in the
-Resid runtime), `Secret(T)` keying material throughout, the hybrid
-post-quantum key exchanges (needs ML-KEM in Resid's standard library),
-then the Android app.
+Resid runtime), the hybrid post-quantum key exchanges (needs ML-KEM in
+Resid's standard library), then the Android app. Open compiler warning:
+SPEC Appendix A, I4.
 
 ## Build and use
 
@@ -67,6 +72,11 @@ servers without the Terrapin fix). Pinned keys live in
 
 ```sh
 tests/interop.sh build/pylon      # needs sshd, ssh-keygen, ssh-agent, python3
+residc test tests/kex_test.resid  # key derivation known answers
+
+# Fuzzing through a mutating proxy in front of a running sshd (port 2222),
+# with the host pinned under the proxy's port:
+FUZZ_PORT=2299 FUZZ_EXPECT=ok tests/fuzz_proxy.py 200 2222 -- build/pylon -p {port} USER@127.0.0.1 echo ok
 ```
 
 ## Layout

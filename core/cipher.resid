@@ -10,16 +10,57 @@
 //
 // A direction's state is a value: sealing or opening a packet returns the
 // new state (sequence number, GCM invocation counter).
+//
+// Keys are Secret(UInt(8)) bytes and every cipher runs on the generic
+// (secret-typed) implementations, so the compiler checks that no branch,
+// index or output depends on a key. Values leave the secret domain only
+// at the declassify points below, each naming what is published: the
+// sealed bytes, a received packet's length (needed to frame it, as in
+// every SSH implementation), and a payload after its tag verified.
 
 import "crypto.resid";
-import "chacha.resid";
-import "aesgcm.resid";
+import "word.resid";
+import "random.resid";
+import "chachag.resid";
+import "aesgcmg.resid";
 import "wire.resid";
 
-// kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM.
-pub type Dir = { Int kind; List(Int) key; List(Int) iv; Int seq; };
+// Public bytes lifted into secret computation (they claim no secrecy).
+pub List(Secret(UInt(8))) lift(List(Int) b) { return lift_acc(b, 0, ListBuf()); }
 
-pub Dir dir_none() { return Dir {.kind = 0, .key = [], .iv = [], .seq = 0}; }
+List(Secret(UInt(8))) lift_acc(List(Int) b, Int i, ListBuf(Secret(UInt(8))) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return lift_acc(b, i + 1, acc.push(classify(wrapping_u8(b[i]))));
+}
+
+pub List(Int) ints_of(List(UInt(8)) b) { return ints_acc(b, 0, ListBuf()); }
+
+List(Int) ints_acc(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints_acc(b, i + 1, acc.push((Int) b[i]));
+}
+
+@robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
+@requires(declassify)
+List(Int) pub_sealed(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "sealed packet bytes are sent on the wire")); }
+
+@robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
+@requires(declassify)
+List(Int) pub_length(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "packet length, needed to frame the packet before its tag is checked")); }
+
+@robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
+@requires(declassify)
+List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "packet payload after its tag verified")); }
+
+// kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM. The GCM IV
+// is not secret (RFC 5647 7.1).
+pub type Dir = { Int kind; List(Secret(UInt(8))) key; List(Int) iv; Int seq; };
+
+// Before the first NEWKEYS nothing is encrypted and the key is never
+// used; it is random rather than empty so that no constant can ever flow
+// into a cipher call (the compiler's key-entropy check, E0270, sees one
+// Dir type for both states).
+pub Dir dir_none() { return Dir {.kind = 0, .key = random_secret(64), .iv = [], .seq = 0}; }
 
 pub Int cipher_key_len(Str name) {
     if (name == "chacha20-poly1305@openssh.com") { return 64; }
@@ -30,7 +71,7 @@ pub Int cipher_key_len(Str name) {
 
 pub Int cipher_iv_len(Str name) { return if (str_ends_with(name, "-gcm@openssh.com")) { 12 } else { 0 }; }
 
-pub Dir dir_new(Str name, List(Int) key, List(Int) iv, Int seq) {
+pub Dir dir_new(Str name, List(Secret(UInt(8))) key, List(Int) iv, Int seq) {
     Int k = if (name == "chacha20-poly1305@openssh.com") { 1 } else { if (str_ends_with(name, "-gcm@openssh.com")) { 2 } else { 0 } };
     return Dir {.kind = k, .key = key, .iv = iv, .seq = seq};
 }
@@ -63,11 +104,12 @@ pub List(Int) frame(Dir d, List(Int) payload) {
 
 pub type Sealed = { Dir d; List(Int) out; };
 
+@requires(declassify)
 pub Sealed seal(Dir d, List(Int) payload) {
     List(Int) pkt = frame(d, payload);
     if (d.kind == 0) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = pkt}; }
     if (d.kind == 1) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = cc_seal(d.key, d.seq, pkt)}; }
-    List(Int) ct = aes_gcm_seal(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
+    List(Int) ct = pub_sealed(aes_gcmg_seal(d.key, d.iv, lift(pkt[4..pkt.len()]), pkt[0..4]));
     Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
     return Sealed {.d = nd, .out = pkt[0..4].concat(ct)};
 }
@@ -83,22 +125,25 @@ pub Sealed seal(Dir d, List(Int) payload) {
 
 List(Int) cc_nonce(Int seq) { return [0, 0, 0, 0].concat(u64_be(seq)); }
 
-List(Int) cc_seal(List(Int) key, Int seq, List(Int) pkt) {
-    List(Int) k2 = key[0..32];
-    List(Int) k1 = key[32..64];
+@requires(declassify)
+List(Int) cc_seal(List(Secret(UInt(8))) key, Int seq, List(Int) pkt) {
+    List(Secret(UInt(8))) k2 = key[0..32];
+    List(Secret(UInt(8))) k1 = key[32..64];
     List(Int) n = cc_nonce(seq);
-    List(Int) enc_len = chacha20_xor(k1, 0, n, pkt[0..4]);
-    List(Int) enc_body = chacha20_xor(k2, 1, n, pkt[4..pkt.len()]);
-    List(Int) poly_key = chacha_block(k2, 0, n)[0..32];
+    List(Int) enc_len = pub_sealed(chachag_xor(k1, 0, n, lift(pkt[0..4])));
+    List(Int) enc_body = pub_sealed(chachag_xor(k2, 1, n, lift(pkt[4..pkt.len()])));
+    List(Secret(UInt(8))) poly_key = chachag_block(k2, 0, n)[0..32];
     List(Int) ct = enc_len.concat(enc_body);
-    return ct.concat(poly1305(poly_key, ct));
+    return ct.concat(pub_sealed(poly1305g(poly_key, lift(ct))));
 }
 
 // The packet length from the first four received bytes, decrypted with
 // K_1. It is used before the MAC is checked, only to know how many bytes
 // to wait for, and is bounded by the caller.
-pub Int cc_length(List(Int) key, Int seq, List(Int) first4) {
-    return be32(chacha20_xor(key[32..64], 0, cc_nonce(seq), first4), 0);
+@requires(declassify)
+pub Int cc_length(List(Secret(UInt(8))) key, Int seq, List(Int) first4) {
+    List(Secret(UInt(8))) k1 = key[32..64];
+    return be32(pub_length(chachag_xor(k1, 0, cc_nonce(seq), lift(first4))), 0);
 }
 
 // ============================================================================
@@ -123,6 +168,7 @@ List(Int) inc_be(List(Int) b, Int i) {
 // How many bytes a packet needs after its first 4 (the length field):
 // the packet body plus the tag, or -1 when the length is impossible. The
 // profile's limit is 256 KiB (SPEC 5).
+@requires(declassify)
 pub Int need_after_len(Dir d, List(Int) first4) {
     Int n = if (d.kind == 1) { cc_length(d.key, d.seq, first4) } else { be32(first4, 0) };
     if (n < 5 || n > 262144) { return -1; }
@@ -139,26 +185,27 @@ pub type Opened = { Dir d; Bool ok; List(Int) payload; };
 Opened open_bad(Dir d) { return Opened {.d = d, .ok = false, .payload = []}; }
 
 // `pkt` is one whole packet as received: length field, body, tag.
+@requires(declassify)
 pub Opened open(Dir d, List(Int) pkt) {
     if (pkt.len() < 4) { return open_bad(d); }
     if (d.kind == 0) { return unpad(dir_seq(d, next_seq(d.seq)), pkt[4..pkt.len()]); }
     if (pkt.len() < 4 + 16) { return open_bad(d); }
     if (d.kind == 1) {
-        List(Int) k2 = d.key[0..32];
+        List(Secret(UInt(8))) k2 = d.key[0..32];
         List(Int) n = cc_nonce(d.seq);
         Int tag_at = pkt.len() - 16;
-        List(Int) poly_key = chacha_block(k2, 0, n)[0..32];
-        List(Int) want = poly1305(poly_key, pkt[0..tag_at]);
-        // The MAC is checked before anything is decrypted.
-        if (!ct_eq(want, pkt[tag_at..pkt.len()])) { return open_bad(d); }
-        List(Int) body = chacha20_xor(k2, 1, n, pkt[4..tag_at]);
+        List(Secret(UInt(8))) poly_key = chachag_block(k2, 0, n)[0..32];
+        List(Secret(UInt(8))) want = poly1305g(poly_key, lift(pkt[0..tag_at]));
+        // The MAC is checked (publishing one bit) before anything is decrypted.
+        if (!ct_same(want, lift(pkt[tag_at..pkt.len()]))) { return open_bad(d); }
+        List(Int) body = pub_plain(chachag_xor(k2, 1, n, lift(pkt[4..tag_at])));
         return unpad(dir_seq(d, next_seq(d.seq)), body);
     }
-    Option(List(Int)) pt = aes_gcm_decrypt(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
     Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
     return match pt {
         None => open_bad(d),
-        Some(body) => unpad(nd, body),
+        Some(body) => unpad(nd, pub_plain(body)),
     };
 }
 
@@ -167,15 +214,4 @@ Opened unpad(Dir nd, List(Int) body) {
     Int pad = body[0];
     if (pad < 4 || 1 + pad > body.len()) { return open_bad(nd); }
     return Opened {.d = nd, .ok = true, .payload = body[1..body.len() - pad]};
-}
-
-// Constant-time equality of two tags of the same length.
-pub Bool ct_eq(List(Int) a, List(Int) b) {
-    if (a.len() != b.len()) { return false; }
-    return ct_acc(a, b, 0, 0) == 0;
-}
-
-Int ct_acc(List(Int) a, List(Int) b, Int i, Int acc) {
-    if (i >= a.len()) { return acc; }
-    return ct_acc(a, b, i + 1, acc | (a[i] ^ b[i]));
 }

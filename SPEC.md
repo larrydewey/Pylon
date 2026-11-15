@@ -1,6 +1,6 @@
 # Pylon: A Security-First Remote Terminal
 
-**Draft 1 -- 2026-11-15.**
+**Draft 2 -- 2026-11-15 (hardening revision, see Appendix A).**
 
 ## Abstract
 
@@ -14,11 +14,13 @@ three decisions:
    population, and most of SSH's practical weaknesses (trust on first use,
    algorithm downgrade, Terrapin, agent-forwarding abuse, loose key
    management, keystroke timing) are fixable from the client side.
-2. **Keys never live in Pylon.** Every signature is made by
+2. **Keys live in Symbolon by default.** Every signature is made by
    [Symbolon](https://github.com/larrydewey/symbolon): threshold or
    imported keys, a consent sheet per signature that shows the server the
    session is bound to, revocation and rotation across every host. Pylon
-   holds no private key, ever.
+   can also be used without Symbolon (hardware keys, another agent, or an
+   imported key file), behind an explicit warning of what is lost (7.6);
+   every other protection of this specification applies either way.
 3. **Where both ends are Pylon, Pylon speaks its own protocol.** After an
    SSH login, Pylon pushes a small, signed, hash-verified `pylond` to the
    host over the same SSH connection (no root, no prior install), then
@@ -42,7 +44,7 @@ app.
 4. Architecture
 5. The SSH profile
 6. Host trust
-7. User authentication through Symbolon
+7. User authentication and key custody
 8. Delivering `pylond`
 9. The Pylon protocol
 10. Sessions, screen sync and re-attach
@@ -54,6 +56,7 @@ app.
 16. Implementation requirements
 17. Phases
 18. Open questions
+A. Hardening review (Draft 2)
 
 ## 1. Conventions
 
@@ -98,8 +101,10 @@ the principal; protecting a session from root on the host it runs on.
 
 ## 3. Security goals
 
-- **G1 No private keys in Pylon.** Pylon never sees, stores or derives a
-  user private key (7).
+- **G1 No private keys in Pylon.** With Symbolon (the default), a
+  hardware key or an external agent, Pylon never sees, stores or derives
+  a user private key (7). The one exception is the opt-in imported key
+  file of 7.6 (tier D), which the principal accepts behind a warning.
 - **G2 No unverified host.** No session data and no authentication
   request is sent before the host key is verified under the host trust
   policy (6). There is no click-through "accept new key" path by default.
@@ -118,8 +123,16 @@ the principal; protecting a session from root on the host it runs on.
   Pylon's own UI without the principal's consent (12).
 - **G8 Isolation of the local shell.** The local shell cannot reach SSH
   sessions, the host database or the agent (13).
-- **G9 Revocation is total.** Revoking a device in Symbolon ends its
-  Pylon sessions' ability to re-attach and to authenticate anywhere (10.4).
+- **G9 Revocation is total.** Revoking a device or key in Symbolon ends
+  its Pylon sessions' ability to re-attach and to authenticate anywhere
+  (10.4), without any other device having to be online.
+- **G10 A stolen device acts alone on nothing.** Holding an unlocked
+  device does not by itself let anyone authenticate to a host or re-attach
+  to a session: each needs a fresh signature through the key's custodian
+  (Symbolon's quorum and consent, a key touch, or a biometric) (10.4).
+- **G11 Small pre-authentication surface.** `pylond` handles nothing from
+  an unauthenticated network peer except one MAC check (9.4), and runs
+  confined or not at all (8.4).
 
 ## 4. Architecture
 
@@ -206,9 +219,13 @@ A host key is accepted only through one of:
 4. **First use under quorum.** A key seen for the first time is shown
    with its fingerprint and art; to pin it, the principal either compares
    it with an out-of-band value (paste or QR of `ssh-keygen -lf`), or
-   approves it on a *second* device of their quorum. A network attacker
-   (A1) must then deceive two devices on two paths, or the principal's
-   out-of-band check.
+   approves it on a *second* device of their quorum, which fetches the
+   host key itself over a *different network path* (its cellular link,
+   or Symbolon's relay and witnesses connecting from their own vantage
+   points). Two devices on the same Wi-Fi do not count: one attacker on
+   that network would deceive both. A network attacker (A1) must then
+   deceive several vantage points on independent paths, or the
+   principal's out-of-band check.
 
 Plain trust-on-first-use is available per host only, never globally, and
 is marked on the host.
@@ -230,7 +247,7 @@ type `pylon-host`, synchronized end-to-end encrypted by Symbolon. The
 database holds no secrets but is integrity-critical; it is protected by
 Symbolon's vault MACs, so a malicious sync server cannot add a pin.
 
-## 7. User authentication through Symbolon
+## 7. User authentication and key custody
 
 ### 7.1 Keys
 
@@ -254,7 +271,17 @@ After the key exchange and before user authentication, Pylon:
 The agent's consent sheet shows the user name, the host's fingerprint and
 pinned name, and the key; it refuses a request whose session or host
 differs from the bound one (Symbolon `refused`). A malicious host (A2)
-therefore cannot obtain a signature for another host.
+therefore cannot obtain a signature for another host. The name on the
+sheet comes from the host database Symbolon itself holds (6.3), matched
+by host key, never from a string Pylon passes along, so a compromised
+Pylon cannot relabel a host.
+
+**Consent fatigue.** A prompt on every connection trains the principal
+to approve without reading. Symbolon therefore MAY remember an approval
+for one (host key, user key, user name) triple for a short window
+(default 10 minutes, set per host), never across a change of host key
+and never for hosts marked *sensitive*, which always prompt. Re-attach
+(10.4) and restricted forwarding (5) always prompt.
 
 ### 7.3 Android IPC
 
@@ -282,6 +309,55 @@ When Symbolon is unlocked under its duress profile, the identities it
 lists are the duress subset; Pylon additionally hides hosts marked
 *sensitive* in their entry. Pylon has no duress state of its own.
 
+### 7.6 Without Symbolon
+
+Pylon can be used without Symbolon. Only key custody changes: the SSH
+profile (5), host trust (6), the terminal hardening (12), the delivery
+and confinement of `pylond` (8) and every other requirement apply
+unchanged. Three custodians are supported besides Symbolon, in
+decreasing order of safety:
+
+| Tier | Custodian | What it keeps | What it loses |
+|---|---|---|---|
+| A | Symbolon (default) | everything in this specification | -- |
+| B | Hardware key: a FIDO2 security key (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, user presence required per signature) or a non-exportable Android Keystore key (StrongBox where present, user authentication with a biometric or device credential per use) | the key cannot be copied off the hardware; each signature needs a touch or biometric | quorum, revocation everywhere, synced host trust, duress; losing the device or key loses the credential |
+| C | External agent at `SSH_AUTH_SOCK` (desktop: OpenSSH, KeePassXC, gpg-agent) | whatever that agent provides | as B, and usually per-signature consent; agents without `session-bind@openssh.com` cannot refuse a signature meant for another session (Pylon still uses host-bound authentication, so the signed data names the host) |
+| D | Imported key file: an OpenSSH private key imported into Pylon, immediately wrapped by a non-exportable Keystore key that requires user authentication per use; Pylon never writes the plaintext | encryption at rest and a biometric per use | as C, and the private key exists in Pylon's process memory while signing; a compromise of the app or the device's OS exposes it |
+
+**The warning.** Choosing tier B, C or D for the first time shows a
+full-screen warning that must be acknowledged by an explicit action
+(typing *I understand* or holding a button, not a single tap):
+
+> **You are about to use Pylon without Symbolon.**
+> Your SSH key will live in one place. If this device is lost, stolen or
+> compromised, whoever holds it can log in to every server that trusts
+> this key, and you cannot revoke it everywhere at once. Pylon cannot
+> confirm each login with you or prevent a signature from being reused
+> elsewhere, cannot keep your trusted hosts in sync across your devices,
+> and has no duress protection. Hosts you pin here are pinned on this
+> device only.
+> Pylon's other protections still apply. Only the safety of your key
+> changes.
+
+Tier D adds: *"This key was a file. Copies may exist in backups, other
+machines or old disks: treat it as exposed and plan to replace it."*
+
+After acknowledgement there is no repeated nagging (repeated warnings
+are tuned out): hosts and sessions using a tier B, C or D key carry a
+permanent, quiet badge that opens the explanation, and the key's screen
+offers a one-step move into Symbolon (which imports OpenSSH keys and,
+for tier D, then offers to rotate the key on every host, Symbolon
+26.3).
+
+**Host trust without Symbolon.** Without a quorum there is no
+second-device approval (6.1.4): a key is pinned from an out-of-band
+fingerprint, a host certificate or SSHFP with DNSSEC. Without Symbolon's
+vault the host database is local to the device, protected by a
+Keystore-held MAC key.
+
+**Policy.** An organization's Symbolon policy can forbid tiers B-D for
+its hosts, or allow only tier B.
+
 ## 8. Delivering `pylond`
 
 ### 8.1 Goal
@@ -301,6 +377,23 @@ quorum of maintainers' devices (A5 must compromise several).
 
 The app ships the `pylond` binaries of its own release and verifies their
 provenance at build time and again at first use on the device.
+
+Provenance alone does not stop a quorum that is coerced or colludes. A
+release is accepted by clients only when, in addition, it is:
+
+- **Reproducible.** The build is reproducible from the tagged source
+  with the pinned Resid toolchain, and at least one builder independent
+  of the signers has published the same hash.
+- **Logged.** The release hash and its signatures appear in a public,
+  append-only transparency log (a Merkle log with signed tree heads;
+  clients check an inclusion proof and gossip tree heads through
+  Symbolon's sync). A malicious release cannot be shown to one victim
+  without being visible to everyone.
+- **Monotonic.** Clients never push a `pylond` older than one they have
+  pushed before or than the app's own release, and the app refuses to be
+  downgraded (Android APK signature scheme v3 with key rotation; version
+  codes only increase). A revoked release (listed in the log) is
+  replaced on the next connection.
 
 ### 8.3 Procedure
 
@@ -329,9 +422,16 @@ and ends the host's sessions.
 
 `pylond` runs as the principal, never as root. It declares only the Resid
 capabilities it needs (`network`, `terminal`, `process` for the PTY
-child, `filesystem` scoped to file transfers) and, where the kernel
-allows, applies Landlock (no filesystem access outside `$HOME` and the
-cache) and a seccomp filter before accepting packets.
+child, `filesystem` scoped to file transfers). Before it opens its UDP
+socket it applies a seccomp filter (the system calls of its event loop,
+PTY and transfer paths only) and Landlock (no filesystem access outside
+`$HOME` and its cache). The PTY's shell is a separate process outside
+this confinement, as the principal expects of a login shell.
+
+Confinement is not best-effort: on a kernel without Landlock or seccomp
+filters, `pylond` refuses to listen and Pylon stays on SSH for that host
+(with a note on the host saying why), unless the host entry explicitly
+allows an unconfined `pylond`.
 
 ## 9. The Pylon protocol
 
@@ -373,10 +473,19 @@ the client's identity and proves knowledge of `psk`.
 type(1) | receiver_index(4) | counter(8) | ChaCha20-Poly1305(payload)
 ```
 
-- **Silence.** A packet that does not authenticate is dropped with no
-  reply. Handshake initiations carry a MAC over the server's static key
-  (WireGuard `mac1`), so a scanner that does not know the key gets
-  nothing; under load the server answers with a cookie (`mac2`).
+- **Silence and a minimal pre-authentication surface.** Every packet
+  from a peer that has not completed a handshake must first pass a MAC
+  keyed by a value only bootstrapped clients know (`mac1`, keyed by a
+  hash of the server's static key and the bootstrap PSK, both delivered
+  only inside SSH); anything else is dropped with no reply and no state.
+  That one constant-time MAC check over a fixed-size packet is the whole
+  code path an unauthenticated network peer can reach (G11); the Noise
+  handshake, ML-KEM decapsulation and everything after run only for
+  packets that passed it. Under load the server answers with a cookie
+  (`mac2`) and does no asymmetric work.
+- **Binding.** `pylond` binds only the address it reported in the
+  bootstrap (by default the address the SSH connection arrived on), not
+  the wildcard address.
 - **Replay.** A 2048-packet sliding window per receive key.
 - **Roaming.** The server sends to the address of the most recent
   authenticated packet, so a phone moving from Wi-Fi to cellular
@@ -427,15 +536,32 @@ short grace period (default 60 s).
 
 ### 10.4 Re-attach
 
-To attach to a session from a device (the same one after its ticket
-expired, or another of the principal's devices), Pylon runs the SSH
-bootstrap again (5-8): it is a fresh, host-verified, Symbolon-signed
-login, and `session_list` in 9.2 offers the sessions to resume. A
-revoked device cannot sign (Symbolon), so it cannot re-attach (G9);
-tickets already held by a revoked device are invalidated at its next
-contact because Symbolon's revocation also instructs every live Pylon
-on the principal's other devices to send `pylond` a `revoke(c_static)`
-control message.
+A session ticket (9.2) lets a device *continue* a live connection:
+roaming, rekeying and short gaps (default up to 15 minutes without an
+authenticated packet) need nothing more. It does not let a device
+*resume* one. Re-attaching after a longer gap, after the app was closed,
+or from another device requires a **fresh user signature**:
+
+1. The client sends `attach(session, c_static, nonce_c)` over the Pylon
+   handshake, or runs the SSH bootstrap again (5-8) when it has no valid
+   ticket.
+2. `pylond` answers with a challenge binding its static key, the
+   session, the client's static key and a fresh nonce.
+3. The client has the challenge signed by the principal's key through its
+   custodian (Symbolon's consent sheet, which always prompts for an
+   attach; or a key touch or biometric in tiers B-D) as an `SSHSIG`
+   with namespace `attach@pylon`.
+4. `pylond` verifies the signature against the principal's own
+   `~/.ssh/authorized_keys` (and user CA, if configured), read at that
+   moment.
+
+So an unlocked stolen phone cannot resume a session without the key's
+custodian (G10), and revoking a key (Symbolon removes it from
+`authorized_keys` on the hosts it manages, Symbolon 26.3) or a device
+(its share can no longer sign) cuts off re-attach on every host at
+once, with no other device needing to be online to tell `pylond` (G9).
+Tickets are stored wrapped by the platform keystore with user
+authentication required, and expire after 12 hours regardless.
 
 ## 11. Streams: forwards and files
 
@@ -444,6 +570,18 @@ control message.
   is on Pylon, surviving roaming. Remote forwards bind loopback only
   unless the host entry says otherwise. Each forward is listed on the
   session screen with its byte counters.
+- **Local forwards on a shared loopback.** On Android, `127.0.0.1` is
+  shared by every app on the device (A4): a local forward to a database
+  or admin panel is open to all of them. Pylon therefore:
+  - offers forwards consumed inside Pylon (its own browser view and its
+    file and SSH clients) without opening a socket at all;
+  - for a forward other apps must use, accepts a connection only from the
+    app the principal picked when creating it (the connecting UID is
+    checked per connection with `ConnectivityManager.getConnectionOwnerUid`,
+    Android 10+), and otherwise shows a warning naming the risk before
+    the forward opens;
+  - closes forwards when the session goes to the background, unless the
+    principal pinned them open.
 - **Files.** SFTP v3 over SSH, and on Pylon a resumable transfer stream
   with per-chunk BLAKE2s hashes so an interrupted transfer continues
   where it stopped. Remote file names are displayed escaped (no control
@@ -453,7 +591,15 @@ control message.
 ## 12. The terminal emulator
 
 A VT/xterm-compatible emulator in Resid, shared by the app and `pylond`.
-Hostile output (A2) is assumed:
+Hostile output (A2) is assumed, and since the emulator is the largest
+parser of attacker-controlled bytes in the client, it is **isolated**:
+on Android it runs in an `isolatedProcess` service (no network, no
+storage, no binder access to Symbolon) that receives channel bytes and
+returns screen cells; the process that holds connections and the
+Symbolon binding never parses host output. On desktop the same split
+uses a separate process under seccomp. A bug in the emulator then
+yields a process that can draw one terminal and nothing else. Within
+the emulator:
 
 - **Clipboard** (OSC 52): writes require a per-host grant; reads are not
   implemented.
@@ -499,6 +645,18 @@ content.
   keyboard support; `FLAG_SECURE` on the terminal (configurable);
   network change listener that nudges the Pylon protocol to re-send from
   the new address.
+- **Keyboards.** Third-party input methods see every keystroke,
+  including passwords typed at a `sudo` prompt. The terminal requests
+  no personalized learning and no suggestions from the input method,
+  warns once when the active input method is not a system one, and
+  offers Pylon's own in-app keyboard, switched to automatically when the
+  screen shows a password prompt (echo off on the PTY, reported by
+  `pylond`; or a recognised prompt over plain SSH).
+- **Clipboard.** Copies from the terminal are marked sensitive
+  (`ClipDescription.EXTRA_IS_SENSITIVE`, Android 13+), are kept out of
+  cross-device clipboard sync, and are cleared after 60 seconds.
+- **Screenshots and recents.** `FLAG_SECURE` keeps terminal content out
+  of screenshots, screen recording and the recents thumbnail by default.
 - **Linux desktop (phase 2).** Tabs and splits; `SSH_AUTH_SOCK` to
   `symbolon ssh-agent`; `pylon` CLI.
 - **Windows, macOS, iOS (phase 3+).** Requires Symbolon on those
@@ -513,6 +671,13 @@ content.
   in CI against OpenSSH (several versions) and Dropbear, with algorithm
   restrictions on both sides, and against fault injection (truncated,
   reordered and Terrapin-style manipulated handshakes).
+- **Formal analysis before use.** The Pylon bootstrap (9.2), handshake
+  (9.3), re-attach (10.4) and the binding of session-bind to host-bound
+  authentication (7.2) are modelled in Tamarin or ProVerif, with goals
+  G2, G3, G5, G9 and G10 as lemmas, before phase 2 ships; the models
+  live in `models/` and run in CI.
+- **External review.** The Pylon protocol and `pylond` get an
+  independent security review before they are enabled by default.
 - The Resid standard library needs: ML-KEM-768 (FIPS 203), BLAKE2s,
   and a non-blocking standard-input read for the CLI.
 
@@ -522,7 +687,8 @@ content.
 |---|---|
 | 0 | SSH transport core in Resid: profile of 5 (key exchange `curve25519-sha256` only until Resid has ML-KEM), host verification against pinned keys, agent authentication with session binding, exec and shell channels; `pylon` CLI; interop tests against OpenSSH. *Done except interactive shells and `Secret(T)` keying material.* |
 | 1 | Android app: host list, terminal emulator, Symbolon IPC, host trust of 6 with sync, SFTP, forwards, ProxyJump. |
-| 2 | `pylond`: delivery (8), Pylon protocol (9), persistent sessions, screen sync and scrollback (10), Pylon streams (11). Linux desktop app. |
+| 1b | Without Symbolon (7.6): hardware keys, external agents, imported key files, with the warning. |
+| 2 | `pylond`: delivery (8) with reproducible, logged releases; Pylon protocol (9); persistent sessions with signed re-attach, screen sync and scrollback (10); Pylon streams (11); formal models and external review. Linux desktop app. |
 | 3 | Restricted agent forwarding, SSHFP/DNSSEC resolver, host and user certificates, organization policy. |
 | 4 | Local shell (13). Windows, macOS, iOS. |
 | 5 | Direct Pylon authentication without SSH on hosts that run `pylond`: Symbolon-signed handshakes and optional host attestation (SEV-SNP, TDX, TPM via Resid's `lib/verify/`). |
@@ -536,3 +702,52 @@ content.
    protocol, or fall back to SSH.
 3. Whether the second-device first-use approval (6.1.4) should go
    through Symbolon's quorum channel or a direct device-to-device QR.
+
+## Appendix A. Hardening review (Draft 2)
+
+A review of Draft 1 against its own threat model. Each finding names the
+adversary, what Draft 1 allowed, and the change.
+
+| # | Adversary | Finding in Draft 1 | Change |
+|---|---|---|---|
+| H1 | A3 | A session ticket alone let a device resume a session, so an unlocked stolen phone could re-attach to a live shell without any signature; revocation depended on another of the principal's devices being online to tell `pylond`. | Tickets continue connections, never resume them; re-attach needs a fresh signature verified by `pylond` against `authorized_keys`; 12-hour ticket lifetime; G10 (10.4). |
+| H2 | A1 | `pylond` is a new network listener running as the principal; a pre-authentication bug would be remote code execution without SSH. | Pre-authentication surface reduced to one MAC check keyed by bootstrap-only values; bind the reported address only; confinement mandatory or no `pylond`; G11 (8.4, 9.4). |
+| H3 | A2 | The terminal emulator parsed hostile output in the process that holds the Symbolon binding. | Emulator in an isolated process with no network, storage or binder access (12). |
+| H4 | A4 | Local forwards on Android bind the loopback shared by every app. | In-app consumption without sockets; per-connection UID check; warning; close in background (11). |
+| H5 | A4 | Third-party keyboards see passwords typed into the terminal; the clipboard leaks to other apps and devices. | Input-method flags, in-app keyboard for password prompts, sensitive and expiring clipboard (15). |
+| H6 | A1 | Second-device first-use approval could be satisfied by two devices on the same Wi-Fi. | The second check must use an independent network path (6.1.4). |
+| H7 | A5 | A coerced or colluding release quorum could still ship a malicious `pylond`, possibly to one victim only. | Reproducible builds, a public transparency log with inclusion proofs, rollback protection (8.2). |
+| H8 | -- | Consent on every connection leads to blind approval; the host name on the sheet came from Pylon. | Short approval window per (host, key, user), never for sensitive hosts or attach; names from Symbolon's own host database (7.2). |
+| H9 | -- | The Pylon protocol had no proof obligation. | Tamarin/ProVerif models of bootstrap, handshake and attach before phase 2; external review before default-on (16). |
+| H10 | -- | Pylon required Symbolon; people who will not run it would keep using weaker clients. | Tiers B-D behind an explicit, acknowledged warning; only key custody changes (7.6). |
+
+Implementation findings in the phase-0 code, fixed with this revision:
+
+- **I1** The socket read deadline was absolute, so a consent sheet held
+  open past 30 seconds failed the login. The deadline is now re-armed
+  after the agent signs.
+- **I2** A server exceeding the channel window or maximum packet size,
+  or sending data for a channel that is not open, was not treated as a
+  protocol error. It now ends the session.
+- **I3** Keying material was handled as public integers. The ephemeral
+  X25519 key, the shared secret K, every derived key and all cipher
+  state are now `Secret(UInt(8))`, computed with Resid's secret-typed
+  X25519, SHA-256, ChaCha20, Poly1305 and AES-GCM, and leave the secret
+  domain only at five named publication functions (sealed bytes, frame
+  lengths, verified plaintext, H, the GCM IV field), each marked
+  `@robust_exempt` with its reason so `residc verify` lists them.
+- **I4** Encoding K as an mpint branches on its leading bytes in common
+  implementations (OpenSSH's included), a timing signal of the kind the
+  Raccoon attack exploited in TLS. Pylon hashes all 64 possible
+  encodings and selects the results with masks, so nothing branches on,
+  indexes by or publishes any part of K (known-answer tests in
+  `tests/kex_test.resid` cover every shape). *Open:* Resid's key-entropy
+  analysis (E0270, a warning during its rollout) does not yet follow a
+  masked selection between values that both depend on a secret, and so
+  reports the cipher keys as unpredictable-byte-free; a Resid change
+  that treats `a ^ ((a ^ c) & m)` (or `ct_select` over byte lists) as a
+  selection is needed to clear it.
+- **I5** The parsers had no fuzz targets. `tests/fuzz_proxy.py` mutates a
+  real sshd's byte stream (bit flips, deletions, insertions, in the
+  cleartext handshake and in encrypted traffic) and requires every run to
+  end in a clean refusal or the exact expected output.

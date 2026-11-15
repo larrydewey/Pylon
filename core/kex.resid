@@ -6,7 +6,10 @@
 // when the Resid standard library has ML-KEM.
 
 import "crypto.resid";
-import "x25519.resid";
+import "word.resid";
+import "random.resid";
+import "x25519g.resid";
+import "sha256g.resid";
 import "wire.resid";
 import "hostkey.resid";
 import "cipher.resid";
@@ -98,11 +101,14 @@ pub Chosen choose(Peer s, List(Str) host_algs, Bool first) {
 // curve25519-sha256 (RFC 8731)
 // ============================================================================
 
-pub type Ecdh = { List(Int) priv; List(Int) pub; };
+// The ephemeral private key is secret bytes from the OS generator; its
+// public key is published through x25519g_public's own declassify.
+pub type Ecdh = { List(Secret(UInt(8))) priv; List(Int) pub; };
 
+@requires(declassify)
 pub Ecdh ecdh_new() {
-    List(Int) priv = random_bytes(32);
-    return Ecdh {.priv = priv, .pub = x25519_public(priv)};
+    List(Secret(UInt(8))) priv = random_secret(32);
+    return Ecdh {.priv = priv, .pub = x25519g_public(priv)};
 }
 
 pub List(Int) ecdh_init_payload(Ecdh e) { return [msg_kex_ecdh_init()].concat(sstring(e.pub)); }
@@ -118,49 +124,171 @@ pub Reply parse_ecdh_reply(List(Int) p) {
     return Reply {.ok = ok, .host_blob = ks.v, .q_s = qs.v, .sig = sig.v};
 }
 
-pub type Exchanged = { Str err; List(Int) k; List(Int) h; PubKey host; };
+// What a key exchange produces: the exchange hash H (public: it is the
+// session identifier, signed by the host and given to the agent), the
+// GCM IV fields (public, RFC 5647 7.1) and the two cipher keys (secret).
+pub type Material = { List(Int) h; List(Int) iv_c; List(Int) iv_s; List(Secret(UInt(8))) key_c; List(Secret(UInt(8))) key_s; };
 
-// The shared secret K (as the mpint encoding used in hashing) and the
-// exchange hash H, after checking the host's signature over H.
-pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg) {
+pub type Exchanged = { Str err; Material m; PubKey host; };
+
+List(Secret(UInt(8))) no_secret() { ListBuf(Secret(UInt(8))) b = ListBuf(); return b.finish(); }
+
+Material no_material() { return Material {.h = [], .iv_c = [], .iv_s = [], .key_c = no_secret(), .key_s = no_secret()}; }
+
+// ----------------------------------------------------------------------------
+// K without a leak
+// ----------------------------------------------------------------------------
+//
+// K enters every hash as an mpint (RFC 8731, RFC 4251 5): leading zero
+// bytes stripped, and a zero byte prepended when the top bit is set. The
+// length of that encoding depends on K, and the usual implementation
+// (OpenSSH's included) branches on K's leading bytes to build it: the
+// kind of timing difference the Raccoon attack used against TLS. Here
+// every possible encoding is hashed and the right results are selected
+// with masks, so nothing in the exchange branches on K, indexes by it or
+// publishes any part of it. A shape is (z, pad): z leading zero bytes
+// stripped, pad whether a zero byte is prepended; K = 0 cannot occur
+// (x25519g_shared refuses it), so z < 32.
+
+// 0xFF when b is non-zero, else 0x00, with public shifts only.
+Secret(UInt(8)) nz_mask(Secret(UInt(8)) b) {
+    Secret(UInt(8)) x4 = b | (b >> wrapping_u8(4));
+    Secret(UInt(8)) x2 = x4 | (x4 >> wrapping_u8(2));
+    Secret(UInt(8)) x1 = (x2 | (x2 >> wrapping_u8(1))) & wrapping_u8(1);
+    return spread(x1);
+}
+
+// Bit 0 of x copied to all eight bits.
+Secret(UInt(8)) spread(Secret(UInt(8)) x1) {
+    Secret(UInt(8)) y2 = x1 | (x1 << wrapping_u8(1));
+    Secret(UInt(8)) y4 = y2 | (y2 << wrapping_u8(2));
+    return y4 | (y4 << wrapping_u8(4));
+}
+
+// 0xFF when K has exactly the shape (z, pad).
+Secret(UInt(8)) shape_mask(List(Secret(UInt(8))) k, Int z, Bool pad) {
+    Secret(UInt(8)) lead = zeros_mask(k, 0, z, classify(wrapping_u8(255)));
+    Secret(UInt(8)) top = spread(k[z] >> wrapping_u8(7));
+    Secret(UInt(8)) want_top = if (pad) { top } else { top ^ wrapping_u8(255) };
+    return lead & nz_mask(k[z]) & want_top;
+}
+
+Secret(UInt(8)) zeros_mask(List(Secret(UInt(8))) k, Int i, Int z, Secret(UInt(8)) acc) {
+    if (i >= z) { return acc; }
+    return zeros_mask(k, i + 1, z, acc & (nz_mask(k[i]) ^ wrapping_u8(255)));
+}
+
+// The mpint encoding of K under the shape (z, pad).
+List(Secret(UInt(8))) encode_as(List(Secret(UInt(8))) k, Int z, Bool pad) {
+    Int n = 32 - z + if (pad) { 1 } else { 0 };
+    List(Int) head = if (pad) { u32_be(n).concat([0]) } else { u32_be(n) };
+    return lift(head).concat(k[z..32]);
+}
+
+// acc where mask is 0x00, cand where it is 0xFF, byte by byte.
+List(Secret(UInt(8))) pick(List(Secret(UInt(8))) acc, List(Secret(UInt(8))) cand, Secret(UInt(8)) mask) {
+    return pick_acc(acc, cand, mask, 0, ListBuf());
+}
+
+List(Secret(UInt(8))) pick_acc(List(Secret(UInt(8))) a, List(Secret(UInt(8))) c, Secret(UInt(8)) m, Int i, ListBuf(Secret(UInt(8))) out) {
+    if (i >= a.len()) { return out.finish(); }
+    return pick_acc(a, c, m, i + 1, out.push(a[i] ^ ((a[i] ^ c[i]) & m)));
+}
+
+// Everything derived from K under one shape: H, then the four outputs of
+// RFC 4253 7.2. On the first exchange the session identifier is H itself.
+pub type Derived = { List(Secret(UInt(8))) h; List(Secret(UInt(8))) iv_c; List(Secret(UInt(8))) iv_s; List(Secret(UInt(8))) key_c; List(Secret(UInt(8))) key_s; };
+
+Derived derive_shape(List(Secret(UInt(8))) kenc, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks) {
+    List(Secret(UInt(8))) h = sha256g(lift(hin).concat(kenc));
+    List(Secret(UInt(8))) sid = if (old_sid.len() > 0) { lift(old_sid) } else { h };
+    return Derived {
+        .h = h,
+        .iv_c = derive(kenc, h, 65, sid, ivc), .iv_s = derive(kenc, h, 66, sid, ivs),
+        .key_c = derive(kenc, h, 67, sid, kc), .key_s = derive(kenc, h, 68, sid, ks),
+    };
+}
+
+Derived pick_derived(Derived a, Derived c, Secret(UInt(8)) m) {
+    return Derived {.h = pick(a.h, c.h, m), .iv_c = pick(a.iv_c, c.iv_c, m), .iv_s = pick(a.iv_s, c.iv_s, m),
+        .key_c = pick(a.key_c, c.key_c, m), .key_s = pick(a.key_s, c.key_s, m)};
+}
+
+// Shapes (z, pad) for z from `z` to 31, both pads, folded into acc.
+Derived all_shapes(List(Secret(UInt(8))) k, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks, Int z, Derived acc) {
+    if (z >= 32) { return acc; }
+    Derived d0 = derive_shape(encode_as(k, z, false), hin, old_sid, ivc, ivs, kc, ks);
+    Derived d1 = derive_shape(encode_as(k, z, true), hin, old_sid, ivc, ivs, kc, ks);
+    Derived a1 = pick_derived(acc, d0, shape_mask(k, z, false));
+    Derived a2 = pick_derived(a1, d1, shape_mask(k, z, true));
+    return all_shapes(k, hin, old_sid, ivc, ivs, kc, ks, z + 1, a2);
+}
+
+// Everything derived from the 32-byte shared secret, selected in constant
+// time across all shapes of its mpint encoding.
+pub Derived derive_all(List(Secret(UInt(8))) shared, List(Int) hin, List(Int) old_sid, Int ivc, Int ivs, Int kc, Int ks) {
+    // Start from shape (0, false) and let every shape, that one included,
+    // be picked by its mask: exactly one mask is 0xFF.
+    Derived start = derive_shape(encode_as(shared, 0, false), hin, old_sid, ivc, ivs, kc, ks);
+    return all_shapes(shared, hin, old_sid, ivc, ivs, kc, ks, 0, start);
+}
+
+@robust_exempt(reason = "the key exchange runs when the server replies; H is the public session identifier and the GCM IV field is not secret")
+@requires(declassify)
+List(Int) pub_hash(List(Secret(UInt(8))) h) { return ints_of(declassify(secret_join(h), "exchange hash H: the session identifier, signed by the host and given to the agent")); }
+
+@robust_exempt(reason = "the key exchange runs when the server replies; H is the public session identifier and the GCM IV field is not secret")
+@requires(declassify)
+List(Int) pub_iv(List(Secret(UInt(8))) iv) { return ints_of(declassify(secret_join(iv), "AES-GCM fixed IV field, not secret (RFC 5647 7.1)")); }
+
+// K, H and the keys, after checking the host's signature over H.
+// `old_sid` is empty on the first exchange and the session identifier on
+// a rekey; c2s and s2c are the negotiated ciphers.
+@requires(declassify)
+pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg, Str c2s, Str s2c, List(Int) old_sid) {
     Option(PubKey) ok = key_of_blob(r.host_blob);
     PubKey host = ok else { no_key() };
-    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .k = [], .h = [], .host = host}; }
-    List(Int) shared = x25519_shared(e.priv, r.q_s);
-    // An all-zero shared secret means a low-order point (RFC 7748 6.1).
-    if (shared.len() != 32 || shared.sum() == 0) { return Exchanged {.err = "the server's key share is invalid", .k = [], .h = [], .host = host}; }
-    List(Int) k = mpint(shared);
+    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
+    // Empty when the result is all zeros: a low-order point (RFC 7748 6.1).
+    List(Secret(UInt(8))) shared = x25519g_shared(e.priv, r.q_s);
+    if (shared.len() != 32) { return Exchanged {.err = "the server's key share is invalid", .m = no_material(), .host = host}; }
     List(Int) hin = sstr(v_c).concat(sstr(v_s)).concat(sstring(i_c)).concat(sstring(i_s))
-        .concat(sstring(r.host_blob)).concat(sstring(e.pub)).concat(sstring(r.q_s)).concat(k);
-    List(Int) h = sha256_bytes(hin);
-    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .k = [], .h = [], .host = host}; }
-    return Exchanged {.err = "", .k = k, .h = h, .host = host};
+        .concat(sstring(r.host_blob)).concat(sstring(e.pub)).concat(sstring(r.q_s));
+    Int ivc = cipher_iv_len(c2s);
+    Int ivs = cipher_iv_len(s2c);
+    Int kc = cipher_key_len(c2s);
+    Int ks = cipher_key_len(s2c);
+    Derived d = derive_all(shared, hin, old_sid, ivc, ivs, kc, ks);
+    List(Int) h = pub_hash(d.h);
+    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
+    Material m = Material {.h = h, .iv_c = pub_iv(d.iv_c), .iv_s = pub_iv(d.iv_s), .key_c = d.key_c, .key_s = d.key_s};
+    return Exchanged {.err = "", .m = m, .host = host};
 }
 
 // ============================================================================
 // Key derivation (RFC 4253 7.2)
 // ============================================================================
 
-pub List(Int) derive(List(Int) k, List(Int) h, Int letter, List(Int) session_id, Int need) {
-    List(Int) k1 = sha256_bytes(k.concat(h).concat([letter]).concat(session_id));
+// HASH(K || H || X || session_id), extended by HASH(K || H || K1 || ...)
+// to `need` bytes. K is the mpint encoding; H and the session identifier
+// are secret-typed here because they are computed per shape.
+List(Secret(UInt(8))) derive(List(Secret(UInt(8))) k, List(Secret(UInt(8))) h, Int letter, List(Secret(UInt(8))) sid, Int need) {
+    if (need == 0) { return no_secret(); }
+    List(Secret(UInt(8))) k1 = sha256g(k.concat(h).concat(lift([letter])).concat(sid));
     return extend(k, h, k1, need);
 }
 
-List(Int) extend(List(Int) k, List(Int) h, List(Int) acc, Int need) {
+List(Secret(UInt(8))) extend(List(Secret(UInt(8))) k, List(Secret(UInt(8))) h, List(Secret(UInt(8))) acc, Int need) {
     if (acc.len() >= need) { return acc[0..need]; }
-    return extend(k, h, acc.concat(sha256_bytes(k.concat(h).concat(acc))), need);
+    return extend(k, h, acc.concat(sha256g(k.concat(h).concat(acc))), need);
 }
 
 pub type Keys = { Dir tx; Dir rx; };
 
 // The new directions after NEWKEYS. With strict kex the sequence numbers
 // start again at 0; otherwise they continue.
-pub Keys new_keys(Chosen c, Bool strict, List(Int) k, List(Int) h, List(Int) sid, Int tx_seq, Int rx_seq) {
-    List(Int) iv_c = derive(k, h, 65, sid, cipher_iv_len(c.c2s));
-    List(Int) iv_s = derive(k, h, 66, sid, cipher_iv_len(c.s2c));
-    List(Int) key_c = derive(k, h, 67, sid, cipher_key_len(c.c2s));
-    List(Int) key_s = derive(k, h, 68, sid, cipher_key_len(c.s2c));
+pub Keys new_keys(Chosen c, Bool strict, Material m, Int tx_seq, Int rx_seq) {
     Int ts = if (strict) { 0 } else { tx_seq };
     Int rs = if (strict) { 0 } else { rx_seq };
-    return Keys {.tx = dir_new(c.c2s, key_c, iv_c, ts), .rx = dir_new(c.s2c, key_s, iv_s, rs)};
+    return Keys {.tx = dir_new(c.c2s, m.key_c, m.iv_c, ts), .rx = dir_new(c.s2c, m.key_s, m.iv_s, rs)};
 }
