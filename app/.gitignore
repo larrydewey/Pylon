@@ -50,3 +50,5 @@ app.*.map.json
 # The Resid core, built by tools/android-core.sh
 /android/app/src/main/jniLibs/
 /assets/pylond/pylond-*
+/assets/pylond/pylond.release
+/assets/pylond/pylond.proof

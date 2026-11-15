@@ -1,0 +1,263 @@
+// pylon-release: making a signed, logged pylond release (SPEC 8.2).
+//
+//   residc tools/release/release.resid -o build/pylon-release
+//
+//   pylon-release keygen NAME
+//       A new Ed25519 key: NAME.key (the 32-byte seed in hex, owner-only)
+//       and NAME.pub (the public key in hex). Run it on the device that
+//       keeps the key; the .key file never goes anywhere else.
+//   pylon-release roots OUT K REL.pub... --log K LOG.pub...
+//       The roots file a client pins (core/release_roots.resid): K of the
+//       release keys, K of the log keys.
+//   pylon-release code-hash FILE
+//       SHA-256 of FILE's code image (without the Resid provenance
+//       trailer): what independent builders compare.
+//   pylon-release manifest VERSION COUNTER DIR OUT
+//       The manifest of DIR/pylond-aarch64 and DIR/pylond-x86_64 (those
+//       present), unsigned, to OUT.
+//   pylon-release sign FILE NAME.key
+//       Append NAME's signature to FILE: a manifest (pylond.release) or a
+//       tree head (LOG/head). Each maintainer signs on their own device.
+//   pylon-release log-append LOG RELEASE
+//       Append the signed RELEASE to the log in directory LOG
+//       (LOG/entries/NNNNNN.release) and write the new, unsigned tree head
+//       to LOG/head, for the log keys to sign.
+//   pylon-release proof LOG RELEASE OUT
+//       RELEASE's proof under LOG's signed head, with consistency proofs
+//       from every smaller size: the pylond.proof shipped beside it.
+//   pylon-release verify ROOTS DIR [PROOF]
+//       Check DIR as a client would (fresh state): every build, its code
+//       image hash, the quorum, the log.
+
+import "crypto.resid";
+import "random.resid";
+import "word.resid";
+import "ed25519g.resid";
+import "../../core/wire.resid";
+import "../../core/merkle.resid";
+import "../../core/release.resid";
+
+@requires(declassify)
+List(Int) widen(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return widen(b, i + 1, acc.push((Int) b[i]));
+}
+
+// A seed read from a .key file, held as secret bytes ([] when malformed).
+@requires(filesystem(readonly))
+List(Secret(UInt(8))) read_seed(Str path) {
+    if (!filesystem.exists(path)) { return []; }
+    List(Int) s = hexn(str_trim(filesystem.read_all(path)), 32);
+    return if (s.len() == 32) { secret_bytes(s) } else { [] };
+}
+
+@requires(filesystem, declassify)
+Int keygen(Str name) {
+    if (filesystem.exists(name + ".key")) { eprintln("pylon-release: " + name + ".key exists; not replaced"); return 1; }
+    List(Secret(UInt(8))) seed = random_secret(32);
+    Str pubk = hex_encode(ed25519g_pub(seed));
+    List(UInt(8)) keep = declassify(secret_join(seed), "persist the release key (owner-only file)");
+    Bool w1 = filesystem.write_secret(name + ".key", bytes_of(hex_encode(widen(keep, 0, ListBuf())) + "\n"));
+    Bool w2 = filesystem.write_all(name + ".pub", pubk + "\n");
+    if (!w1 || !w2) { eprintln("pylon-release: cannot write " + name + ".key / .pub"); return 1; }
+    println(name + ".pub " + pubk + " (key id " + key_id(hexn(pubk, 32)) + ")");
+    return 0;
+}
+
+// Public keys from .pub files (or hex given directly).
+@requires(filesystem(readonly))
+List(List(Int)) pubs_of(List(Str) ps, Int i, List(List(Int)) acc) {
+    if (i >= ps.len()) { return acc; }
+    Str t = if (filesystem.exists(ps[i])) { str_trim(filesystem.read_all(ps[i])) } else { ps[i] };
+    List(Int) k = hexn(t, 32);
+    if (k.len() != 32) { return []; }
+    return pubs_of(ps, i + 1, acc.concat([k]));
+}
+
+@requires(args, filesystem)
+Int roots(List(Str) a) {
+    // OUT K REL... --log K LOG...
+    Int sep = index_of(a, "--log", 0);
+    if (a.len() < 6 || sep < 3 || sep + 2 >= a.len()) { return usage(); }
+    List(List(Int)) rel = pubs_of(a[2..sep], 0, []);
+    List(List(Int)) lg = pubs_of(a[(sep + 2)..a.len()], 0, []);
+    Str t = roots_text(rel, dec(a[1]), lg, dec(a[sep + 1]));
+    Roots r = parse_roots(t);
+    if (rel.len() != sep - 2 || lg.len() != a.len() - sep - 2 || str_len(r.err) > 0) { eprintln("pylon-release: bad keys or thresholds (K of n, 1 <= K <= n, every key distinct)"); return 1; }
+    if (!filesystem.write_all(a[0], t)) { eprintln("pylon-release: cannot write " + a[0]); return 1; }
+    println(a[0] + ": " + f"{r.rel_k}" + " of " + f"{r.rel.len()}" + " release keys, " + f"{r.log_k}" + " of " + f"{r.log.len()}" + " log keys");
+    return 0;
+}
+
+Int index_of(List(Str) a, Str s, Int i) {
+    if (i >= a.len()) { return -1; }
+    return if (a[i] == s) { i } else { index_of(a, s, i + 1) };
+}
+
+@requires(filesystem(readonly))
+Str code_hash(Str f) { return hex_encode(sha256_bytes(code_image(filesystem.read_bytes(f)))); }
+
+@requires(filesystem)
+Int manifest(Str version, Str counter, Str dir, Str out) {
+    List(Build) bs = builds_in(dir, ["aarch64", "x86_64"], 0, []);
+    if (bs.len() == 0) { eprintln("pylon-release: no pylond-aarch64 or pylond-x86_64 in " + dir); return 1; }
+    Str body = manifest_body(version, dec(counter), bs);
+    if (str_len(parse_manifest(lines_of(body).ls).err) > 0) { eprintln("pylon-release: bad version or counter (a counter is a whole number above the last release's)"); return 1; }
+    if (filesystem.exists(out)) { eprintln("pylon-release: " + out + " exists; not replaced"); return 1; }
+    if (!filesystem.write_all(out, body)) { eprintln("pylon-release: cannot write " + out); return 1; }
+    print(body);
+    return 0;
+}
+
+@requires(filesystem(readonly))
+List(Build) builds_in(Str dir, List(Str) archs, Int i, List(Build) acc) {
+    if (i >= archs.len()) { return acc; }
+    Str f = dir + "/pylond-" + archs[i];
+    if (!filesystem.exists(f)) { return builds_in(dir, archs, i + 1, acc); }
+    List(Int) bin = filesystem.read_bytes(f);
+    Build b = Build {.arch = archs[i], .file = hex_encode(sha256_bytes(bin)), .code = hex_encode(sha256_bytes(code_image(bin)))};
+    return builds_in(dir, archs, i + 1, acc.concat([b]));
+}
+
+@requires(filesystem, declassify)
+Int sign(Str file, Str keyf) {
+    List(Secret(UInt(8))) seed = read_seed(keyf);
+    if (seed.len() != 32) { eprintln("pylon-release: " + keyf + " is not a key file (32-byte hex seed)"); return 1; }
+    if (!filesystem.exists(file)) { eprintln("pylon-release: no " + file); return 1; }
+    Str t = filesystem.read_all(file);
+    Signed s = split_signed(t);
+    Bool kind = s.ok && s.body.len() > 0 && (s.body[0] == "pylond-release v1" || s.body[0] == "pylond-log v1");
+    if (!kind) { eprintln("pylon-release: " + file + " is neither a release manifest nor a tree head"); return 1; }
+    Str body = joined(s.body);
+    List(Int) pubk = ed25519g_pub(seed);
+    Str kid = key_id(pubk);
+    if (signers(body, s.sigs, [pubk]) > 0) { eprintln("pylon-release: " + file + " already carries a signature by " + kid); return 1; }
+    Str line = "sig " + kid + " " + hex_encode(ed25519g_sign(seed, bytes_of(body))) + "\n";
+    if (!filesystem.append_bytes(file, bytes_of(line))) { eprintln("pylon-release: cannot write " + file); return 1; }
+    println(file + ": signed by " + kid);
+    return 0;
+}
+
+Str entry_name(Int i) {
+    Str n = f"{i}";
+    return str_repeat("0", 6 - str_len(n)) + n + ".release";
+}
+
+// The leaf hashes of LOG's entries, in order.
+@requires(filesystem(readonly))
+List(List(Int)) log_leaves(Str log, Int i, List(List(Int)) acc) {
+    Str f = log + "/entries/" + entry_name(i);
+    if (!filesystem.exists(f)) { return acc; }
+    return log_leaves(log, i + 1, acc.concat([leaf_hash(filesystem.read_bytes(f))]));
+}
+
+// The highest release counter among LOG's entries (0 for none).
+@requires(filesystem(readonly))
+Int top_counter(Str log, Int i, Int top) {
+    Str f = log + "/entries/" + entry_name(i);
+    if (!filesystem.exists(f)) { return top; }
+    Signed s = split_signed(filesystem.read_all(f));
+    Manifest m = if (s.ok) { parse_manifest(s.body) } else { parse_manifest([]) };
+    return top_counter(log, i + 1, if (m.counter > top) { m.counter } else { top });
+}
+
+Int find_leaf(List(List(Int)) hs, List(Int) h, Int i) {
+    if (i >= hs.len()) { return -1; }
+    return if (same_bytes(hs[i], h)) { i } else { find_leaf(hs, h, i + 1) };
+}
+
+@requires(filesystem)
+Int log_append(Str log, Str relf) {
+    if (!filesystem.exists(relf)) { eprintln("pylon-release: no " + relf); return 1; }
+    Str t = filesystem.read_all(relf);
+    Signed s = split_signed(t);
+    Manifest m = if (s.ok) { parse_manifest(s.body) } else { parse_manifest([]) };
+    if (!s.ok || str_len(m.err) > 0 || s.sigs.len() == 0) { eprintln("pylon-release: " + relf + " is not a signed release manifest"); return 1; }
+    List(List(Int)) hs = log_leaves(log, 0, []);
+    if (find_leaf(hs, leaf_hash(bytes_of(t)), 0) >= 0) { eprintln("pylon-release: " + relf + " is already in the log"); return 1; }
+    Int top = top_counter(log, 0, 0);
+    if (m.counter <= top) { eprintln("pylon-release: release counter " + f"{m.counter}" + " is not above the log's highest, " + f"{top}" + " (clients refuse a rollback)"); return 1; }
+    Bool ok = filesystem.create_dir(log + "/entries") && filesystem.write_all(log + "/entries/" + entry_name(hs.len()), t);
+    List(List(Int)) hs2 = hs.concat([leaf_hash(bytes_of(t))]);
+    Bool ok2 = ok && filesystem.write_all(log + "/head", sth_body(hs2.len(), tree_root(hs2)));
+    if (!ok2) { eprintln("pylon-release: cannot write the log in " + log); return 1; }
+    println("entry " + f"{hs.len()}" + "; " + log + "/head is the new tree head (size " + f"{hs2.len()}" + "), unsigned: the log keys sign it");
+    return 0;
+}
+
+@requires(filesystem)
+Int proof(Str log, Str relf, Str out) {
+    if (!filesystem.exists(relf) || !filesystem.exists(log + "/head")) { eprintln("pylon-release: no " + relf + " or " + log + "/head"); return 1; }
+    List(List(Int)) hs = log_leaves(log, 0, []);
+    Int idx = find_leaf(hs, leaf_hash(filesystem.read_bytes(relf)), 0);
+    if (idx < 0) { eprintln("pylon-release: " + relf + " is not in the log"); return 1; }
+    Signed h = split_signed(filesystem.read_all(log + "/head"));
+    if (!h.ok || joined(h.body) != sth_body(hs.len(), tree_root(hs))) { eprintln("pylon-release: " + log + "/head is not the head of the log's entries (log-append writes it)"); return 1; }
+    if (h.sigs.len() == 0) { eprintln("pylon-release: " + log + "/head is not signed"); return 1; }
+    Str p = make_proof(hs, idx, h.sigs);
+    if (!filesystem.write_all(out, p)) { eprintln("pylon-release: cannot write " + out); return 1; }
+    println(out + ": entry " + f"{idx}" + " of " + f"{hs.len()}");
+    return 0;
+}
+
+@requires(filesystem(readonly))
+Int verify(Str rootsf, Str dir, Str prooff) {
+    if (!filesystem.exists(rootsf) || !filesystem.exists(dir + "/pylond.release") || !filesystem.exists(prooff)) { eprintln("pylon-release: need " + rootsf + ", " + dir + "/pylond.release and " + prooff); return 1; }
+    Str rel = filesystem.read_all(dir + "/pylond.release");
+    Signed s = split_signed(rel);
+    Manifest m = if (s.ok) { parse_manifest(s.body) } else { parse_manifest([]) };
+    if (str_len(m.err) > 0) { eprintln("pylon-release: " + m.err); return 1; }
+    return verify_builds(filesystem.read_all(rootsf), dir, rel, filesystem.read_all(prooff), m.builds, 0);
+}
+
+@requires(filesystem(readonly))
+Int verify_builds(Str roots, Str dir, Str rel, Str prf, List(Build) bs, Int i) {
+    if (i >= bs.len()) { return 0; }
+    Str f = dir + "/pylond-" + bs[i].arch;
+    if (!filesystem.exists(f)) { eprintln("pylon-release: no " + f + " (named in the manifest)"); return 1; }
+    List(Int) bin = filesystem.read_bytes(f);
+    Verdict v = verify_release(roots, rel, prf, bs[i].arch, hex_encode(sha256_bytes(bin)), "", "");
+    if (!v.ok) { eprintln("pylon-release: " + f + ": " + v.why); return 1; }
+    if (hex_encode(sha256_bytes(code_image(bin))) != bs[i].code) { eprintln("pylon-release: " + f + ": its code image is not the manifest's"); return 1; }
+    println(f + ": " + v.version + " (release " + f"{v.counter}" + "), signed by " + f"{v.signed}" + ", entry " + f"{v.index}" + " of " + f"{v.size}");
+    return verify_builds(roots, dir, rel, prf, bs, i + 1);
+}
+
+Int usage() {
+    eprintln("usage: pylon-release keygen NAME");
+    eprintln("       pylon-release roots OUT K REL.pub... --log K LOG.pub...");
+    eprintln("       pylon-release code-hash FILE");
+    eprintln("       pylon-release manifest VERSION COUNTER DIR OUT");
+    eprintln("       pylon-release sign FILE NAME.key");
+    eprintln("       pylon-release log-append LOG RELEASE");
+    eprintln("       pylon-release proof LOG RELEASE OUT");
+    eprintln("       pylon-release verify ROOTS DIR [PROOF]");
+    return 2;
+}
+
+@requires(args)
+List(Str) argv(Int i, List(Str) acc) {
+    if (i >= args.count()) { return acc; }
+    return argv(i + 1, acc.concat([args.get(i)]));
+}
+
+@requires(args, filesystem, declassify)
+Int main() {
+    List(Str) a = argv(1, []);
+    if (a.len() == 0) { return usage(); }
+    Str c = a[0];
+    Int n = a.len();
+    if (c == "keygen" && n == 2) { return keygen(a[1]); }
+    if (c == "roots") { return roots(a[1..n]); }
+    if (c == "code-hash" && n == 2) {
+        if (!filesystem.exists(a[1])) { eprintln("pylon-release: no " + a[1]); return 1; }
+        println(code_hash(a[1]));
+        return 0;
+    }
+    if (c == "manifest" && n == 5) { return manifest(a[1], a[2], a[3], a[4]); }
+    if (c == "sign" && n == 3) { return sign(a[1], a[2]); }
+    if (c == "log-append" && n == 3) { return log_append(a[1], a[2]); }
+    if (c == "proof" && n == 4) { return proof(a[1], a[2], a[3]); }
+    if (c == "verify" && (n == 3 || n == 4)) { return verify(a[1], a[2], if (n == 4) { a[3] } else { a[2] + "/pylond.proof" }); }
+    return usage();
+}

@@ -1,0 +1,119 @@
+// The transparency log's Merkle tree (SPEC 8.2): RFC 9162 (Certificate
+// Transparency 2.0) section 2.1, with SHA-256.
+//
+//   leaf hash  SHA-256(0x00 || entry)
+//   node hash  SHA-256(0x01 || left || right)
+//   MTH(D[n])  for n > 1, k the largest power of two below n:
+//              node(MTH(D[0:k]), MTH(D[k:n]))
+//
+// Proofs are generated (tools/release) from the list of leaf hashes and
+// verified (the client) with the algorithms of RFC 9162 2.1.3.2
+// (inclusion) and 2.1.4.2 (consistency). Every hash is 32 bytes; anything
+// else is refused.
+
+import "crypto.resid";
+
+pub List(Int) leaf_hash(List(Int) entry) { return sha256_bytes([0].concat(entry)); }
+
+pub List(Int) node_hash(List(Int) l, List(Int) r) { return sha256_bytes([1].concat(l).concat(r)); }
+
+pub List(Int) empty_root() { return sha256_bytes([]); }
+
+// The largest power of two strictly below n (n >= 2).
+pub Int split_point(Int n) { return split_acc(n, 1); }
+
+Int split_acc(Int n, Int k) { return if (k * 2 < n) { split_acc(n, k * 2) } else { k }; }
+
+// The root over leaf hashes (MTH of RFC 9162 2.1.1).
+pub List(Int) tree_root(List(List(Int)) hs) {
+    if (hs.len() == 0) { return empty_root(); }
+    if (hs.len() == 1) { return hs[0]; }
+    Int k = split_point(hs.len());
+    return node_hash(tree_root(hs[0..k]), tree_root(hs[k..hs.len()]));
+}
+
+// The inclusion proof of leaf m (RFC 9162 2.1.3.1), leaf to root.
+pub List(List(Int)) inclusion_path(Int m, List(List(Int)) hs) {
+    Int n = hs.len();
+    if (n <= 1 || m < 0 || m >= n) { return []; }
+    Int k = split_point(n);
+    if (m < k) { return inclusion_path(m, hs[0..k]).concat([tree_root(hs[k..n])]); }
+    return inclusion_path(m - k, hs[k..n]).concat([tree_root(hs[0..k])]);
+}
+
+// The consistency proof from the first m leaves to all of them
+// (RFC 9162 2.1.4.1, SUBPROOF with b = true); [] when m is 0 or not
+// below the tree's size.
+pub List(List(Int)) consistency_proof(Int m, List(List(Int)) hs) {
+    if (m <= 0 || m >= hs.len()) { return []; }
+    return subproof(m, hs, true);
+}
+
+List(List(Int)) subproof(Int m, List(List(Int)) hs, Bool b) {
+    Int n = hs.len();
+    if (m == n) { return if (b) { [] } else { [tree_root(hs)] }; }
+    Int k = split_point(n);
+    if (m <= k) { return subproof(m, hs[0..k], b).concat([tree_root(hs[k..n])]); }
+    return subproof(m - k, hs[k..n], false).concat([tree_root(hs[0..k])]);
+}
+
+Bool all32(List(List(Int)) hs, Int i) {
+    if (i >= hs.len()) { return true; }
+    return hs[i].len() == 32 && all32(hs, i + 1);
+}
+
+Bool same32(List(Int) a, List(Int) b) { return a.len() == 32 && b.len() == 32 && ct_equal(a, b); }
+
+// Shift fn and sn right until fn's lowest bit is set or fn is 0.
+type FS = { Int fn; Int sn; };
+
+FS shift_odd(Int fn, Int sn) {
+    if (fn == 0 || (fn & 1) == 1) { return FS {.fn = fn, .sn = sn}; }
+    return shift_odd(fn >> 1, sn >> 1);
+}
+
+// Shift fn and sn right while fn's lowest bit is set.
+FS shift_even(Int fn, Int sn) {
+    if ((fn & 1) == 0) { return FS {.fn = fn, .sn = sn}; }
+    return shift_even(fn >> 1, sn >> 1);
+}
+
+// RFC 9162 2.1.3.2: leaf `index` with hash `leaf` is in the tree of
+// `size` leaves whose root is `root`.
+pub Bool inclusion_ok(Int index, Int size, List(Int) leaf, List(List(Int)) path, List(Int) root) {
+    if (index < 0 || size <= 0 || index >= size || leaf.len() != 32 || !all32(path, 0) || path.len() > 64) { return false; }
+    return incl_walk(index, size - 1, leaf, path, 0, root);
+}
+
+Bool incl_walk(Int fn, Int sn, List(Int) r, List(List(Int)) path, Int i, List(Int) root) {
+    if (i >= path.len()) { return sn == 0 && same32(r, root); }
+    if (sn == 0) { return false; }
+    Bool left = (fn & 1) == 1 || fn == sn;
+    List(Int) r2 = if (left) { node_hash(path[i], r) } else { node_hash(r, path[i]) };
+    FS s = if (left && (fn & 1) == 0) { shift_odd(fn, sn) } else { FS {.fn = fn, .sn = sn} };
+    return incl_walk(s.fn >> 1, s.sn >> 1, r2, path, i + 1, root);
+}
+
+Bool is_pow2(Int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+// RFC 9162 2.1.4.2: the tree of `first` leaves with root `r1` is a prefix
+// of the tree of `second` leaves with root `r2`. Equal sizes need equal
+// roots and an empty proof.
+pub Bool consistency_ok(Int first, Int second, List(Int) r1, List(Int) r2, List(List(Int)) proof) {
+    if (first <= 0 || first > second || r1.len() != 32 || r2.len() != 32 || !all32(proof, 0) || proof.len() > 128) { return false; }
+    if (first == second) { return proof.len() == 0 && same32(r1, r2); }
+    if (proof.len() == 0) { return false; }
+    List(List(Int)) p = if (is_pow2(first)) { [r1].concat(proof) } else { proof };
+    FS s = shift_even(first - 1, second - 1);
+    return cons_walk(s.fn, s.sn, p[0], p[0], p, 1, r1, r2);
+}
+
+Bool cons_walk(Int fn, Int sn, List(Int) fr, List(Int) sr, List(List(Int)) p, Int i, List(Int) r1, List(Int) r2) {
+    if (i >= p.len()) { return sn == 0 && same32(fr, r1) && same32(sr, r2); }
+    if (sn == 0) { return false; }
+    Bool left = (fn & 1) == 1 || fn == sn;
+    List(Int) fr2 = if (left) { node_hash(p[i], fr) } else { fr };
+    List(Int) sr2 = if (left) { node_hash(p[i], sr) } else { node_hash(sr, p[i]) };
+    FS s = if (left && (fn & 1) == 0) { shift_odd(fn, sn) } else { FS {.fn = fn, .sn = sn} };
+    return cons_walk(s.fn >> 1, s.sn >> 1, fr2, sr2, p, i + 1, r1, r2);
+}

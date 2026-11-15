@@ -1,0 +1,16 @@
+// The release and log keys this build of pylon trusts for pylond
+// (SPEC 8.2), in the roots format of core/release.resid:
+//
+//   pylond-roots v1
+//   release-threshold K
+//   release-key HEX            (the n maintainers' release keys)
+//   log-threshold K
+//   log-key HEX                (the transparency log's keys)
+//
+// Public keys only; the private keys never enter this repository
+// (SPEC 8.2.1). Empty until the first release ceremony: until
+// then no pylond verifies against this build, and pylon refuses to push
+// one unless told to trust other roots (--pylond-roots FILE) or none
+// (--pylond-unverified), both developer options that say so.
+
+pub Str pinned_roots() { return ""; }

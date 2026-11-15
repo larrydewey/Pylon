@@ -25,6 +25,8 @@ import "../core/proto.resid";
 import "../core/link.resid";
 import "../core/pyclient.resid";
 import "../core/files.resid";
+import "../core/release.resid";
+import "../core/release_gate.resid";
 
 type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; Str jump; Str pylond; List(Str) pflags; List(Str) fwds; List(Str) rest; Str err; };
 
@@ -40,6 +42,8 @@ Opts parse(Int i, Opts o) {
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app" || a == "--resume") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--pylond-unverified") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["pylond-unverified"]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--pylond-roots" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["roots=" + args.get(i + 1)]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if ((a == "-L" || a == "-D" || a == "-R") && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds.concat([str_slice(a, 1, 2) + " " + args.get(i + 1)]), .rest = [], .err = ""}); }
@@ -61,9 +65,13 @@ Int usage() {
     eprintln("                       [-R [localhost:]RPORT:HOST:HOSTPORT] ... USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
-    eprintln("       pylon get/put --pylond FILE [--resume] ...   over the Pylon protocol, resumable");
-    eprintln("       pylon --pylond FILE [-N -L/-D/-R ...] USER@HOST   a terminal or forwards over the");
+    eprintln("       pylon get/put --pylond DIR [--resume] ...   over the Pylon protocol, resumable");
+    eprintln("       pylon --pylond DIR [-N -L/-D/-R ...] USER@HOST   a terminal or forwards over the");
     eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
+    eprintln("                       DIR holds pylond-x86_64, pylond-aarch64 and the signed release");
+    eprintln("                       (pylond.release, pylond.proof), checked before pylond is pushed;");
+    eprintln("                       for a local build: --pylond-roots ROOTS or --pylond-unverified");
+    eprintln("       pylon pylond-check DIR [PROOF]          check DIR's release (PROOF: a newer log proof)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
     eprintln("       pylon history [HOST]                    what happened to pins");
@@ -302,6 +310,9 @@ Up pylon_up(Conn c, Str host, Str path, List(Str) pflags) {
     if (!filesystem.exists(file)) { eprintln("pylon: no pylond at " + file); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 2}; }
     List(Int) bin = filesystem.read_bytes(file);
     Str hash = hex_encode(sha256_bytes(bin));
+    // The release check (SPEC 8.2): signed by the release quorum, in the
+    // log, not a rollback; before anything is sent to the host.
+    if (!pylond_vetted(if (dir) { path } else { dir_of(path) }, if (dir) { ar.arch } else { "" }, hash, pflags)) { _ = disconnect(ar.c, "done"); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
     Pushed p = push_pylond(ar.c, bin, hash);
     if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
     Started st = start_pylond_b(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"), environment.get("PYLON_TEST_BUSY") == "1");
@@ -314,6 +325,61 @@ Up pylon_up(Conn c, Str host, Str path, List(Str) pflags) {
     Str rks = environment.get("PYLON_TEST_REKEY_SECS");
     Rk rk = rk_new(st.b, st.bc.c, if (str_is_int(rks) && str_parse_int(rks) > 0) { str_parse_int(rks) * 1000000000 } else { 120000000000 });
     return Up {.l = link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns()), .rk = rk, .rebind = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 }, .code = -1};
+}
+
+// Whether the pylond with `hash` (the `arch` build, "" for any) may be
+// pushed: its release in `dir` verifies (core/release_gate.resid), or the
+// developer said not to check (--pylond-unverified), which is announced.
+@requires(filesystem, environment)
+Bool pylond_vetted(Str dir, Str arch, Str hash, List(Str) pflags) {
+    if (has_flag(pflags, "pylond-unverified")) {
+        eprintln("pylon: WARNING: pushing an unverified pylond (--pylond-unverified): no release signatures, transparency log or rollback check");
+        return true;
+    }
+    Str roots = flag_value(pflags, "roots=");
+    Verdict v = release_gate(dir, proof_file(dir), arch, hash, roots);
+    if (!v.ok) {
+        eprintln("pylon: refusing to push pylond: " + v.why);
+        eprintln("pylon: (a local build of pylond: --pylond-roots ROOTS with a release signed by your own keys, or --pylond-unverified)");
+        return false;
+    }
+    if (str_len(roots) > 0) { eprintln("pylon: WARNING: pylond release checked against the roots in " + roots + " (--pylond-roots), not the pinned release keys"); }
+    eprintln("pylon: pylond " + v.version + " (release " + f"{v.counter}" + "): signed by " + f"{v.signed}" + " release keys, entry " + f"{v.index}" + " of the log's " + f"{v.size}");
+    return true;
+}
+
+// The value of the first flag that starts with `key` ("" for none).
+Str flag_value(List(Str) fs, Str key) {
+    if (fs.len() == 0) { return ""; }
+    if (str_starts_with(fs[0], key)) { return str_slice(fs[0], str_len(key), str_len(fs[0])); }
+    return flag_value(fs[1..fs.len()], key);
+}
+
+// pylon pylond-check DIR [PROOF]: check the release in DIR as a push
+// would, for every build it holds, with PROOF in place of the bundled
+// DIR/pylond.proof (a newer one, fetched from where the log is published,
+// moves the newest log head seen forward).
+@requires(filesystem, environment)
+Int cmd_pylond_check(Opts o) {
+    if (o.rest.len() < 1 || o.rest.len() > 2) { return usage(); }
+    Str dir = o.rest[0];
+    Str proof = if (o.rest.len() == 2) { o.rest[1] } else { proof_file(dir) };
+    return check_builds(dir, proof, flag_value(o.pflags, "roots="), ["aarch64", "x86_64"], 0, 0);
+}
+
+@requires(filesystem, environment)
+Int check_builds(Str dir, Str proof, Str roots, List(Str) archs, Int i, Int seen) {
+    if (i >= archs.len()) {
+        if (seen == 0) { eprintln("pylon: no pylond-aarch64 or pylond-x86_64 in " + dir); return 1; }
+        return 0;
+    }
+    Str f = dir + "/pylond-" + archs[i];
+    if (!filesystem.exists(f)) { return check_builds(dir, proof, roots, archs, i + 1, seen); }
+    Str hash = hex_encode(sha256_bytes(filesystem.read_bytes(f)));
+    Verdict v = release_gate(dir, proof, archs[i], hash, roots);
+    if (!v.ok) { eprintln("pylon: pylond-" + archs[i] + ": " + v.why); return 1; }
+    println("pylond-" + archs[i] + " " + v.version + " (release " + f"{v.counter}" + "): signed by " + f"{v.signed}" + " release keys, entry " + f"{v.index}" + " of the log's " + f"{v.size}");
+    return check_builds(dir, proof, roots, archs, i + 1, seen + 1);
 }
 
 // --pylond FILE: a terminal (no -N), or -N -L forwards, over the Pylon
@@ -453,11 +519,12 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins";
+    Bool sub = verb == "pylond-check" || verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
     if (verb == "ca") { return cmd_ca(o); }
+    if (verb == "pylond-check") { return cmd_pylond_check(o); }
     if (verb == "pins") { _ = print_lines(pin_lines(), 0); return 0; }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);

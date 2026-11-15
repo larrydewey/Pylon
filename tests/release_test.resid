@@ -1,0 +1,343 @@
+// Release integrity for pylond (core/merkle.resid, core/release.resid):
+// the Merkle log against the Certificate Transparency reference vectors
+// (RFC 6962/9162 trees over the eight leaves below), proof verification,
+// the signing quorum, the log's tree heads and rollback.
+//
+// Every key here is a test key derived from a label in this file.
+
+import "crypto.resid";
+import "ed25519.resid";
+import "../core/wire.resid";
+import "../core/merkle.resid";
+import "../core/release.resid";
+
+// The reference leaves: "", 00, 10, 2021, 3031, 40..43, 50..57, 60..6f.
+List(List(Int)) ref_leaves() {
+    return [[], [0], [16], [32, 33], [48, 49], [64, 65, 66, 67], [80, 81, 82, 83, 84, 85, 86, 87],
+        [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]];
+}
+
+List(List(Int)) ref_hashes(Int n) { return hash_all(ref_leaves()[0..n], 0, []); }
+
+List(List(Int)) hash_all(List(List(Int)) ls, Int i, List(List(Int)) acc) {
+    if (i >= ls.len()) { return acc; }
+    return hash_all(ls, i + 1, acc.concat([leaf_hash(ls[i])]));
+}
+
+// The roots of the first n reference leaves, n = 1..8.
+List(Str) ref_roots() {
+    return ["6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "fac54203e7cc696cf0dfcb42c92a1d9dbaf70ad9e621f4bd8d98662f00e3c125",
+        "aeb6bcfe274b70a14fb067a5e5578264db0fa9b51af5e0ba159158f329e06e77",
+        "d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7",
+        "4e3bbb1f7b478dcfe71fb631631519a3bca12c9aefca1612bfce4c13a86264d4",
+        "76e67dadbcdf1e10e1b74ddc608abd2f98dfb16fbce75277b5232a127f2087ef",
+        "ddb89be403809e325750d3d263cd78929c2942b7942a34b77e122c9594a74c8c",
+        "5dc9da79a70659a9ad559cb701ded9a2ab9d823aad2f4960cfe370eff4604328"];
+}
+
+List(Int) root_of(Int n) { return hexn(ref_roots()[n - 1], 32); }
+
+Str hexes(List(List(Int)) hs) { return hash_fields_t(hs, 0, ""); }
+
+Str hash_fields_t(List(List(Int)) hs, Int i, Str acc) {
+    if (i >= hs.len()) { return acc; }
+    return hash_fields_t(hs, i + 1, acc + (if (i > 0) { " " } else { "" }) + hex_encode(hs[i]));
+}
+
+List(List(Int)) unhexes(List(Str) ss, Int i, List(List(Int)) acc) {
+    if (i >= ss.len()) { return acc; }
+    return unhexes(ss, i + 1, acc.concat([hexn(ss[i], 32)]));
+}
+
+test "merkle: roots of the reference trees" {
+    expect(hex_encode(empty_root())).toEqual("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    expect(hex_encode(tree_root(ref_hashes(1)))).toEqual(ref_roots()[0]);
+    expect(hex_encode(tree_root(ref_hashes(2)))).toEqual(ref_roots()[1]);
+    expect(hex_encode(tree_root(ref_hashes(3)))).toEqual(ref_roots()[2]);
+    expect(hex_encode(tree_root(ref_hashes(4)))).toEqual(ref_roots()[3]);
+    expect(hex_encode(tree_root(ref_hashes(5)))).toEqual(ref_roots()[4]);
+    expect(hex_encode(tree_root(ref_hashes(6)))).toEqual(ref_roots()[5]);
+    expect(hex_encode(tree_root(ref_hashes(7)))).toEqual(ref_roots()[6]);
+    expect(hex_encode(tree_root(ref_hashes(8)))).toEqual(ref_roots()[7]);
+}
+
+test "merkle: reference inclusion proofs" {
+    expect(hexes(inclusion_path(0, ref_hashes(8)))).toEqual("96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7 5f083f0a1a33ca076a95279832580db3e0ef4584bdff1f54c8a360f50de3031e 6b47aaf29ee3c2af9af889bc1fb9254dabd31177f16232dd6aab035ca39bf6e4");
+    expect(hexes(inclusion_path(5, ref_hashes(8)))).toEqual("bc1a0643b12e4d2d7c77918f44e0f4f79a838b6cf9ec5b5c283e1f4d88599e6b ca854ea128ed050b41b35ffc1b87b8eb2bde461e9e3b5596ece6b9d5975a0ae0 d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7");
+    expect(hexes(inclusion_path(2, ref_hashes(3)))).toEqual("fac54203e7cc696cf0dfcb42c92a1d9dbaf70ad9e621f4bd8d98662f00e3c125");
+    expect(inclusion_path(0, ref_hashes(1)).len()).toEqual(0);
+    // The published vectors verify as given.
+    List(List(Int)) p = unhexes(["bc1a0643b12e4d2d7c77918f44e0f4f79a838b6cf9ec5b5c283e1f4d88599e6b", "ca854ea128ed050b41b35ffc1b87b8eb2bde461e9e3b5596ece6b9d5975a0ae0", "d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7"], 0, []);
+    expect(inclusion_ok(5, 8, leaf_hash(ref_leaves()[5]), p, root_of(8))).toEqual(true);
+}
+
+test "merkle: reference consistency proofs" {
+    expect(hexes(consistency_proof(1, ref_hashes(8)))).toEqual("96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7 5f083f0a1a33ca076a95279832580db3e0ef4584bdff1f54c8a360f50de3031e 6b47aaf29ee3c2af9af889bc1fb9254dabd31177f16232dd6aab035ca39bf6e4");
+    expect(hexes(consistency_proof(6, ref_hashes(8)))).toEqual("0ebc5d3437fbe2db158b9f126a1d118e308181031d0a949f8dededebc558ef6a ca854ea128ed050b41b35ffc1b87b8eb2bde461e9e3b5596ece6b9d5975a0ae0 d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7");
+    expect(hexes(consistency_proof(2, ref_hashes(5)))).toEqual("5f083f0a1a33ca076a95279832580db3e0ef4584bdff1f54c8a360f50de3031e bc1a0643b12e4d2d7c77918f44e0f4f79a838b6cf9ec5b5c283e1f4d88599e6b");
+    List(List(Int)) p = unhexes(["0ebc5d3437fbe2db158b9f126a1d118e308181031d0a949f8dededebc558ef6a", "ca854ea128ed050b41b35ffc1b87b8eb2bde461e9e3b5596ece6b9d5975a0ae0", "d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7"], 0, []);
+    expect(consistency_ok(6, 8, root_of(6), root_of(8), p)).toEqual(true);
+}
+
+// Every leaf of every tree up to 8, and every pair of sizes.
+Int incl_all(Int n, Int m, Int bad) {
+    if (n > 8) { return bad; }
+    if (m >= n) { return incl_all(n + 1, 0, bad); }
+    List(List(Int)) hs = ref_hashes(n);
+    Bool ok = inclusion_ok(m, n, hs[m], inclusion_path(m, hs), root_of(n));
+    return incl_all(n, m + 1, if (ok) { bad } else { bad + 1 });
+}
+
+Int cons_all(Int n, Int m, Int bad) {
+    if (n > 8) { return bad; }
+    if (m > n) { return cons_all(n + 1, 1, bad); }
+    List(List(Int)) hs = ref_hashes(n);
+    Bool ok = consistency_ok(m, n, root_of(m), root_of(n), consistency_proof(m, hs));
+    return cons_all(n, m + 1, if (ok) { bad } else { bad + 1 });
+}
+
+test "merkle: every generated proof verifies" {
+    expect(incl_all(1, 0, 0)).toEqual(0);
+    expect(cons_all(1, 1, 0)).toEqual(0);
+}
+
+List(Int) flip(List(Int) h) { return [h[0] ^ 1].concat(h[1..h.len()]); }
+
+test "merkle: tampered, wrong-size and wrong-index inclusion proofs fail" {
+    List(List(Int)) hs = ref_hashes(7);
+    List(List(Int)) p = inclusion_path(3, hs);
+    List(Int) root = root_of(7);
+    expect(inclusion_ok(3, 7, hs[3], p, root)).toEqual(true);
+    expect(inclusion_ok(3, 7, hs[3], [flip(p[0])].concat(p[1..p.len()]), root)).toEqual(false);
+    expect(inclusion_ok(3, 7, hs[3], p[0..2], root)).toEqual(false);
+    expect(inclusion_ok(3, 7, hs[3], p.concat([p[0]]), root)).toEqual(false);
+    expect(inclusion_ok(3, 7, flip(hs[3]), p, root)).toEqual(false);
+    expect(inclusion_ok(3, 7, hs[3], p, flip(root))).toEqual(false);
+    // Sizes whose tree puts leaf 3 elsewhere. (Sizes 5 to 8 give leaf 3
+    // the same path shape, so the size is bound by the signed tree head,
+    // which signs it with the root.)
+    expect(inclusion_ok(3, 4, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(3, 9, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(3, 16, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(2, 7, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(7, 7, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(-1, 7, hs[3], p, root)).toEqual(false);
+    expect(inclusion_ok(0, 0, hs[0], [], root)).toEqual(false);
+    expect(inclusion_ok(3, 7, hs[3], [[1, 2, 3]].concat(p[1..p.len()]), root)).toEqual(false);
+}
+
+test "merkle: tampered and wrong-size consistency proofs fail" {
+    List(List(Int)) hs = ref_hashes(7);
+    List(List(Int)) p = consistency_proof(3, hs);
+    expect(consistency_ok(3, 7, root_of(3), root_of(7), p)).toEqual(true);
+    expect(consistency_ok(3, 7, root_of(3), root_of(7), [flip(p[0])].concat(p[1..p.len()]))).toEqual(false);
+    expect(consistency_ok(3, 7, root_of(3), root_of(7), p[0..(p.len() - 1)])).toEqual(false);
+    expect(consistency_ok(3, 7, root_of(3), root_of(7), p.concat([p[0]]))).toEqual(false);
+    expect(consistency_ok(3, 7, root_of(4), root_of(7), p)).toEqual(false);
+    expect(consistency_ok(3, 7, root_of(3), root_of(6), p)).toEqual(false);
+    expect(consistency_ok(4, 7, root_of(3), root_of(7), p)).toEqual(false);
+    expect(consistency_ok(3, 8, root_of(3), root_of(8), p)).toEqual(false);
+    expect(consistency_ok(7, 3, root_of(7), root_of(3), p)).toEqual(false);
+    expect(consistency_ok(0, 7, empty_root(), root_of(7), p)).toEqual(false);
+    // Equal sizes: equal roots and an empty proof.
+    expect(consistency_ok(7, 7, root_of(7), root_of(7), [])).toEqual(true);
+    expect(consistency_ok(7, 7, root_of(6), root_of(7), [])).toEqual(false);
+    expect(consistency_ok(7, 7, root_of(7), root_of(7), p)).toEqual(false);
+    // A power-of-two first tree (its root is implied).
+    expect(consistency_ok(4, 7, root_of(4), root_of(7), consistency_proof(4, hs))).toEqual(true);
+    expect(consistency_ok(4, 7, flip(root_of(4)), root_of(7), consistency_proof(4, hs))).toEqual(false);
+}
+
+// ---- releases -------------------------------------------------------------------
+
+List(Int) seed(Str label) { return sha256_bytes(bytes_of("pylon release test key " + label)); }
+
+List(List(Int)) rel_seeds() { return [seed("r1"), seed("r2"), seed("r3")]; }
+List(List(Int)) log_seeds() { return [seed("l1"), seed("l2")]; }
+
+List(List(Int)) pubs(List(List(Int)) ss, Int i, List(List(Int)) acc) {
+    if (i >= ss.len()) { return acc; }
+    return pubs(ss, i + 1, acc.concat([pub_key(ss[i])]));
+}
+
+// 2 of 3 release keys, 1 of 2 log keys.
+Str roots() { return roots_text(pubs(rel_seeds(), 0, []), 2, pubs(log_seeds(), 0, []), 1); }
+
+Str fake_hash(Str label) { return hex_encode(sha256_bytes(bytes_of(label))); }
+
+Str body_of(Str version, Int counter, Str bin) {
+    return manifest_body(version, counter, [Build {.arch = "aarch64", .file = fake_hash(bin + "-a"), .code = fake_hash(bin + "-ca")}, Build {.arch = "x86_64", .file = fake_hash(bin), .code = fake_hash(bin + "-c")}]);
+}
+
+// A release signed by the given release seeds.
+Str release(Str version, Int counter, Str bin, List(List(Int)) by) {
+    Str b = body_of(version, counter, bin);
+    return b + joined(sign_all(by, b, 0, []));
+}
+
+List(List(Int)) leaves_of(List(Str) rels, Int i, List(List(Int)) acc) {
+    if (i >= rels.len()) { return acc; }
+    return leaves_of(rels, i + 1, acc.concat([leaf_hash(bytes_of(rels[i]))]));
+}
+
+// The proof of release `index` in the log of `rels`, its head signed by `by`.
+Str proof(List(Str) rels, Int index, List(List(Int)) by) {
+    List(List(Int)) hs = leaves_of(rels, 0, []);
+    return make_proof(hs, index, sign_all(by, sth_body(hs.len(), tree_root(hs)), 0, []));
+}
+
+List(Str) log3() {
+    return [release("0.1.0", 1, "bin1", [seed("r1"), seed("r2")]), release("0.2.0", 2, "bin2", [seed("r2"), seed("r3")]), release("0.3.0", 3, "bin3", rel_seeds())];
+}
+
+test "release: a signed, logged release is accepted" {
+    List(Str) rs = log3();
+    Verdict v = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
+    expect(v.why).toEqual("");
+    expect(v.ok).toEqual(true);
+    expect(v.version).toEqual("0.2.0");
+    expect(v.counter).toEqual(2);
+    expect(v.signed).toEqual(2);
+    expect(v.index).toEqual(1);
+    expect(v.size).toEqual(3);
+    // The aarch64 build too, and any build when the machine type is unknown.
+    expect(verify_release(roots(), rs[1], proof(rs, 1, [seed("l2")]), "aarch64", fake_hash("bin2-a"), "", "").ok).toEqual(true);
+    expect(verify_release(roots(), rs[1], proof(rs, 1, [seed("l2")]), "", fake_hash("bin2-a"), "", "").ok).toEqual(true);
+}
+
+test "release: k-1 signatures are refused" {
+    List(Str) rs = [release("0.1.0", 1, "bin1", [seed("r1")])];
+    Verdict v = verify_release(roots(), rs[0], proof(rs, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "");
+    expect(v.ok).toEqual(false);
+    expect(v.why).toEqual("the release is signed by 1 of the 2 release keys it needs");
+    // The same key twice counts once; an unpinned key does not count.
+    List(Str) twice = [release("0.1.0", 1, "bin1", [seed("r1"), seed("r1")])];
+    expect(verify_release(roots(), twice[0], proof(twice, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "").why).toEqual("the release is signed by 1 of the 2 release keys it needs");
+    List(Str) other = [release("0.1.0", 1, "bin1", [seed("r1"), seed("x")])];
+    expect(verify_release(roots(), other[0], proof(other, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "").ok).toEqual(false);
+    // A log key is not a release key.
+    List(Str) lk = [release("0.1.0", 1, "bin1", [seed("r1"), seed("l1")])];
+    expect(verify_release(roots(), lk[0], proof(lk, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "").ok).toEqual(false);
+}
+
+test "release: a tampered manifest or another binary is refused" {
+    List(Str) rs = log3();
+    // Signatures over another hash do not carry over.
+    Str b = body_of("0.2.0", 2, "evil");
+    Signed s = split_signed(rs[1]);
+    Str forged = b + joined(s.sigs);
+    List(Str) logged = [rs[0], forged, rs[2]];
+    Verdict v = verify_release(roots(), forged, proof(logged, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
+    expect(v.why).toEqual("the release is signed by 0 of the 2 release keys it needs");
+    // A binary the manifest does not name.
+    Verdict w = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
+    expect(w.ok).toEqual(false);
+    expect(str_contains(w.why, "is not the x86_64 build")).toEqual(true);
+    // The aarch64 build is not the x86_64 one.
+    expect(verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2-a"), "", "").ok).toEqual(false);
+    // Malformed manifests.
+    expect(verify_release(roots(), "pylond-release v1\n", proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "").why).toEqual("the release manifest is malformed");
+    expect(verify_release(roots(), str_replace(rs[1], "counter 2", "counter 02"), proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "").why).toEqual("the release manifest is malformed");
+}
+
+test "release: not in the log, or a head without the log quorum, is refused" {
+    List(Str) rs = log3();
+    // Logged without this release.
+    List(Str) without = [rs[0], rs[2]];
+    Verdict v = verify_release(roots(), rs[1], proof(without, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
+    expect(v.why).toEqual("the release is not in the log (its inclusion proof does not verify)");
+    // The head signed by a release key, not a log key.
+    expect(verify_release(roots(), rs[1], proof(rs, 1, [seed("r1")]), "x86_64", fake_hash("bin2"), "", "").why).toEqual("the log's tree head is signed by 0 of the 1 log keys it needs");
+    // A proof claiming another size or index: the path no longer leads to the root.
+    List(List(Int)) hs = leaves_of(rs, 0, []);
+    Str wrong = proof_text(4, tree_root(hs), sign_all([seed("l1")], sth_body(4, tree_root(hs)), 0, []), 3, inclusion_path(1, hs), []);
+    expect(verify_release(roots(), rs[1], wrong, "x86_64", fake_hash("bin2"), "", "").why).toEqual("the release is not in the log (its inclusion proof does not verify)");
+    Str wrong2 = proof_text(3, tree_root(hs), sign_all([seed("l1")], sth_body(3, tree_root(hs)), 0, []), 0, inclusion_path(1, hs), []);
+    expect(verify_release(roots(), rs[1], wrong2, "x86_64", fake_hash("bin2"), "", "").why).toEqual("the release is not in the log (its inclusion proof does not verify)");
+    // A tampered path element.
+    Str good = proof(rs, 1, [seed("l1")]);
+    List(List(Int)) p = inclusion_path(1, hs);
+    Str bent = str_replace(good, "path " + hex_encode(p[0]), "path " + hex_encode(flip(p[0])));
+    expect(verify_release(roots(), rs[1], bent, "x86_64", fake_hash("bin2"), "", "").why).toEqual("the release is not in the log (its inclusion proof does not verify)");
+    // The head's root changed after signing.
+    Str moved = str_replace(good, "root " + hex_encode(tree_root(hs)), "root " + hex_encode(flip(tree_root(hs))));
+    expect(verify_release(roots(), rs[1], moved, "x86_64", fake_hash("bin2"), "", "").why).toEqual("the log's tree head is signed by 0 of the 1 log keys it needs");
+}
+
+test "release: tree heads must be consistent with the newest seen" {
+    List(Str) rs = log3();
+    List(Str) two = rs[0..2];
+    Str p2 = proof(two, 1, [seed("l1")]);
+    Str p3 = proof(rs, 1, [seed("l1")]);
+    // First the head of size 2, then the log grew to 3: the newer head is kept.
+    Verdict a = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), "", "");
+    expect(a.ok).toEqual(true);
+    Verdict b = verify_release(roots(), rs[1], p3, "x86_64", fake_hash("bin2"), a.head, a.rel);
+    expect(b.ok).toEqual(true);
+    expect(b.head).toEqual(p3);
+    // Back to the bundled head of size 2: proved by the kept head's consistency proof.
+    Verdict c = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), b.head, b.rel);
+    expect(c.ok).toEqual(true);
+    expect(c.head).toEqual(p3);
+    // A forked log: another third entry, a head of size 3 that differs.
+    List(Str) fork = [rs[0], rs[1], release("0.3.0", 3, "evil", rel_seeds())];
+    Str pf = proof(fork, 1, [seed("l1")]);
+    expect(verify_release(roots(), rs[1], pf, "x86_64", fake_hash("bin2"), b.head, b.rel).why).toEqual("the log's tree head of size 3 differs from the one seen before: the log was forked or rewritten");
+    // A fork that grew past the head seen.
+    List(Str) fork4 = fork.concat([release("0.4.0", 4, "bin4", rel_seeds())]);
+    Str pf4 = proof(fork4, 1, [seed("l1")]);
+    expect(verify_release(roots(), rs[1], pf4, "x86_64", fake_hash("bin2"), b.head, b.rel).why).toEqual("the log's tree head of size 4 is not consistent with the one of size 3 seen before: the log was forked or rewritten");
+    // A rewritten past: a head of size 2 that the kept head does not extend.
+    List(Str) other2 = [release("0.0.9", 1, "old", rel_seeds()), rs[1]];
+    Str po = proof(other2, 1, [seed("l1")]);
+    expect(verify_release(roots(), rs[1], po, "x86_64", fake_hash("bin2"), b.head, b.rel).why).toEqual("the log's tree head of size 2 is not consistent with the one of size 3 seen before: the log was forked or rewritten");
+    // A newer head without the consistency proof from the one seen.
+    List(List(Int)) hs = leaves_of(rs, 0, []);
+    Str bare = proof_text(3, tree_root(hs), sign_all([seed("l1")], sth_body(3, tree_root(hs)), 0, []), 1, inclusion_path(1, hs), []);
+    expect(verify_release(roots(), rs[1], bare, "x86_64", fake_hash("bin2"), a.head, a.rel).why).toEqual("no consistency proof between the log's tree heads of size 2 (seen before) and 3");
+}
+
+test "release: rollback to a lower counter is refused" {
+    List(Str) rs = log3();
+    Verdict v3 = verify_release(roots(), rs[2], proof(rs, 2, [seed("l1")]), "x86_64", fake_hash("bin3"), "", "");
+    expect(v3.ok).toEqual(true);
+    Verdict v2 = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), v3.head, v3.rel);
+    expect(v2.ok).toEqual(false);
+    expect(v2.why).toEqual("rollback: release 0.2.0 (counter 2) is older than release 0.3.0 (counter 3), accepted before");
+    // The same release again is fine.
+    expect(verify_release(roots(), rs[2], proof(rs, 2, [seed("l1")]), "x86_64", fake_hash("bin3"), v3.head, v3.rel).ok).toEqual(true);
+    // Another manifest under the same counter is refused.
+    List(Str) more = rs.concat([release("0.3.1", 3, "bin31", rel_seeds())]);
+    Verdict w = verify_release(roots(), more[3], proof(more, 3, [seed("l1")]), "x86_64", fake_hash("bin31"), v3.head, v3.rel);
+    expect(w.why).toEqual("release 0.3.1 has counter 3, as release 0.3.0 accepted before, with another manifest");
+    // A newer one moves the record forward.
+    List(Str) next = rs.concat([release("0.4.0", 4, "bin4", rel_seeds())]);
+    Verdict v4 = verify_release(roots(), next[3], proof(next, 3, [seed("l1")]), "x86_64", fake_hash("bin4"), v3.head, v3.rel);
+    expect(v4.ok).toEqual(true);
+    expect(str_starts_with(v4.rel, "counter 4\n")).toEqual(true);
+}
+
+test "release: roots" {
+    expect(parse_roots(roots()).err).toEqual("");
+    expect(parse_roots(roots()).rel_k).toEqual(2);
+    expect(parse_roots("").err).toEqual("no release keys");
+    // A threshold above the number of keys, or a key twice.
+    List(List(Int)) r = pubs(rel_seeds(), 0, []);
+    expect(parse_roots(roots_text(r, 4, pubs(log_seeds(), 0, []), 1)).err).toEqual("malformed release roots");
+    expect(parse_roots(roots_text(r, 0, pubs(log_seeds(), 0, []), 1)).err).toEqual("malformed release roots");
+    expect(parse_roots(roots_text(r.concat([r[0]]), 2, pubs(log_seeds(), 0, []), 1)).err).toEqual("malformed release roots");
+    expect(parse_roots(roots_text(r, 2, [r[0]], 1)).err).toEqual("malformed release roots");
+    expect(verify_release("", "", "", "x86_64", "", "", "").why).toEqual("no release keys");
+}
+
+test "release: the code image drops the provenance trailer" {
+    List(Int) code = [1, 2, 3, 4, 5];
+    List(Int) cose = [9, 9, 9];
+    List(Int) bin = code.concat(cose).concat([0, 0, 0, 3]).concat(bytes_of("RESIDPROV2"));
+    expect(hex_encode(code_image(bin))).toEqual(hex_encode(code));
+    expect(hex_encode(code_image(code))).toEqual(hex_encode(code));
+    // A length past the start leaves the bytes unchanged.
+    List(Int) odd = [1].concat([0, 0, 0, 200]).concat(bytes_of("RESIDPROV2"));
+    expect(odd.len() == code_image(odd).len()).toEqual(true);
+}

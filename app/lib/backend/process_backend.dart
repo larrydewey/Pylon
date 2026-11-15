@@ -7,6 +7,12 @@ import '../term/screen.dart';
 import 'frames.dart';
 import 'model.dart';
 
+/// Whether this build pushes pylond without its release check (SPEC 8.2):
+/// only a developer build, `--dart-define=PYLON_UNVERIFIED_PYLOND=true`.
+/// Otherwise pylon refuses a pylond that is not a signed, logged release
+/// at least as new as the newest it has accepted.
+const unverifiedPylond = bool.fromEnvironment('PYLON_UNVERIFIED_PYLOND');
+
 /// The real backend: the Resid core as processes. Per terminal, `pylon
 /// --app` holds the connection (keys from the agent at SSH_AUTH_SOCK,
 /// Symbolon's) and `pylon-term` (confined) turns the host's output into
@@ -35,7 +41,8 @@ class ProcessBackend implements Backend {
 
   final String pylonPath, termPath;
 
-  /// A pylond binary, or a directory of pylond-x86_64 / pylond-aarch64.
+  /// A pylond binary, or a directory of pylond-x86_64 / pylond-aarch64,
+  /// with the signed release beside them (pylond.release, pylond.proof).
   final String pylondPath;
 
   /// PYLON_HOME: pins, CAs, pin history, and this app's host list.
@@ -120,7 +127,7 @@ class _ProcSession extends Session {
     changed();
     try {
       _term = await Process.start(b.termPath, ['$rows', '$cols']);
-      final args = ['--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (host.mode == Mode.pylon) ...['--pylond', b.pylondPath], host.target];
+      final args = ['--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (host.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', b.pylondPath], host.target];
       _conn = await Process.start(b.pylonPath, args, environment: b._env);
     } catch (e) {
       status = 'Cannot start the Pylon core: $e';
