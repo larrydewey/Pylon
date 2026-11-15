@@ -12,14 +12,21 @@
 // other datagram is dropped without a reply. It exits after --idle
 // seconds without an authenticated packet (default 600).
 //
-// Not yet (SPEC 8.4, 10): Landlock and seccomp confinement, pseudo-
-// terminal sessions, rekeying, re-attach.
+// A SHELL request starts the principal's login shell ($SHELL -l, with
+// TERM=xterm-256color) on a new pseudo-terminal; its output and input
+// travel on the request's stream, a RESIZE sets its size, and its exit code
+// ends the stream. pylond keeps running while a terminal does, within the
+// idle limit for the link.
+//
+// Not yet (SPEC 8.4, 10): Landlock and seccomp confinement, rekeying,
+// re-attach from a new client.
 
 import "crypto.resid";
 import "../core/wire.resid";
 import "../core/cipher.resid";
 import "../core/proto.resid";
 import "../core/link.resid";
+import "../core/term.resid";
 
 @requires(network)
 List(Int) read_stdin(Int n, List(Int) acc) {
@@ -27,6 +34,16 @@ List(Int) read_stdin(Int n, List(Int) acc) {
     List(Int) more = resid_read_some(n - acc.len());
     if (more.len() == 0) { return acc; }
     return read_stdin(n, acc.concat(more));
+}
+
+// The principal's shell: $SHELL when it is an absolute path of plain
+// characters (it is split on spaces to run, never given to a shell),
+// else /bin/sh.
+@requires(environment)
+Str login_shell() {
+    Str sh = environment.get("SHELL");
+    Bool plain = str_starts_with(sh, "/") && !str_contains(sh, " ") && str_len(sh) < 256;
+    return if (plain) { sh } else { "/bin/sh" };
 }
 
 // The server's address on the SSH connection, from SSH_CONNECTION
@@ -37,7 +54,20 @@ Str server_addr() {
     return if (p.len() == 4) { p[2] } else { "" };
 }
 
-type Srv = { Boot b; Static s; List(Int) mk; Bool linked; Link l; List(Int) last_stamp; Int idle_ns; Int started; };
+// A terminal: its stream, the pseudo-terminal's master, the shell's pid,
+// and the screen as the emulator sees it (kept to repaint a client that
+// re-attaches; replies and clipboard requests are the client's to answer).
+type Tty = { Int sid; Int fd; Int pid; Term t; };
+
+type Srv = { Boot b; Static s; List(Int) mk; Bool linked; Link l; List(Int) last_stamp; Int idle_ns; Int started; List(Tty) ttys; Str shell; };
+
+Srv with_link(Srv v, Link l) {
+    return Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = v.linked, .l = l, .last_stamp = v.last_stamp, .idle_ns = v.idle_ns, .started = v.started, .ttys = v.ttys, .shell = v.shell};
+}
+
+Srv with_ttys(Srv v, Link l, List(Tty) ts) {
+    return Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = v.linked, .l = l, .last_stamp = v.last_stamp, .idle_ns = v.idle_ns, .started = v.started, .ttys = ts, .shell = v.shell};
+}
 
 // Is stamp a newer than b (big-endian, same length)?
 Bool newer(List(Int) a, List(Int) b, Int i) {
@@ -60,30 +90,107 @@ Srv handshakes(Srv v, List(List(Int)) others, Int i, Int now) {
     Int port = d[4] * 256 + d[5];
     _ = resid_udp_send_to(v.l.udp, d[0..4], port, a.resp);
     // A new handshake replaces the keys; the streams carry on.
-    Link fresh = link_new(true, v.l.udp, d[0..4], port, a.keys, now);
-    Link l2 = Link {.server = true, .udp = fresh.udp, .addr = fresh.addr, .port = fresh.port, .k = fresh.k, .tx_ctr = 0, .win = fresh.win,
-        .streams = v.l.streams, .next_sid = v.l.next_sid, .last_rx = now, .last_tx = now, .err = ""};
-    return handshakes(Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = true, .l = l2, .last_stamp = a.stamp, .idle_ns = v.idle_ns, .started = v.started}, others, i + 1, now);
+    Link l2 = link_rekeyed(v.l, d[0..4], port, a.keys, now);
+    return handshakes(Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = true, .l = l2, .last_stamp = a.stamp, .idle_ns = v.idle_ns, .started = v.started, .ttys = v.ttys, .shell = v.shell}, others, i + 1, now);
 }
 
-@requires(network, declassify, clock(readonly))
+@requires(network, declassify, clock(readonly), process)
 Int serve_loop(Srv v) {
     Int now = clock.monotonic_ns();
     Int since = if (v.linked) { v.l.last_rx } else { v.started };
-    if (now - since > v.idle_ns) { return 0; }
+    if (now - since > v.idle_ns) { return hang_up(v.ttys, 0); }
     List(Int) sfds = stream_fds(v.l.streams, 0, []);
-    List(Int) fds = [v.l.udp].concat(sfds);
+    List(Int) tfds = tty_fds(v.ttys, 0, []);
+    List(Int) fds = [v.l.udp].concat(sfds).concat(tfds);
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
     Drained g = drain(v.l, now, 64, []);
-    Srv v1 = Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = v.linked, .l = g.l, .last_stamp = v.last_stamp, .idle_ns = v.idle_ns, .started = v.started};
-    Srv v2 = handshakes(v1, g.other, 0, now);
-    Link l3 = if (v2.linked) { retransmit(read_streams(v2.l, sfds, ready, 1, 0, now), 0, now) } else { v2.l };
-    return serve_loop(Srv {.b = v2.b, .s = v2.s, .mk = v2.mk, .linked = v2.linked, .l = l3, .last_stamp = v2.last_stamp, .idle_ns = v2.idle_ns, .started = v2.started});
+    Srv v2 = handshakes(with_link(v, g.l), g.other, 0, now);
+    if (!v2.linked) { return serve_loop(v2); }
+    Srv v3 = on_events(v2, now);
+    Link l3 = retransmit(read_streams(v3.l, sfds, ready, 1, 0, now), 0, now);
+    Srv v4 = tty_io(with_link(v3, l3), ready, 1 + sfds.len(), 0, now);
+    return serve_loop(with_link(v4, keepalive(v4.l, now)));
+}
+
+// Terminals asked for, and resizes.
+@requires(network, declassify, process)
+Srv on_events(Srv v, Int now) {
+    Ev e = events(v.l);
+    Srv a = start_ttys(with_link(v, events_taken(v.l)), e.shells, 0, now);
+    return with_ttys(a, a.l, resize_ttys(a.ttys, e.resizes, 0));
+}
+
+@requires(network, declassify, process)
+Srv start_ttys(Srv v, List(List(Int)) req, Int i, Int now) {
+    if (i >= req.len()) { return v; }
+    List(Int) p = resid_pty_spawn("env TERM=xterm-256color " + v.shell + " -l", req[i][1], req[i][2]);
+    Tty t = Tty {.sid = req[i][0], .fd = if (p.len() == 2) { p[0] } else { -1 }, .pid = if (p.len() == 2) { p[1] } else { -1 }, .t = term_new(req[i][1], req[i][2])};
+    Srv n = if (p.len() == 2) { with_ttys(v, v.l, v.ttys.concat([t])) } else { with_link(v, refuse(v.l, req[i][0], now)) };
+    return start_ttys(n, req, i + 1, now);
+}
+
+@requires(process)
+List(Tty) resize_ttys(List(Tty) ts, List(List(Int)) rs, Int i) {
+    if (i >= rs.len()) { return ts; }
+    Int k = tty_of(ts, rs[i][0], 0);
+    _ = if (k >= 0) { resid_pty_resize(ts[k].fd, rs[i][1], rs[i][2]) } else { false };
+    List(Tty) n = if (k >= 0) { ts[0..k].concat([Tty {.sid = ts[k].sid, .fd = ts[k].fd, .pid = ts[k].pid, .t = term_resize(ts[k].t, rs[i][1], rs[i][2])}]).concat(ts[k + 1..ts.len()]) } else { ts };
+    return resize_ttys(n, rs, i + 1);
+}
+
+Int tty_of(List(Tty) ts, Int sid, Int i) {
+    if (i >= ts.len()) { return -1; }
+    if (ts[i].sid == sid) { return i; }
+    return tty_of(ts, sid, i + 1);
+}
+
+// Masters to poll: those whose stream has room.
+List(Int) tty_fds(List(Tty) ts, Int i, List(Int) acc) {
+    if (i >= ts.len()) { return acc; }
+    return tty_fds(ts, i + 1, acc.concat([ts[i].fd]));
+}
+
+// Each terminal: its output into the stream (or, once the shell has
+// exited and its output is drained, the stream's end with the exit code);
+// the stream's inbox into the terminal. A terminal whose stream the client
+// reset is hung up.
+@requires(network, declassify, process)
+Srv tty_io(Srv v, List(Int) ready, Int at, Int i, Int now) {
+    if (i >= v.ttys.len()) { return v; }
+    Tty t = v.ttys[i];
+    if (!open_sid(v.l, t.sid)) {
+        _ = resid_pty_close(t.fd);
+        _ = resid_pty_wait(t.pid);
+        return tty_io(with_ttys(v, v.l, v.ttys[0..i].concat(v.ttys[i + 1..v.ttys.len()])), ready, at, i, now);
+    }
+    Bool r = at + i < ready.len() && (ready[at + i] & 9) != 0;
+    Int rm = room(v.l, t.sid);
+    List(Int) out = if (r && rm > 0) { resid_pty_read(t.fd, if (rm < 16384) { rm } else { 16384 }) } else { [] };
+    Link l1 = push_bytes(v.l, t.sid, out, now);
+    Int code = if (r && out.len() == 0) { resid_pty_wait(t.pid) } else { -1 };
+    List(Int) in = inbox(l1, t.sid);
+    Int took = if (in.len() > 0) { resid_pty_write(t.fd, in) } else { 0 };
+    Link l2 = take_inbox(l1, t.sid, took);
+    if (code >= 0) {
+        _ = resid_pty_close(t.fd);
+        Link l3 = push_eof(l2, t.sid, code, now);
+        return tty_io(with_ttys(v, l3, v.ttys[0..i].concat(v.ttys[i + 1..v.ttys.len()])), ready, at, i + 1, now);
+    }
+    Tty t2 = Tty {.sid = t.sid, .fd = t.fd, .pid = t.pid, .t = if (out.len() > 0) { taken(term_feed(t.t, out)) } else { t.t }};
+    return tty_io(with_ttys(v, l2, v.ttys[0..i].concat([t2]).concat(v.ttys[i + 1..v.ttys.len()])), ready, at, i + 1, now);
+}
+
+// Every terminal hung up (pylond is exiting).
+@requires(process)
+Int hang_up(List(Tty) ts, Int i) {
+    if (i >= ts.len()) { return 0; }
+    _ = resid_pty_close(ts[i].fd);
+    return hang_up(ts, i + 1);
 }
 
 List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
 
-@requires(args, network, environment, declassify, clock(readonly))
+@requires(args, network, environment, declassify, clock(readonly), process)
 Int main() {
     if (args.count() < 2 || args.get(1) != "serve") { eprintln("usage: pylond serve [--idle SECONDS]"); return 2; }
     Int idle = if (args.count() == 4 && args.get(2) == "--idle" && str_is_int(args.get(3))) { str_parse_int(args.get(3)) } else { 600 };
@@ -101,6 +208,7 @@ Int main() {
     SessionKeys k0 = SessionKeys {.ok = false, .tx = none, .rx = none, .my_idx = -1, .their_idx = 0};
     Int now = clock.monotonic_ns();
     Srv v = Srv {.b = served.boot, .s = s, .mk = mac1_key(served.boot.s_pub, served.boot.psk), .linked = false,
-        .l = link_new(true, udp, [0, 0, 0, 0], 0, k0, now), .last_stamp = [], .idle_ns = idle * 1000000000, .started = now};
+        .l = link_new(true, udp, [0, 0, 0, 0], 0, k0, now), .last_stamp = [], .idle_ns = idle * 1000000000, .started = now,
+        .ttys = [], .shell = login_shell()};
     return serve_loop(v);
 }

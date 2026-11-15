@@ -1,0 +1,112 @@
+// The terminal emulator core (core/term.resid).
+
+import "crypto.resid";
+import "../core/term.resid";
+
+Term fed(Int rows, Int cols, Str s) { return term_feed(term_new(rows, cols), bytes_of(s)); }
+
+test "text, newline, carriage return, wrap" {
+    Term t = fed(3, 5, "ab\r\ncdefgh");
+    List(Str) s = screen_text(t);
+    expect(s[0]).toEqual("ab");
+    expect(s[1]).toEqual("cdefg");
+    expect(s[2]).toEqual("h");
+    expect(t.c.x).toEqual(1);
+}
+
+test "cursor movement and erase" {
+    Term t = fed(3, 10, "hello\x1b[1;3HX\x1b[2;1Hworld\x1b[1D\x1b[K");
+    List(Str) s = screen_text(t);
+    expect(s[0]).toEqual("heXlo");
+    expect(s[1]).toEqual("worl");
+}
+
+test "scrolling feeds the scrollback; ED 2 and 3" {
+    Term t = fed(2, 4, "1\r\n2\r\n3\r\n4");
+    expect(t.sb.len()).toEqual(2);
+    expect(row_text(t.sb[0])).toEqual("1   ");
+    expect(screen_text(t)[1]).toEqual("4");
+    Term u = term_feed(t, bytes_of("\x1b[2J\x1b[3J"));
+    expect(screen_text(u)[0]).toEqual("");
+    expect(u.sb.len()).toEqual(0);
+}
+
+test "scroll region, insert and delete lines" {
+    Term t = fed(4, 3, "a\r\nb\r\nc\r\nd\x1b[2;3r\x1b[2;1H\x1b[L");
+    expect(screen_text(t)).toEqual(["a", "", "b", "d"]);
+    Term u = term_feed(t, bytes_of("\x1b[M"));
+    expect(screen_text(u)).toEqual(["a", "b", "", "d"]);
+}
+
+test "SGR colours and attributes" {
+    Term t = fed(1, 5, "\x1b[1;31mA\x1b[0;38;5;200;48;2;255;0;0mB\x1b[mC");
+    Int a = cell_attr(t.scr[0][0]);
+    Int b = cell_attr(t.scr[0][1]);
+    expect(attr_fg(a)).toEqual(1);
+    expect((a >> 18) & 1).toEqual(1);
+    expect(attr_fg(b)).toEqual(200);
+    expect(attr_bg(b)).toEqual(196);
+    expect(cell_attr(t.scr[0][2])).toEqual(attr_default());
+}
+
+test "UTF-8, wide characters, invalid bytes" {
+    Term t = term_feed(term_new(1, 6), [195, 169, 228, 184, 173, 255, 33]);
+    expect(cell_ch(t.scr[0][0])).toEqual(233);
+    expect(cell_ch(t.scr[0][1])).toEqual(20013);
+    expect(cell_ch(t.scr[0][2])).toEqual(0);
+    expect(cell_ch(t.scr[0][3])).toEqual(65533);
+    expect(cell_ch(t.scr[0][4])).toEqual(33);
+}
+
+test "alternate screen keeps the main screen" {
+    Term t = fed(2, 5, "main\x1b[?1049h\x1b[HALT");
+    expect(screen_text(t)[0]).toEqual("ALT");
+    Term u = term_feed(t, bytes_of("\x1b[?1049l"));
+    expect(screen_text(u)[0]).toEqual("main");
+}
+
+test "replies are fixed-format only; title is kept, never echoed" {
+    Term t = fed(3, 10, "\x1b[2;4H\x1b[6n\x1b]2;my\x07title\x1b\\\x1b[21t\x1bP$qm\x1b\\");
+    expect(ascii_text_of(t.replies)).toEqual("\x1b[2;4R");
+    expect(t.title).toEqual("my");
+}
+
+test "OSC 52 writes are queued, reads ignored, overlong strings dropped" {
+    Term t = fed(1, 10, "\x1b]52;c;aGk=\x07\x1b]52;c;?\x07");
+    expect(t.clip.len()).toEqual(1);
+    expect(ascii_text_of(t.clip[0])).toEqual("aGk=");
+}
+
+test "bounded parameters and aborted sequences" {
+    Term t = fed(2, 10, "\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18mX\x1b[99999999999999;1HY\x1b[5\x18Z");
+    List(Str) s = screen_text(t);
+    expect(str_contains(s[0] + s[1], "X")).toEqual(true);
+    expect(str_contains(s[0] + s[1], "Z")).toEqual(true);
+}
+
+test "line drawing charset" {
+    Term t = fed(1, 4, "\x1b(0lqk\x1b(Bq");
+    expect(cell_ch(t.scr[0][0])).toEqual(9484);
+    expect(cell_ch(t.scr[0][1])).toEqual(9472);
+    expect(cell_ch(t.scr[0][3])).toEqual(113);
+}
+
+test "repaint reproduces the screen on a fresh terminal" {
+    Term t = term_feed(term_new(3, 8), bytes_of("\x1b[1;32mgreen\x1b[0m\r\nplain ").concat([228, 184, 173]).concat(bytes_of("\r\n\x1b[7minv\x1b[2;3H")));
+    Term u = term_feed(term_new(3, 8), repaint(t, 0));
+    expect(screen_text(u)).toEqual(screen_text(t));
+    expect(u.scr).toEqual(t.scr);
+    expect(u.c.x).toEqual(t.c.x);
+    expect(u.c.y).toEqual(t.c.y);
+}
+
+test "resize keeps the cursor inside" {
+    Term t = term_resize(fed(4, 10, "a\r\nb\r\nc\r\nd"), 2, 3);
+    expect(t.rows).toEqual(2);
+    expect(screen_text(t)).toEqual(["c", "d"]);
+    expect(t.c.y).toEqual(1);
+    expect(t.sb.len()).toEqual(2);
+}
+
+Str ascii_text_of(List(Int) b) { return at_acc(b, 0, ""); }
+Str at_acc(List(Int) b, Int i, Str acc) { if (i >= b.len()) { return acc; } return at_acc(b, i + 1, acc + str_from_code(b[i])); }

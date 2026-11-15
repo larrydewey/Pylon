@@ -247,7 +247,7 @@ pub Chan send_eof(Chan ch) {
 // Chaff is SSH2_MSG_PING when the server supports ping@openssh.com (its
 // PONG then looks like an echo), else SSH_MSG_IGNORE.
 
-Int tick_ns() { return 20000000; }
+pub Int tick_ns() { return 20000000; }
 Int msg_ping() { return 192; }
 
 // on: obfuscating. next: the next tick. until: chaff stops then.
@@ -265,7 +265,7 @@ List(Int) chaff(Conn c) {
 
 // Milliseconds to wait in poll: until the next tick while the clock runs,
 // else half a second (to notice terminal resizes).
-Int wait_ms(Keys k, Int now) {
+pub Int wait_ms(Keys k, Int now) {
     Bool running = k.on && (k.pending.len() > 0 || now < k.until);
     if (!running) { return 500; }
     Int ns = k.next - now;

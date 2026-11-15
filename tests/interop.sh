@@ -249,6 +249,12 @@ except socket.timeout:
         bash -c "curl -s -m 60 http://127.0.0.1:$L3/big.bin | sha256sum"
     check "pylon protocol: the client did change sockets" 0 "moved to a new UDP socket" cat pr.log
     kill $PR $WEB2 2>/dev/null; wait $PR $WEB2 2>/dev/null
+    check "pylon protocol: a terminal (type, resize, paste, exit status)" 0 "interactive ok" \
+        python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+    check "pylon protocol: a terminal that roams mid-session" 0 "interactive ok" \
+        env PYLON_TEST_REBIND_AFTER=60 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+    check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
+        "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
     pkill -f "pylond-.* serve" 2>/dev/null
 else
     echo "skip pylon protocol (no $PYLOND)"

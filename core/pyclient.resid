@@ -107,9 +107,8 @@ pub Link rebind(Link l) {
     Int u = resid_udp_open();
     if (u < 0) { return l; }
     _ = resid_tcp_close(l.udp);
-    eprintln("pylon: moved to a new UDP socket (test hook)");
-    return Link {.server = l.server, .udp = u, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err};
+    eprintln("pylon: moved to a new UDP socket (test hook)\r");
+    return link_moved(l, u);
 }
 
 List(Int) listen_fds(List(Fwd) fs, Int i, List(Int) acc) {
@@ -135,4 +134,71 @@ pub List(Fwd) listen_local(List(Fwd) fs, Int i, List(Fwd) acc) {
     Int l = resid_tcp_listen(fs[i].lport);
     if (l < 0) { return []; }
     return listen_local(fs, i + 1, acc.concat([Fwd {.kind = 0, .lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l}]));
+}
+
+// ============================================================================
+// A terminal over the Pylon protocol
+// ============================================================================
+
+// The interactive loop for the terminal on stream `sid`, with any -L
+// forwards beside it. Keystrokes are batched on 20 ms ticks with chaff of
+// the same sealed size as a one-key frame, as over SSH (SPEC 5, 9.4); the
+// terminal's size is checked every pass and sent when it changed. Returns
+// the shell's exit code (255 when the stream was reset).
+pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; };
+
+@requires(network, declassify, terminal, clock(readonly))
+pub Int pylon_shell(Sh h, List(Fwd) fs) {
+    if (str_len(h.l.err) > 0) { return 255; }
+    Int now = clock.monotonic_ns();
+    // The peer's bytes to the screen, then its end.
+    List(Int) show = inbox(h.l, h.sid);
+    _ = if (show.len() > 0) { print_bytes(show) } else { true };
+    Ev e = events(h.l);
+    Int code = exit_of(e.exits, h.sid, 0);
+    if (code != -2) { return if (code >= 0) { code } else { 255 }; }
+    if (!open_sid(h.l, h.sid)) { return 255; }
+    Link l0 = events_taken(take_inbox(h.l, h.sid, show.len()));
+    List(Int) lfd = listen_fds(fs, 0, []);
+    List(Int) sfds = stream_fds(l0.streams, 0, []);
+    List(Int) kb = if (h.in_eof) { [] } else { [0] };
+    List(Int) fds = [l0.udp].concat(kb).concat(lfd).concat(sfds);
+    List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), wait_ms(h.k, now));
+    Int t = clock.monotonic_ns();
+    Drained g = drain(l0, t, 64, []);
+    Bool key = !h.in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
+    Int rm = room(g.l, h.sid);
+    List(Int) got = if (key && rm > 0) { resid_read_some(if (rm < 4096) { rm } else { 4096 }) } else { [] };
+    Bool now_eof = h.in_eof || (key && rm > 0 && got.len() == 0);
+    // Keys: at once, or on the next tick.
+    Link l1 = if (!h.k.on && got.len() > 0) { push_bytes(g.l, h.sid, got, t) } else { g.l };
+    Bool idle = h.k.pending.len() == 0 && t >= h.k.until;
+    Keys k1 = if (h.k.on && got.len() > 0) {
+        Keys {.on = true, .next = if (idle) { t + tick_ns() } else { h.k.next }, .until = t + 1000000000 + (random_bytes(1)[0] * 4000000), .pending = h.k.pending.concat(got)}
+    } else { h.k };
+    Bool due = k1.on && (k1.pending.len() > 0 || t < k1.until) && t >= k1.next;
+    Link l2 = if (due && k1.pending.len() > 0) { push_bytes(l1, h.sid, k1.pending, t) } else {
+        if (due) { send_frame(l1, [6].concat(random_bytes(13)), t) } else { l1 } };
+    Int nxt = if (t - k1.next > 5 * tick_ns()) { t + tick_ns() } else { k1.next + tick_ns() };
+    Keys k2 = if (due) { Keys {.on = true, .next = nxt, .until = k1.until, .pending = []} } else { k1 };
+    Link l3 = if (now_eof && !h.in_eof) { push_eof(push_bytes(l2, h.sid, k2.pending, t), h.sid, -1, t) } else { l2 };
+    Keys k3 = if (now_eof && !h.in_eof) { keys_new(false) } else { k2 };
+    // Forwards beside the terminal.
+    Int at = 1 + kb.len();
+    Link l4 = retransmit(read_streams(accept_into(l3, fs, ready, at, 0, t), sfds, ready, at + fs.len(), 0, t), 0, t);
+    Int nc = resid_term_cols();
+    Int nr = resid_term_rows();
+    Bool changed = nc > 0 && nr > 0 && (nc != h.cols || nr != h.rows);
+    Link l5 = keepalive(if (changed) { resize(l4, h.sid, nr, nc, t) } else { l4 }, t);
+    Bool move = h.rebind > 0 && l5.tx_ctr >= h.rebind;
+    Link l6 = if (move) { rebind(l5) } else { l5 };
+    return pylon_shell(Sh {.l = l6, .sid = h.sid, .rows = if (changed) { nr } else { h.rows }, .cols = if (changed) { nc } else { h.cols },
+        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }}, fs);
+}
+
+// The exit code reported for sid: -2 when none, -1 when the stream was reset.
+Int exit_of(List(List(Int)) xs, Int sid, Int i) {
+    if (i >= xs.len()) { return -2; }
+    if (xs[i][0] == sid) { return xs[i][1]; }
+    return exit_of(xs, sid, i + 1);
 }

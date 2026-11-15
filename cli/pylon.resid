@@ -59,6 +59,8 @@ Int usage() {
     eprintln("                       [-R [localhost:]RPORT:HOST:HOSTPORT] ... USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
+    eprintln("       pylon --pylond FILE [-N -L ...] USER@HOST   a terminal or -L forwards over the");
+    eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
     return 2;
@@ -117,7 +119,8 @@ Int cmd_run(Opts o, Int via) {
     Str command = if (interactive) { "" } else { str_join(o.rest[1..o.rest.len()], " ") };
     Authed a = login(user, host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
-    if (o.no_cmd && str_len(o.pylond) > 0) { return run_pylon(a.c, host, fs, o.pylond); }
+    if (str_len(o.pylond) > 0 && !o.no_cmd && !interactive) { _ = disconnect(a.c, "done"); eprintln("pylon: --pylond runs a terminal or -N forwards, not a COMMAND"); return 2; }
+    if (str_len(o.pylond) > 0) { return run_pylon(a.c, host, fs, o.pylond, interactive, !o.no_obfuscate); }
     if (o.no_cmd) { return run_forwards(a.c, fs); }
     Chan ch = open_session(a.c);
     if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
@@ -202,12 +205,12 @@ Int cmd_put(Opts o, Int via) {
     return 0;
 }
 
-// -N -L ... --pylond FILE: the forwards over the Pylon protocol
-// (EXPERIMENTAL, SPEC 9). FILE is the pylond binary, delivered over the
-// verified SSH connection and checked by its hash on the host; the SSH
-// connection closes once pylond has answered the bootstrap.
-@requires(network, filesystem, environment, declassify, clock)
-Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path) {
+// --pylond FILE: a terminal (no -N), or -N -L forwards, over the Pylon
+// protocol (EXPERIMENTAL, SPEC 9). FILE is the pylond binary, delivered
+// over the verified SSH connection and checked by its hash on the host;
+// the SSH connection closes once pylond has answered the bootstrap.
+@requires(network, filesystem, environment, declassify, clock, terminal)
+Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell, Bool obfuscate) {
     List(Int) addr = ipv4(host);
     if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return 2; }
     if (!only_local(fs, 0)) { eprintln("pylon: the Pylon protocol (v1) carries -L forwards only"); return 2; }
@@ -227,7 +230,18 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path) {
     eprintln("pylon: Pylon protocol session to " + host + ":" + f"{st.b.port}" + " (experimental); SSH closed");
     _ = announce(ls, 0);
     Str rb = environment.get("PYLON_TEST_REBIND_AFTER");
-    Link done = pylon_forwards(link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns()), ls, if (str_is_int(rb)) { str_parse_int(rb) } else { 0 });
+    Int rebind_after = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 };
+    Link l0 = link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns());
+    if (shell) {
+        Int cols = resid_term_cols();
+        Int rows = resid_term_rows();
+        Link l1 = open_shell(l0, rows, cols, clock.monotonic_ns());
+        _ = resid_term_raw();
+        Int code = pylon_shell(Sh {.l = l1, .sid = l0.next_sid, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after}, ls);
+        _ = resid_term_restore();
+        return code;
+    }
+    Link done = pylon_forwards(l0, ls, rebind_after);
     eprintln("pylon: " + done.err);
     return 1;
 }

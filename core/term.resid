@@ -1,0 +1,766 @@
+// The terminal emulator core (SPEC 10.1, 12): a VT/xterm-compatible
+// parser and screen model, shared by pylond (screen state for re-attach)
+// and the apps (what is drawn). Host output is assumed hostile (A2):
+//
+//   - The parser is a total state machine over bytes (after Williams' DEC
+//     parser): every byte in every state has a defined transition, and
+//     every buffer is bounded (16 parameters up to 65535, intermediates up
+//     to 2 bytes, OSC strings up to 64 KiB, DCS/SOS/PM/APC discarded).
+//   - No read-back (SPEC 12): the only replies are fixed-format ones
+//     (device attributes, status, cursor position). Title, colour, font
+//     and DECRQSS queries are not answered, so nothing the host wrote can
+//     come back as input.
+//   - OSC 52 clipboard writes are queued for the program to grant per
+//     host; clipboard reads are not implemented.
+//   - OSC 8 hyperlinks are not made clickable in v1 (the text stays as
+//     written), so no link can hide its target.
+//
+// Not in v1: reflow on resize, the G1 charset, custom tab stops, images.
+//
+// A cell is one Int: the code point in bits 0-20 (0 for the right half of
+// a wide character) and the attributes from bit 21: foreground in 0-8
+// (256 = default), background in 9-17, then bold, dim, italic, underline,
+// blink, inverse, hidden, strike.
+
+import "crypto.resid";
+
+pub Int attr_default() { return 256 | (256 << 9); }
+Int a_bold() { return 1 << 18; }
+Int a_dim() { return 1 << 19; }
+Int a_italic() { return 1 << 20; }
+Int a_under() { return 1 << 21; }
+Int a_blink() { return 1 << 22; }
+Int a_inverse() { return 1 << 23; }
+Int a_hidden() { return 1 << 24; }
+Int a_strike() { return 1 << 25; }
+
+pub Int cell(Int ch, Int attr) { return ch | (attr << 21); }
+pub Int cell_ch(Int c) { return c & 2097151; }
+pub Int cell_attr(Int c) { return c >> 21; }
+pub Int attr_fg(Int a) { return a & 511; }
+pub Int attr_bg(Int a) { return (a >> 9) & 511; }
+
+// Modes (bits of Term.modes).
+pub Int m_autowrap() { return 1; }
+pub Int m_cursor() { return 2; }
+pub Int m_paste() { return 4; }
+pub Int m_appcursor() { return 8; }
+pub Int m_origin() { return 16; }
+pub Int m_insert() { return 32; }
+pub Int m_graphics() { return 64; }   // G0 is DEC special graphics (line drawing)
+
+// Parser states.
+Int s_ground() { return 0; }
+Int s_esc() { return 1; }
+Int s_csi() { return 2; }
+Int s_osc() { return 3; }
+Int s_str() { return 4; }      // DCS, SOS, PM, APC: discarded up to ST
+Int s_esc_inter() { return 5; }
+Int s_csi_ignore() { return 6; }
+Int s_osc_esc() { return 7; }  // ESC inside OSC (ST is ESC \)
+Int s_str_esc() { return 8; }
+
+// The cursor: position, pen, a wrap waiting for the next character.
+pub type Cur = { Int x; Int y; Int attr; Bool wrap; };
+
+// The parser: state, parameters (the one being read is `cur`, -1 when
+// empty), intermediates, whether the CSI was private ('?', '>' or '='),
+// an OSC string, and a UTF-8 sequence in progress.
+pub type Par = { Int st; List(Int) ps; Int cur; List(Int) inter; Int priv; List(Int) osc; Int need; Int cp; };
+
+pub type Term = {
+    Int rows; Int cols; List(List(Int)) scr; Int top; Int bot; Cur c; Cur saved; Int modes;
+    Bool alt; List(List(Int)) prim; Cur main_cur; Par p;
+    List(List(Int)) sb; Str title; List(Int) replies; List(List(Int)) clip; Int bell; Int last;
+};
+
+Int sb_max() { return 5000; }
+
+pub Term term_new(Int rows0, Int cols0) {
+    Int rows = clamp(rows0, 1, 1000);
+    Int cols = clamp(cols0, 1, 1000);
+    Cur c0 = Cur {.x = 0, .y = 0, .attr = attr_default(), .wrap = false};
+    return Term {.rows = rows, .cols = cols, .scr = blank_screen(rows, cols, attr_default()), .top = 0, .bot = rows - 1, .c = c0, .saved = c0,
+        .modes = m_autowrap() | m_cursor(), .alt = false, .prim = [], .main_cur = c0, .p = par_new(), .sb = [], .title = "", .replies = [], .clip = [], .bell = 0, .last = 32};
+}
+
+Par par_new() { return Par {.st = 0, .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 0, .cp = 0}; }
+
+pub List(Int) blank_row(Int cols, Int attr) { return fill(cols, cell(32, attr & (511 << 9) | 256), []); }
+
+List(Int) fill(Int n, Int v, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    return fill(n - 1, v, acc.concat([v]));
+}
+
+List(List(Int)) blank_screen(Int rows, Int cols, Int attr) { return blank_rows(rows, blank_row(cols, attr), []); }
+
+List(List(Int)) blank_rows(Int n, List(Int) row, List(List(Int)) acc) {
+    if (n <= 0) { return acc; }
+    return blank_rows(n - 1, row, acc.concat([row]));
+}
+
+// ============================================================================
+// Copies with one part changed
+// ============================================================================
+
+Term t_cur(Term t, Cur c) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_scr(Term t, List(List(Int)) scr, Cur c) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = scr, .top = t.top, .bot = t.bot, .c = c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_par(Term t, Par p) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_out(Term t, Str title, List(Int) reply, List(List(Int)) clip, Int bell) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = title, .replies = reply, .clip = clip, .bell = bell, .last = t.last};
+}
+
+Term t_modes(Term t, Int modes) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = t.saved, .modes = modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_region(Term t, Int top, Int bot) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = top, .bot = bot, .c = t.c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_saved(Term t, Cur s) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = s, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_sb(Term t, List(List(Int)) scr, List(List(Int)) sb) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term t_last(Term t, Int last) {
+    return Term {.rows = t.rows, .cols = t.cols, .scr = t.scr, .top = t.top, .bot = t.bot, .c = t.c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = t.prim, .main_cur = t.main_cur, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = last};
+}
+
+Cur at(Cur c, Int x, Int y) { return Cur {.x = x, .y = y, .attr = c.attr, .wrap = false}; }
+Cur pen(Cur c, Int attr) { return Cur {.x = c.x, .y = c.y, .attr = attr, .wrap = c.wrap}; }
+Cur wrapping(Cur c, Int x) { return Cur {.x = x, .y = c.y, .attr = c.attr, .wrap = true}; }
+
+// What the program takes after each feed: replies for the host, OSC 52
+// payloads (base64, for a per-host grant), bells. Cleared by taken().
+pub Term taken(Term t) { return t_out(t, t.title, [], [], 0); }
+
+// ============================================================================
+// Feeding bytes
+// ============================================================================
+
+pub Term term_feed(Term t, List(Int) b) { return feed_at(t, b, 0); }
+
+Term feed_at(Term t, List(Int) b, Int i) {
+    if (i >= b.len()) { return t; }
+    // Fast path: a run of printable ASCII in the ground state.
+    if (t.p.st == 0 && t.p.need == 0 && b[i] >= 32 && b[i] < 127) {
+        Int e = run_end(b, i, i + (t.cols - t.c.x));
+        Int n = if (e > i) { e - i } else { 1 };
+        return feed_at(put_run(t, b, i, n), b, i + n);
+    }
+    return feed_at(byte(t, b[i] & 255), b, i + 1);
+}
+
+// The end of printable ASCII from i, at most up to lim.
+Int run_end(List(Int) b, Int i, Int lim) {
+    if (i >= b.len() || i >= lim || b[i] < 32 || b[i] >= 127) { return i; }
+    return run_end(b, i + 1, lim);
+}
+
+// n printable ASCII bytes from b[i], all on the current line (the caller
+// bounds n by the room left); one character at a time when a wrap is
+// pending, insert mode is on, or line drawing is selected.
+Term put_run(Term t, List(Int) b, Int i, Int n) {
+    Bool simple = !t.c.wrap && (t.modes & (m_insert() | m_graphics())) == 0 && n > 1 && t.c.x + n <= t.cols;
+    if (!simple) { return put_each(t, b, i, n); }
+    List(Int) row = t.scr[t.c.y];
+    List(Int) cells = cells_of(b, i, n, t.c.attr, []);
+    List(Int) r2 = row[0..t.c.x].concat(cells).concat(row[t.c.x + n..t.cols]);
+    Int x = t.c.x + n;
+    Bool aw = (t.modes & m_autowrap()) != 0;
+    Cur c = if (x >= t.cols) { if (aw) { wrapping(t.c, t.cols - 1) } else { at(t.c, t.cols - 1, t.c.y) } } else { at(t.c, x, t.c.y) };
+    return t_last(t_scr(t, set_row(t.scr, t.c.y, r2), c), b[i + n - 1]);
+}
+
+Term put_each(Term t, List(Int) b, Int i, Int n) {
+    if (n <= 0) { return t; }
+    return put_each(put_char(t, b[i]), b, i + 1, n - 1);
+}
+
+List(Int) cells_of(List(Int) b, Int i, Int n, Int attr, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    return cells_of(b, i + 1, n - 1, attr, acc.concat([cell(b[i], attr)]));
+}
+
+List(List(Int)) set_row(List(List(Int)) s, Int y, List(Int) r) { return s[0..y].concat([r]).concat(s[y + 1..s.len()]); }
+
+Term byte(Term t, Int c) {
+    Int st = t.p.st;
+    // CAN and SUB abort any sequence; ESC starts one from anywhere but
+    // inside strings, where it may begin ST.
+    if (c == 24 || c == 26) { return t_par(t, par_new()); }
+    if (st == s_osc()) { return osc_byte(t, c); }
+    if (st == s_osc_esc()) { return if (c == 92) { osc_end(t) } else { byte(osc_end(t), c) }; }
+    if (st == s_str()) { return if (c == 27) { t_par(t, par_st(t.p, s_str_esc())) } else { if (c == 7) { t_par(t, par_new()) } else { t } }; }
+    if (st == s_str_esc()) { return t_par(t, if (c == 92) { par_new() } else { par_st(t.p, s_str()) }); }
+    if (c == 27) { return t_par(t, Par {.st = s_esc(), .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 0, .cp = 0}); }
+    if (c < 32) { return control(t, c); }
+    if (st == s_ground()) { return ground(t, c); }
+    if (st == s_esc()) { return esc(t, c); }
+    if (st == s_esc_inter()) { return esc_inter(t, c); }
+    if (st == s_csi()) { return csi_byte(t, c); }
+    if (st == s_csi_ignore()) { return if (c >= 64 && c <= 126) { t_par(t, par_new()) } else { t }; }
+    return t_par(t, par_new());
+}
+
+Par par_st(Par p, Int st) { return Par {.st = st, .ps = p.ps, .cur = p.cur, .inter = p.inter, .priv = p.priv, .osc = p.osc, .need = p.need, .cp = p.cp}; }
+
+// ============================================================================
+// Ground: text, with UTF-8
+// ============================================================================
+
+Term ground(Term t, Int c) {
+    Par p = t.p;
+    if (c == 127) { return t; }
+    if (p.need > 0) {
+        if ((c & 192) != 128) { return ground(t_par(t, par_new()), c); }
+        Int cp = (p.cp << 6) | (c & 63);
+        Par p2 = Par {.st = 0, .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = p.need - 1, .cp = cp};
+        if (p.need > 1) { return t_par(t, p2); }
+        Bool bad = cp > 1114111 || (cp >= 55296 && cp <= 57343);
+        return put_char(t_par(t, par_new()), if (bad) { 65533 } else { cp });
+    }
+    if (c < 128) { return put_char(t, c); }
+    if (c >= 194 && c <= 223) { return t_par(t, Par {.st = 0, .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 1, .cp = c & 31}); }
+    if (c >= 224 && c <= 239) { return t_par(t, Par {.st = 0, .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 2, .cp = c & 15}); }
+    if (c >= 240 && c <= 244) { return t_par(t, Par {.st = 0, .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 3, .cp = c & 7}); }
+    return put_char(t, 65533);
+}
+
+// Display width: 2 for East Asian wide and emoji ranges, 0 for combining
+// marks and zero-width characters (dropped in v1), else 1.
+pub Int width(Int cp) {
+    if ((cp >= 768 && cp <= 879) || (cp >= 8203 && cp <= 8207) || cp == 65279 || (cp >= 65024 && cp <= 65039)) { return 0; }
+    Bool wide = (cp >= 4352 && cp <= 4447) || (cp >= 11904 && cp <= 42191) || (cp >= 44032 && cp <= 55203) || (cp >= 63744 && cp <= 64255)
+        || (cp >= 65072 && cp <= 65103) || (cp >= 65280 && cp <= 65376) || (cp >= 65504 && cp <= 65510)
+        || (cp >= 127744 && cp <= 128591) || (cp >= 129280 && cp <= 129535) || (cp >= 131072 && cp <= 262141);
+    return if (wide) { 2 } else { 1 };
+}
+
+// DEC special graphics for 0x5f-0x7e (line drawing), as Unicode.
+Int graphic(Int c) {
+    List(Int) m = [32, 9670, 9618, 9225, 9228, 9229, 9226, 176, 177, 9252, 9227, 9496, 9488, 9484, 9492, 9532, 9146, 9147, 9472, 9148, 9149, 9500, 9508, 9524, 9516, 9474, 8804, 8805, 960, 8800, 163, 183];
+    return if (c >= 95 && c <= 126) { m[c - 95] } else { c };
+}
+
+Term put_char(Term t0, Int cp0) {
+    Int cp = if ((t0.modes & m_graphics()) != 0) { graphic(cp0) } else { cp0 };
+    Int w = width(cp);
+    if (w == 0) { return t0; }
+    // A pending wrap moves to the next line first.
+    Term t = if (t0.c.wrap && (t0.modes & m_autowrap()) != 0) { line_feed(t_cur(t0, at(t0.c, 0, t0.c.y))) } else { t0 };
+    // A wide character that does not fit wraps (or is clipped to one cell).
+    Bool clip2 = w == 2 && t.c.x + 2 > t.cols;
+    Term u = if (clip2 && (t.modes & m_autowrap()) != 0 && t.cols >= 2) { line_feed(t_cur(t, at(t.c, 0, t.c.y))) } else { t };
+    Int ww = if (w == 2 && u.c.x + 2 <= u.cols) { 2 } else { 1 };
+    List(Int) row0 = u.scr[u.c.y];
+    List(Int) row1 = if ((u.modes & m_insert()) != 0) { row0[0..u.c.x].concat(fill(ww, cell(32, u.c.attr), [])).concat(row0[u.c.x..u.cols - ww]) } else { row0 };
+    List(Int) cells = if (ww == 2) { [cell(cp, u.c.attr), cell(0, u.c.attr)] } else { [cell(if (w == 2) { 65533 } else { cp }, u.c.attr)] };
+    List(Int) row2 = row1[0..u.c.x].concat(cells).concat(row1[u.c.x + ww..u.cols]);
+    Int x = u.c.x + ww;
+    Bool aw = (u.modes & m_autowrap()) != 0;
+    Cur c = if (x >= u.cols) { if (aw) { wrapping(u.c, u.cols - 1) } else { at(u.c, u.cols - 1, u.c.y) } } else { at(u.c, x, u.c.y) };
+    return t_last(t_scr(u, set_row(u.scr, u.c.y, row2), c), cp);
+}
+
+// ============================================================================
+// Controls and scrolling
+// ============================================================================
+
+Term control(Term t, Int c) {
+    if (c == 7) { return t_out(t, t.title, t.replies, t.clip, t.bell + 1); }
+    if (c == 8) { return t_cur(t, at(t.c, if (t.c.x > 0) { t.c.x - 1 } else { 0 }, t.c.y)); }
+    if (c == 9) { Int nx = (t.c.x / 8 + 1) * 8; return t_cur(t, at(t.c, if (nx >= t.cols) { t.cols - 1 } else { nx }, t.c.y)); }
+    if (c == 10 || c == 11 || c == 12) { return line_feed(t); }
+    if (c == 13) { return t_cur(t, at(t.c, 0, t.c.y)); }
+    if (c == 14 || c == 15) { return t; }
+    return t;
+}
+
+// Down one line, scrolling the region at its bottom.
+Term line_feed(Term t) {
+    if (t.c.y == t.bot) { return scroll_up(t, 1); }
+    Int y = if (t.c.y + 1 >= t.rows) { t.rows - 1 } else { t.c.y + 1 };
+    return t_cur(t, Cur {.x = t.c.x, .y = y, .attr = t.c.attr, .wrap = false});
+}
+
+Term reverse_index(Term t) {
+    if (t.c.y == t.top) { return scroll_down(t, 1); }
+    return t_cur(t, at(t.c, t.c.x, if (t.c.y > 0) { t.c.y - 1 } else { 0 }));
+}
+
+// The region scrolls up n lines; lines leaving the top of the whole main
+// screen go to the scrollback.
+Term scroll_up(Term t, Int n0) {
+    Int h = t.bot - t.top + 1;
+    Int n = clamp(n0, 1, h);
+    List(Int) blank = blank_row(t.cols, t.c.attr);
+    List(List(Int)) gone = t.scr[t.top..t.top + n];
+    List(List(Int)) scr = t.scr[0..t.top].concat(t.scr[t.top + n..t.bot + 1]).concat(blank_rows(n, blank, [])).concat(t.scr[t.bot + 1..t.rows]);
+    Bool keep = !t.alt && t.top == 0;
+    List(List(Int)) sb0 = if (keep) { t.sb.concat(gone) } else { t.sb };
+    List(List(Int)) sb = if (sb0.len() > sb_max()) { sb0[sb0.len() - sb_max()..sb0.len()] } else { sb0 };
+    Term u = t_sb(t, scr, sb);
+    return t_cur(u, Cur {.x = t.c.x, .y = t.c.y, .attr = t.c.attr, .wrap = false});
+}
+
+Term scroll_down(Term t, Int n0) {
+    Int h = t.bot - t.top + 1;
+    Int n = clamp(n0, 1, h);
+    List(Int) blank = blank_row(t.cols, t.c.attr);
+    List(List(Int)) scr = t.scr[0..t.top].concat(blank_rows(n, blank, [])).concat(t.scr[t.top..t.bot + 1 - n]).concat(t.scr[t.bot + 1..t.rows]);
+    return t_scr(t, scr, Cur {.x = t.c.x, .y = t.c.y, .attr = t.c.attr, .wrap = false});
+}
+
+// ============================================================================
+// ESC sequences
+// ============================================================================
+
+Term esc(Term t, Int c) {
+    if (c == 91) { return t_par(t, Par {.st = s_csi(), .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 0, .cp = 0}); }
+    if (c == 93) { return t_par(t, Par {.st = s_osc(), .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = [], .need = 0, .cp = 0}); }
+    if (c == 80 || c == 88 || c == 94 || c == 95) { return t_par(t, par_st(par_new(), s_str())); }
+    if (c >= 32 && c <= 47) { return t_par(t, Par {.st = s_esc_inter(), .ps = [], .cur = -1, .inter = [c], .priv = 0, .osc = [], .need = 0, .cp = 0}); }
+    Term u = t_par(t, par_new());
+    if (c == 55) { return t_saved(u, u.c); }
+    if (c == 56) { return t_cur(u, u.saved); }
+    if (c == 68) { return line_feed(u); }
+    if (c == 69) { return line_feed(t_cur(u, at(u.c, 0, u.c.y))); }
+    if (c == 77) { return reverse_index(u); }
+    if (c == 99) { return reset(u); }
+    return u;
+}
+
+// ESC ( 0 selects line drawing for G0, ESC ( B (or any other) ASCII.
+Term esc_inter(Term t, Int c) {
+    if (c >= 32 && c <= 47) { return t_par(t, if (t.p.inter.len() < 2) { Par {.st = s_esc_inter(), .ps = [], .cur = -1, .inter = t.p.inter.concat([c]), .priv = 0, .osc = [], .need = 0, .cp = 0} } else { t.p }); }
+    Term u = t_par(t, par_new());
+    if (t.p.inter.len() == 1 && t.p.inter[0] == 40) { return t_modes(u, if (c == 48) { u.modes | m_graphics() } else { u.modes & (0 - 1 - m_graphics()) }); }
+    return u;
+}
+
+Term reset(Term t) {
+    Term n = term_new(t.rows, t.cols);
+    return t_out(n, "", t.replies, t.clip, t.bell);
+}
+
+// ============================================================================
+// CSI
+// ============================================================================
+
+Term csi_byte(Term t, Int c) {
+    Par p = t.p;
+    if (c >= 48 && c <= 57) {
+        Int v = if (p.cur < 0) { c - 48 } else { p.cur * 10 + c - 48 };
+        return t_par(t, Par {.st = p.st, .ps = p.ps, .cur = if (v > 65535) { 65535 } else { v }, .inter = p.inter, .priv = p.priv, .osc = [], .need = 0, .cp = 0});
+    }
+    if (c == 59 || c == 58) {
+        if (p.ps.len() >= 16) { return t_par(t, par_st(p, s_csi_ignore())); }
+        return t_par(t, Par {.st = p.st, .ps = p.ps.concat([p.cur]), .cur = -1, .inter = p.inter, .priv = p.priv, .osc = [], .need = 0, .cp = 0});
+    }
+    if (c >= 60 && c <= 63) {
+        Bool first = p.ps.len() == 0 && p.cur < 0 && p.priv == 0;
+        return t_par(t, if (first) { Par {.st = p.st, .ps = [], .cur = -1, .inter = p.inter, .priv = c, .osc = [], .need = 0, .cp = 0} } else { par_st(p, s_csi_ignore()) });
+    }
+    if (c >= 32 && c <= 47) {
+        return t_par(t, if (p.inter.len() < 2) { Par {.st = p.st, .ps = p.ps, .cur = p.cur, .inter = p.inter.concat([c]), .priv = p.priv, .osc = [], .need = 0, .cp = 0} } else { par_st(p, s_csi_ignore()) });
+    }
+    if (c >= 64 && c <= 126) {
+        List(Int) ps = if (p.cur >= 0 || p.ps.len() > 0) { p.ps.concat([p.cur]) } else { [] };
+        Term u = t_par(t, par_new());
+        if (p.inter.len() > 0) { return u; }
+        return if (p.priv == 0) { csi(u, c, ps) } else { csi_private(u, c, p.priv, ps) };
+    }
+    return t_par(t, par_st(p, s_csi_ignore()));
+}
+
+// Parameter i, or d when absent or 0 (when zero_ok is false).
+Int arg(List(Int) ps, Int i, Int d) { return if (i < ps.len() && ps[i] > 0) { ps[i] } else { d }; }
+Int arg0(List(Int) ps, Int i) { return if (i < ps.len() && ps[i] >= 0) { ps[i] } else { 0 }; }
+
+Term move(Term t, Int x, Int y) {
+    return t_cur(t, at(t.c, clamp(x, 0, t.cols - 1), clamp(y, 0, t.rows - 1)));
+}
+
+Term csi(Term t, Int f, List(Int) ps) {
+    Int n = arg(ps, 0, 1);
+    Bool origin = (t.modes & m_origin()) != 0;
+    if (f == 65) { return move(t, t.c.x, if (t.c.y >= t.top) { max(t.c.y - n, t.top) } else { t.c.y - n }); }
+    if (f == 66) { return move(t, t.c.x, if (t.c.y <= t.bot) { min(t.c.y + n, t.bot) } else { t.c.y + n }); }
+    if (f == 67 || f == 97) { return move(t, t.c.x + n, t.c.y); }
+    if (f == 68) { return move(t, t.c.x - n, t.c.y); }
+    if (f == 69) { return move(t, 0, t.c.y + n); }
+    if (f == 70) { return move(t, 0, t.c.y - n); }
+    if (f == 71 || f == 96) { return move(t, n - 1, t.c.y); }
+    if (f == 72 || f == 102) {
+        Int y = arg(ps, 0, 1) - 1 + if (origin) { t.top } else { 0 };
+        return move(t, arg(ps, 1, 1) - 1, if (origin) { min(y, t.bot) } else { y });
+    }
+    if (f == 100) { return move(t, t.c.x, n - 1 + if (origin) { t.top } else { 0 }); }
+    if (f == 101) { return move(t, t.c.x, t.c.y + n); }
+    if (f == 74) { return erase_display(t, arg0(ps, 0)); }
+    if (f == 75) { return erase_line(t, arg0(ps, 0)); }
+    if (f == 76) { return lines(t, n, true); }
+    if (f == 77) { return lines(t, n, false); }
+    if (f == 64) { return chars(t, n, 0); }
+    if (f == 80) { return chars(t, n, 1); }
+    if (f == 88) { return chars(t, n, 2); }
+    if (f == 83) { return scroll_up(t, n); }
+    if (f == 84) { return if (ps.len() <= 1) { scroll_down(t, n) } else { t }; }
+    if (f == 98) { return repeat(t, min(n, 65535)); }
+    if (f == 109) { return t_cur(t, pen(t.c, sgr(t.c.attr, if (ps.len() == 0) { [0] } else { ps }, 0))); }
+    if (f == 114) {
+        Int top = arg(ps, 0, 1) - 1;
+        Int bot = arg(ps, 1, t.rows) - 1;
+        if (top >= bot || bot >= t.rows) { return t; }
+        return move(t_region(t, top, bot), 0, if (origin) { top } else { 0 });
+    }
+    if (f == 115) { return t_saved(t, t.c); }
+    if (f == 117) { return t_cur(t, t.saved); }
+    if (f == 110) { return status(t, arg0(ps, 0)); }
+    if (f == 99) { return if (arg0(ps, 0) == 0) { reply(t, bytes_of("\x1b[?62;22c")) } else { t }; }
+    if (f == 104 || f == 108) { return if (arg0(ps, 0) == 4) { t_modes(t, set_bit(t.modes, m_insert(), f == 104)) } else { t }; }
+    return t;
+}
+
+// DECSET / DECRST and secondary device attributes.
+Term csi_private(Term t, Int f, Int priv, List(Int) ps) {
+    if (priv == 62 && f == 99) { return reply(t, bytes_of("\x1b[>1;10;0c")); }
+    if (priv != 63 || (f != 104 && f != 108)) { return t; }
+    return dec_modes(t, ps, 0, f == 104);
+}
+
+Term dec_modes(Term t, List(Int) ps, Int i, Bool on) {
+    if (i >= ps.len()) { return t; }
+    Int m = ps[i];
+    Term u = if (m == 1) { t_modes(t, set_bit(t.modes, m_appcursor(), on)) } else {
+        if (m == 6) { move(t_modes(t, set_bit(t.modes, m_origin(), on)), 0, if (on) { t.top } else { 0 }) } else {
+        if (m == 7) { t_modes(t, set_bit(t.modes, m_autowrap(), on)) } else {
+        if (m == 25) { t_modes(t, set_bit(t.modes, m_cursor(), on)) } else {
+        if (m == 2004) { t_modes(t, set_bit(t.modes, m_paste(), on)) } else {
+        if (m == 47 || m == 1047 || m == 1049) { alt_screen(t, on, m == 1049) } else { t } } } } } };
+    return dec_modes(u, ps, i + 1, on);
+}
+
+Int set_bit(Int v, Int b, Bool on) { return if (on) { v | b } else { v & (0 - 1 - b) }; }
+
+// The alternate screen: the main screen and cursor kept aside.
+Term alt_screen(Term t, Bool on, Bool cursor) {
+    if (on == t.alt) { return t; }
+    if (on) {
+        Term u = Term {.rows = t.rows, .cols = t.cols, .scr = blank_screen(t.rows, t.cols, attr_default()), .top = 0, .bot = t.rows - 1, .c = t.c, .saved = t.saved, .modes = t.modes,
+            .alt = true, .prim = t.scr, .main_cur = t.c, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+        return u;
+    }
+    Cur c = if (cursor) { t.main_cur } else { t.c };
+    List(List(Int)) scr = if (t.prim.len() == t.rows) { t.prim } else { blank_screen(t.rows, t.cols, attr_default()) };
+    return Term {.rows = t.rows, .cols = t.cols, .scr = scr, .top = 0, .bot = t.rows - 1, .c = c, .saved = t.saved, .modes = t.modes,
+        .alt = false, .prim = [], .main_cur = c, .p = t.p, .sb = t.sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+Term reply(Term t, List(Int) b) {
+    if (t.replies.len() > 4096) { return t; }
+    return t_out(t, t.title, t.replies.concat(b), t.clip, t.bell);
+}
+
+// DSR: 5 is "OK", 6 the cursor position (fixed-format numbers only).
+Term status(Term t, Int k) {
+    if (k == 5) { return reply(t, bytes_of("\x1b[0n")); }
+    if (k == 6) { return reply(t, bytes_of("\x1b[" + f"{t.c.y + 1};{t.c.x + 1}" + "R")); }
+    return t;
+}
+
+Term repeat(Term t, Int n) {
+    if (n <= 0 || t.last < 32) { return t; }
+    return repeat(put_char(t, t.last), n - 1);
+}
+
+// ED: 0 cursor to end, 1 start to cursor, 2 all, 3 scrollback.
+Term erase_display(Term t, Int k) {
+    List(Int) blank = blank_row(t.cols, t.c.attr);
+    if (k == 3) { return t_sb(t, t.scr, []); }
+    if (k == 2) { return t_scr(t, blank_rows(t.rows, blank, []), t.c); }
+    Term u = erase_line(t, k);
+    List(List(Int)) scr = if (k == 0) { u.scr[0..t.c.y + 1].concat(blank_rows(t.rows - t.c.y - 1, blank, [])) } else { blank_rows(t.c.y, blank, []).concat(u.scr[t.c.y..t.rows]) };
+    return t_scr(u, scr, u.c);
+}
+
+// EL: 0 cursor to end, 1 start to cursor, 2 the line.
+Term erase_line(Term t, Int k) {
+    List(Int) row = t.scr[t.c.y];
+    Int b = cell(32, t.c.attr & (511 << 9) | 256);
+    List(Int) r2 = if (k == 0) { row[0..t.c.x].concat(fill(t.cols - t.c.x, b, [])) } else {
+        if (k == 1) { fill(t.c.x + 1, b, []).concat(row[t.c.x + 1..t.cols]) } else { fill(t.cols, b, []) } };
+    return t_scr(t, set_row(t.scr, t.c.y, r2), Cur {.x = t.c.x, .y = t.c.y, .attr = t.c.attr, .wrap = false});
+}
+
+// IL / DL inside the scroll region, at the cursor's line.
+Term lines(Term t, Int n0, Bool insert) {
+    if (t.c.y < t.top || t.c.y > t.bot) { return t; }
+    Term r = t_region(t, t.c.y, t.bot);
+    Term s = if (insert) { scroll_down(r, n0) } else { scroll_up_noback(r, n0) };
+    return t_cur(t_region(s, t.top, t.bot), at(t.c, 0, t.c.y));
+}
+
+Term scroll_up_noback(Term t, Int n0) {
+    Int h = t.bot - t.top + 1;
+    Int n = clamp(n0, 1, h);
+    List(Int) blank = blank_row(t.cols, t.c.attr);
+    List(List(Int)) scr = t.scr[0..t.top].concat(t.scr[t.top + n..t.bot + 1]).concat(blank_rows(n, blank, [])).concat(t.scr[t.bot + 1..t.rows]);
+    return t_scr(t, scr, t.c);
+}
+
+// ICH (0), DCH (1), ECH (2) on the cursor's line.
+Term chars(Term t, Int n0, Int k) {
+    List(Int) row = t.scr[t.c.y];
+    Int x = t.c.x;
+    Int n = clamp(n0, 1, t.cols - x);
+    Int b = cell(32, t.c.attr & (511 << 9) | 256);
+    List(Int) r2 = if (k == 0) { row[0..x].concat(fill(n, b, [])).concat(row[x..t.cols - n]) } else {
+        if (k == 1) { row[0..x].concat(row[x + n..t.cols]).concat(fill(n, b, [])) } else { row[0..x].concat(fill(n, b, [])).concat(row[x + n..t.cols]) } };
+    return t_scr(t, set_row(t.scr, t.c.y, r2), Cur {.x = x, .y = t.c.y, .attr = t.c.attr, .wrap = false});
+}
+
+// SGR, with 256 colours and true colour (mapped to the 256-colour cube).
+Int sgr(Int a, List(Int) ps, Int i) {
+    if (i >= ps.len()) { return a; }
+    Int p = if (ps[i] < 0) { 0 } else { ps[i] };
+    if (p == 38 || p == 48) {
+        Int shift = if (p == 38) { 0 } else { 9 };
+        Bool idx = i + 2 < ps.len() && ps[i + 1] == 5;
+        Bool rgb = i + 4 < ps.len() && ps[i + 1] == 2;
+        Int col = if (idx) { clamp(ps[i + 2], 0, 255) } else { if (rgb) { cube(ps[i + 2], ps[i + 3], ps[i + 4]) } else { -1 } };
+        Int na = if (col >= 0) { (a & (0 - 1 - (511 << shift))) | (col << shift) } else { a };
+        return sgr(na, ps, i + if (idx) { 3 } else { if (rgb) { 5 } else { 1 } });
+    }
+    return sgr(sgr1(a, p), ps, i + 1);
+}
+
+Int cube(Int r, Int g, Int b) {
+    Int r6 = (clamp(r, 0, 255) * 5 + 127) / 255;
+    Int g6 = (clamp(g, 0, 255) * 5 + 127) / 255;
+    Int b6 = (clamp(b, 0, 255) * 5 + 127) / 255;
+    return 16 + 36 * r6 + 6 * g6 + b6;
+}
+
+Int sgr1(Int a, Int p) {
+    Int fgm = 0 - 1 - 511;
+    Int bgm = 0 - 1 - (511 << 9);
+    if (p == 0) { return attr_default(); }
+    if (p == 1) { return a | a_bold(); }
+    if (p == 2) { return a | a_dim(); }
+    if (p == 3) { return a | a_italic(); }
+    if (p == 4) { return a | a_under(); }
+    if (p == 5 || p == 6) { return a | a_blink(); }
+    if (p == 7) { return a | a_inverse(); }
+    if (p == 8) { return a | a_hidden(); }
+    if (p == 9) { return a | a_strike(); }
+    if (p == 22) { return a & (0 - 1 - a_bold() - a_dim()); }
+    if (p == 23) { return a & (0 - 1 - a_italic()); }
+    if (p == 24) { return a & (0 - 1 - a_under()); }
+    if (p == 25) { return a & (0 - 1 - a_blink()); }
+    if (p == 27) { return a & (0 - 1 - a_inverse()); }
+    if (p == 28) { return a & (0 - 1 - a_hidden()); }
+    if (p == 29) { return a & (0 - 1 - a_strike()); }
+    if (p >= 30 && p <= 37) { return (a & fgm) | (p - 30); }
+    if (p == 39) { return (a & fgm) | 256; }
+    if (p >= 40 && p <= 47) { return (a & bgm) | ((p - 40) << 9); }
+    if (p == 49) { return (a & bgm) | (256 << 9); }
+    if (p >= 90 && p <= 97) { return (a & fgm) | (p - 82); }
+    if (p >= 100 && p <= 107) { return (a & bgm) | ((p - 92) << 9); }
+    return a;
+}
+
+// ============================================================================
+// OSC
+// ============================================================================
+
+Int osc_max() { return 65536; }
+
+Term osc_byte(Term t, Int c) {
+    if (c == 7) { return osc_end(t); }
+    if (c == 27) { return t_par(t, par_st(t.p, s_osc_esc())); }
+    if (t.p.osc.len() >= osc_max()) { return t; }
+    if (c < 32) { return t; }
+    return t_par(t, Par {.st = s_osc(), .ps = [], .cur = -1, .inter = [], .priv = 0, .osc = t.p.osc.concat([c]), .need = 0, .cp = 0});
+}
+
+// "0;T" and "2;T" set the title (kept, never reported back); "52;c;B64"
+// queues a clipboard write ("?" reads are not implemented); others are
+// ignored. An overlong string was truncated and is dropped.
+Term osc_end(Term t) {
+    List(Int) s = t.p.osc;
+    Term u = t_par(t, par_new());
+    if (s.len() >= osc_max()) { return u; }
+    Int semi = index_of(s, 59, 0);
+    if (semi < 0) { return u; }
+    Str k = ascii_of(s[0..semi]);
+    List(Int) body = s[semi + 1..s.len()];
+    if ((k == "0" || k == "2") && body.len() <= 256) { return t_out(u, printable(body), u.replies, u.clip, u.bell); }
+    if (k == "52") {
+        Int s2 = index_of(body, 59, 0);
+        List(Int) data = if (s2 >= 0) { body[s2 + 1..body.len()] } else { [] };
+        Bool write = data.len() > 0 && !(data.len() == 1 && data[0] == 63) && u.clip.len() < 8;
+        return if (write) { t_out(u, u.title, u.replies, u.clip.concat([data]), u.bell) } else { u };
+    }
+    return u;
+}
+
+Int index_of(List(Int) b, Int v, Int i) {
+    if (i >= b.len()) { return -1; }
+    if (b[i] == v) { return i; }
+    return index_of(b, v, i + 1);
+}
+
+Str ascii_of(List(Int) b) { return ascii_acc(b, 0, ""); }
+Str ascii_acc(List(Int) b, Int i, Str acc) { if (i >= b.len()) { return acc; } return ascii_acc(b, i + 1, acc + str_from_code(b[i])); }
+
+// Printable ASCII only (a title is shown by the program, never by the terminal).
+Str printable(List(Int) b) { return pr_acc(b, 0, ""); }
+Str pr_acc(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    return pr_acc(b, i + 1, if (b[i] >= 32 && b[i] < 127) { acc + str_from_code(b[i]) } else { acc + "?" });
+}
+
+// ============================================================================
+// Resize, text, repaint
+// ============================================================================
+
+// A new size: rows and columns cut or padded (no reflow in v1), the
+// cursor kept inside, the scroll region reset.
+pub Term term_resize(Term t, Int rows0, Int cols0) {
+    Int rows = clamp(rows0, 1, 1000);
+    Int cols = clamp(cols0, 1, 1000);
+    if (rows == t.rows && cols == t.cols) { return t; }
+    List(List(Int)) cut = fit_cols(t.scr, cols, 0, []);
+    // Rows lost at the top go to the scrollback; rows added at the bottom.
+    Int drop_n = if (t.rows > rows && t.c.y >= rows) { t.c.y - rows + 1 } else { 0 };
+    List(List(Int)) top = cut[drop_n..cut.len()];
+    List(List(Int)) scr = if (top.len() >= rows) { top[0..rows] } else { top.concat(blank_rows(rows - top.len(), blank_row(cols, attr_default()), [])) };
+    List(List(Int)) main = if (t.alt) { fit_rows(fit_cols(t.prim, cols, 0, []), rows, cols) } else { [] };
+    Cur c = Cur {.x = clamp(t.c.x, 0, cols - 1), .y = clamp(t.c.y - drop_n, 0, rows - 1), .attr = t.c.attr, .wrap = false};
+    List(List(Int)) sb = if (!t.alt && drop_n > 0) { t.sb.concat(cut[0..drop_n]) } else { t.sb };
+    return Term {.rows = rows, .cols = cols, .scr = scr, .top = 0, .bot = rows - 1, .c = c, .saved = t.saved, .modes = t.modes,
+        .alt = t.alt, .prim = main, .main_cur = t.main_cur, .p = t.p, .sb = sb, .title = t.title, .replies = t.replies, .clip = t.clip, .bell = t.bell, .last = t.last};
+}
+
+List(List(Int)) fit_cols(List(List(Int)) s, Int cols, Int i, List(List(Int)) acc) {
+    if (i >= s.len()) { return acc; }
+    List(Int) r = s[i];
+    List(Int) r2 = if (r.len() >= cols) { r[0..cols] } else { r.concat(blank_row(cols - r.len(), attr_default())) };
+    return fit_cols(s, cols, i + 1, acc.concat([r2]));
+}
+
+List(List(Int)) fit_rows(List(List(Int)) s, Int rows, Int cols) {
+    if (s.len() >= rows) { return s[s.len() - rows..s.len()]; }
+    return s.concat(blank_rows(rows - s.len(), blank_row(cols, attr_default()), []));
+}
+
+// A row's characters as text (trailing spaces kept; wide halves skipped).
+pub Str row_text(List(Int) r) { return rt_acc(r, 0, ""); }
+Str rt_acc(List(Int) r, Int i, Str acc) {
+    if (i >= r.len()) { return acc; }
+    Int ch = cell_ch(r[i]);
+    return rt_acc(r, i + 1, if (ch == 0) { acc } else { acc + str_from_code(ch) });
+}
+
+pub List(Str) screen_text(Term t) { return st_acc(t.scr, 0, []); }
+List(Str) st_acc(List(List(Int)) s, Int i, List(Str) acc) {
+    if (i >= s.len()) { return acc; }
+    return st_acc(s, i + 1, acc.concat([str_trim_end(row_text(s[i]))]));
+}
+
+Str str_trim_end(Str s) {
+    Int n = str_len(s);
+    if (n == 0 || str_slice(s, n - 1, n) != " ") { return s; }
+    return str_trim_end(str_slice(s, 0, n - 1));
+}
+
+// Bytes that draw this terminal's state on a fresh terminal of the same
+// size (re-attach, SPEC 10.1): the last `sb_lines` scrollback lines
+// printed so they scroll into the viewer's own scrollback, then the screen
+// cell by cell with its attributes, then the cursor and modes. Only
+// characters from the screen model are emitted, never raw host bytes.
+pub List(Int) repaint(Term t, Int sb_lines) {
+    Int from = if (t.sb.len() > sb_lines) { t.sb.len() - sb_lines } else { 0 };
+    List(Int) hist = rows_out(t.sb, from, true, [27, 91, 48, 109]);
+    List(Int) clear = bytes_of("\x1b[0m\x1b[H\x1b[2J");
+    List(Int) body = screen_out(t.scr, 0, []);
+    List(Int) cur = bytes_of("\x1b[0m" + sgr_of(t.c.attr) + "\x1b[" + f"{t.c.y + 1};{t.c.x + 1}" + "H");
+    List(Int) modes = bytes_of(if ((t.modes & m_cursor()) != 0) { "\x1b[?25h" } else { "\x1b[?25l" })
+        .concat(bytes_of(if ((t.modes & m_paste()) != 0) { "\x1b[?2004h" } else { "\x1b[?2004l" }))
+        .concat(bytes_of(if ((t.modes & m_appcursor()) != 0) { "\x1b[?1h" } else { "\x1b[?1l" }))
+        .concat(bytes_of(if (t.top != 0 || t.bot != t.rows - 1) { "\x1b[" + f"{t.top + 1};{t.bot + 1}" + "r" } else { "" }));
+    return hist.concat(clear).concat(body).concat(cur).concat(modes);
+}
+
+List(Int) rows_out(List(List(Int)) rs, Int i, Bool nl, List(Int) acc) {
+    if (i >= rs.len()) { return acc; }
+    return rows_out(rs, i + 1, nl, acc.concat(row_out(rs[i], 0, -1, [])).concat([27, 91, 48, 109, 13, 10]));
+}
+
+List(Int) screen_out(List(List(Int)) s, Int y, List(Int) acc) {
+    if (y >= s.len()) { return acc; }
+    List(Int) pos = bytes_of("\x1b[" + f"{y + 1}" + ";1H");
+    return screen_out(s, y + 1, acc.concat(pos).concat(row_out(s[y], 0, -1, [])));
+}
+
+// A row's cells with an SGR wherever the attributes change; trailing
+// default blanks are not written.
+List(Int) row_out(List(Int) r, Int i, Int a, List(Int) acc) {
+    Int end = last_ink(r, r.len() - 1);
+    if (i > end) { return acc; }
+    Int ch = cell_ch(r[i]);
+    Int ca = cell_attr(r[i]);
+    List(Int) set = if (ca != a) { bytes_of("\x1b[0m" + sgr_of(ca)) } else { [] };
+    List(Int) ch_b = if (ch == 0) { [] } else { utf8(ch) };
+    return row_out(r, i + 1, ca, acc.concat(set).concat(ch_b));
+}
+
+Int last_ink(List(Int) r, Int i) {
+    if (i < 0) { return -1; }
+    if (r[i] != cell(32, attr_default())) { return i; }
+    return last_ink(r, i - 1);
+}
+
+Str sgr_of(Int a) {
+    Int fg = attr_fg(a);
+    Int bg = attr_bg(a);
+    Str s0 = if (fg == 256) { "" } else { "\x1b[38;5;" + f"{fg}" + "m" };
+    Str s1 = if (bg == 256) { "" } else { "\x1b[48;5;" + f"{bg}" + "m" };
+    Str s2 = flag(a, a_bold(), "1") + flag(a, a_dim(), "2") + flag(a, a_italic(), "3") + flag(a, a_under(), "4") + flag(a, a_blink(), "5")
+        + flag(a, a_inverse(), "7") + flag(a, a_hidden(), "8") + flag(a, a_strike(), "9");
+    return s0 + s1 + s2;
+}
+
+Str flag(Int a, Int bit, Str n) { return if ((a & bit) != 0) { "\x1b[" + n + "m" } else { "" }; }
+
+pub List(Int) utf8(Int cp) {
+    if (cp < 128) { return [cp]; }
+    if (cp < 2048) { return [192 | (cp >> 6), 128 | (cp & 63)]; }
+    if (cp < 65536) { return [224 | (cp >> 12), 128 | ((cp >> 6) & 63), 128 | (cp & 63)]; }
+    return [240 | (cp >> 18), 128 | ((cp >> 12) & 63), 128 | ((cp >> 6) & 63), 128 | (cp & 63)];
+}
