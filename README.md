@@ -44,7 +44,9 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Host trust | pinned keys (`pylon pin HOST FINGERPRINT`; re-pinning replaces the old key) or host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked); a changed key names the old pin; `pylon history [HOST]` |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
-Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
+Tested against OpenSSH 9.6, against OpenSSH 10.2 in CI (`openssh10`
+workflow: built from source, the post-quantum hybrid negotiated with
+OpenSSH itself), and the handshake against Dropbear 2022.83:
 119 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
@@ -52,10 +54,9 @@ post-quantum and hostile-server cases in `tests/interop.sh`,
 known-answer tests for the key derivation in `tests/kex_test.resid`, and
 a mutation fuzzer in `tests/fuzz_proxy.py`.
 
-Next (SPEC 17): an OpenSSH 10 interop run for the hybrid (OpenSSH 9.6
-here has no ML-KEM; it is checked against a reference server built on
-OpenSSL's primitives, `tests/pq_server.py`), then the Android app. Open
-compiler warnings: SPEC Appendix A, I6.
+Without an sshd that has ML-KEM (OpenSSH before 9.9), the hybrid is
+checked against a reference server built on OpenSSL's primitives
+(`tests/pq_server.py`). Open compiler warnings: SPEC Appendix A, I6.
 
 ## Build and use
 
