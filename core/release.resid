@@ -1,0 +1,432 @@
+// Release integrity for pylond (SPEC 8.2, Appendix A H7): a release
+// manifest signed by a quorum of release keys, logged in an append-only
+// Merkle log (core/merkle.resid) whose signed tree heads the client checks
+// for consistency with the newest it has seen, and a release counter that
+// never goes back.
+//
+// Every format is text, one item per line, each line ending in "\n":
+//
+//   pylond.release   the manifest, then its signatures
+//     pylond-release v1
+//     version VERSION
+//     counter N
+//     pylond ARCH FILE-SHA256 CODE-SHA256      (one per machine type,
+//     ...                                       aarch64 before x86_64)
+//     sig KEYID ED25519-SIGNATURE               (one per signer)
+//
+//   the signed tree head (STH): body
+//     pylond-log v1
+//     size N
+//     root ROOT
+//   and its signatures (sig lines) by the log keys
+//
+//   pylond.proof     one release's place in the log
+//     pylond-proof v1
+//     size N
+//     root ROOT
+//     sig KEYID SIGNATURE                       (the STH's signatures)
+//     index I
+//     path HASH                                 (leaf to root)
+//     consistency M HASH HASH ...               (for every 1 <= M < N)
+//
+//   roots            the keys a client trusts (pinned in
+//                    core/release_roots.resid)
+//     pylond-roots v1
+//     release-threshold K
+//     release-key PUBLIC-KEY                    (n of them)
+//     log-threshold K
+//     log-key PUBLIC-KEY
+//
+// A signature is Ed25519 over the body's bytes (every line before the
+// first sig line, each with its "\n"); the first line names the kind, so
+// a manifest signature is never a tree-head signature. KEYID is the first
+// 8 bytes of SHA-256(public key), in hex; all hex is lowercase. The log's
+// entries are the pylond.release files, byte for byte (signatures
+// included). FILE-SHA256 is the hash of the file pushed to hosts;
+// CODE-SHA256 the hash of its code image, the file without the Resid
+// provenance trailer (which names the build's output path and the
+// builder's key), the bytes independent builders reproduce.
+
+import "crypto.resid";
+import "ed25519.resid";
+import "wire.resid";
+import "merkle.resid";
+
+// ---- hex -----------------------------------------------------------------
+
+Int hexval(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+// Lowercase hex to bytes; [] (and not ok) on anything else.
+pub type Hex = { List(Int) b; Bool ok; };
+
+pub Hex unhex(Str s) {
+    List(Int) cs = bytes_of(s);
+    if (cs.len() % 2 != 0 || !hex_chars(cs, 0)) { return Hex {.b = [], .ok = false}; }
+    return Hex {.b = unhex_acc(cs, 0, ListBuf()), .ok = true};
+}
+
+Bool hex_chars(List(Int) cs, Int i) {
+    if (i >= cs.len()) { return true; }
+    return hexval(cs[i]) >= 0 && hex_chars(cs, i + 1);
+}
+
+List(Int) unhex_acc(List(Int) cs, Int i, ListBuf(Int) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    return unhex_acc(cs, i + 2, acc.push(hexval(cs[i]) * 16 + hexval(cs[i + 1])));
+}
+
+// Exactly n bytes of lowercase hex, else [].
+pub List(Int) hexn(Str s, Int n) {
+    Hex h = unhex(s);
+    return if (h.ok && h.b.len() == n) { h.b } else { [] };
+}
+
+pub Str key_id(List(Int) pubk) { return hex_encode(sha256_bytes(pubk)[0..8]); }
+
+// ---- signed text -----------------------------------------------------------
+
+// Lines of a text that ends in "\n" and holds no carriage return or NUL;
+// ok false otherwise.
+pub type Lines = { List(Str) ls; Bool ok; };
+
+pub Lines lines_of(Str t) {
+    if (str_len(t) == 0 || !str_ends_with(t, "\n") || str_contains(t, "\r") || str_contains(t, "\t")) { return Lines {.ls = [], .ok = false}; }
+    List(Str) ls = str_split(t, "\n");
+    List(Str) body = ls[0..(ls.len() - 1)];
+    return Lines {.ls = body, .ok = !has_empty(body, 0)};
+}
+
+Bool has_empty(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return false; }
+    return str_len(ls[i]) == 0 || has_empty(ls, i + 1);
+}
+
+// The body (lines before the first sig line) and the sig lines after it.
+pub type Signed = { List(Str) body; List(Str) sigs; Bool ok; };
+
+pub Signed split_signed(Str t) {
+    Lines l = lines_of(t);
+    if (!l.ok) { return Signed {.body = [], .sigs = [], .ok = false}; }
+    Int b = run_end(l.ls, 0, "sig ", false);
+    Int e = run_end(l.ls, b, "sig ", true);
+    return Signed {.body = l.ls[0..b], .sigs = l.ls[b..e], .ok = e == l.ls.len()};
+}
+
+// The index after the run of lines from i that do (want) or do not
+// (!want) start with prefix.
+Int run_end(List(Str) ls, Int i, Str prefix, Bool want) {
+    if (i >= ls.len() || str_starts_with(ls[i], prefix) != want) { return i; }
+    return run_end(ls, i + 1, prefix, want);
+}
+
+pub Str joined(List(Str) ls) { return if (ls.len() == 0) { "" } else { str_join(ls, "\n") + "\n" }; }
+
+// "sig KEYID SIGNATURE" for body by seed (tools/release).
+pub Str sig_line(List(Int) seed, Str body) {
+    List(Int) pubk = pub_key(seed);
+    return "sig " + key_id(pubk) + " " + hex_encode(sign_msg_bytes(seed, bytes_of(body)));
+}
+
+// How many of `keys` signed `body`: each key counts once, whatever its
+// number of sig lines; lines by other keys are ignored.
+pub Int signers(Str body, List(Str) sigs, List(List(Int)) keys) { return signers_acc(bytes_of(body), sigs, keys, 0, 0); }
+
+Int signers_acc(List(Int) msg, List(Str) sigs, List(List(Int)) keys, Int i, Int n) {
+    if (i >= keys.len()) { return n; }
+    Bool good = signed_by(msg, sigs, keys[i], key_id(keys[i]), 0);
+    return signers_acc(msg, sigs, keys, i + 1, if (good) { n + 1 } else { n });
+}
+
+Bool signed_by(List(Int) msg, List(Str) sigs, List(Int) k, Str kid, Int i) {
+    if (i >= sigs.len()) { return false; }
+    List(Str) f = str_split(sigs[i], " ");
+    Bool mine = f.len() == 3 && f[1] == kid;
+    List(Int) s = if (mine) { hexn(f[2], 64) } else { [] };
+    if (s.len() == 64 && verify_sig_bytes(msg, s, k)) { return true; }
+    return signed_by(msg, sigs, k, kid, i + 1);
+}
+
+// Whether every sig line is well formed.
+Bool sigs_ok(List(Str) sigs, Int i) {
+    if (i >= sigs.len()) { return true; }
+    List(Str) f = str_split(sigs[i], " ");
+    return f.len() == 3 && f[0] == "sig" && hexn(f[1], 8).len() == 8 && hexn(f[2], 64).len() == 64 && sigs_ok(sigs, i + 1);
+}
+
+// ---- small parsers ----------------------------------------------------------
+
+// A canonical decimal in 0..10^15, else -1.
+pub Int dec(Str s) {
+    if (str_len(s) == 0 || str_len(s) > 15 || !str_is_int(s) || str_starts_with(s, "-") || str_starts_with(s, "+")) { return -1; }
+    Int v = str_parse_int(s);
+    return if (f"{v}" == s) { v } else { -1 };
+}
+
+// "WORD VALUE": VALUE when line has that shape, else "".
+Str val(Str line, Str word) {
+    List(Str) f = str_split(line, " ");
+    return if (f.len() == 2 && f[0] == word) { f[1] } else { "" };
+}
+
+Bool version_char(Int c) { return (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 46 || c == 43 || c == 45 || c == 126; }
+
+Bool version_ok(List(Int) cs, Int i) {
+    if (i >= cs.len()) { return cs.len() > 0 && cs.len() <= 32; }
+    return version_char(cs[i]) && version_ok(cs, i + 1);
+}
+
+// ---- roots --------------------------------------------------------------------
+
+pub type Roots = { List(List(Int)) rel; Int rel_k; List(List(Int)) log; Int log_k; Str err; };
+
+pub Roots parse_roots(Str t) {
+    Roots bad = Roots {.rel = [], .rel_k = 0, .log = [], .log_k = 0, .err = "no release keys"};
+    Lines l = lines_of(t);
+    if (!l.ok || l.ls.len() < 5 || l.ls[0] != "pylond-roots v1") { return bad; }
+    Int rk = dec(val(l.ls[1], "release-threshold"));
+    Int re = run_end(l.ls, 2, "release-key ", true);
+    if (re >= l.ls.len()) { return bad; }
+    Int lk = dec(val(l.ls[re], "log-threshold"));
+    Int le = run_end(l.ls, re + 1, "log-key ", true);
+    List(List(Int)) rel = keys_of(l.ls[2..re], 0, []);
+    List(List(Int)) lg = keys_of(l.ls[(re + 1)..le], 0, []);
+    Bool ok = le == l.ls.len() && rel.len() == re - 2 && lg.len() == le - re - 1
+        && rk >= 1 && rk <= rel.len() && lk >= 1 && lk <= lg.len() && distinct(rel.concat(lg), 0);
+    if (!ok) { return Roots {.rel = [], .rel_k = 0, .log = [], .log_k = 0, .err = "malformed release roots"}; }
+    return Roots {.rel = rel, .rel_k = rk, .log = lg, .log_k = lk, .err = ""};
+}
+
+List(List(Int)) keys_of(List(Str) ls, Int i, List(List(Int)) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(ls[i], " ");
+    List(Int) k = if (f.len() == 2) { hexn(f[1], 32) } else { [] };
+    return keys_of(ls, i + 1, if (k.len() == 32) { acc.concat([k]) } else { acc });
+}
+
+Bool distinct(List(List(Int)) ks, Int i) {
+    if (i >= ks.len()) { return true; }
+    return !key_in(ks, ks[i], i + 1) && distinct(ks, i + 1);
+}
+
+Bool key_in(List(List(Int)) ks, List(Int) k, Int i) {
+    if (i >= ks.len()) { return false; }
+    return same_bytes(ks[i], k) || key_in(ks, k, i + 1);
+}
+
+// ---- the manifest -------------------------------------------------------------
+
+pub type Build = { Str arch; Str file; Str code; };
+pub type Manifest = { Str version; Int counter; List(Build) builds; Str err; };
+
+pub Manifest parse_manifest(List(Str) body) {
+    Manifest bad = Manifest {.version = "", .counter = 0, .builds = [], .err = "malformed release manifest"};
+    if (body.len() < 4 || body[0] != "pylond-release v1") { return bad; }
+    Str v = val(body[1], "version");
+    Int n = dec(val(body[2], "counter"));
+    List(Build) bs = builds_of(body, 3, []);
+    Bool ok = version_ok(bytes_of(v), 0) && n >= 1 && bs.len() == body.len() - 3 && arch_order(bs, 1);
+    return if (ok) { Manifest {.version = v, .counter = n, .builds = bs, .err = ""} } else { bad };
+}
+
+List(Build) builds_of(List(Str) ls, Int i, List(Build) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(ls[i], " ");
+    Bool ok = f.len() == 4 && f[0] == "pylond" && (f[1] == "aarch64" || f[1] == "x86_64") && hexn(f[2], 32).len() == 32 && hexn(f[3], 32).len() == 32;
+    return if (ok) { builds_of(ls, i + 1, acc.concat([Build {.arch = f[1], .file = f[2], .code = f[3]}])) } else { acc };
+}
+
+// aarch64 before x86_64, each at most once.
+Bool arch_order(List(Build) bs, Int i) {
+    if (i >= bs.len()) { return true; }
+    return bs[i - 1].arch == "aarch64" && bs[i].arch == "x86_64" && arch_order(bs, i + 1);
+}
+
+pub Str manifest_body(Str version, Int counter, List(Build) bs) {
+    return "pylond-release v1\nversion " + version + "\ncounter " + f"{counter}" + "\n" + build_lines(bs, 0, "");
+}
+
+Str build_lines(List(Build) bs, Int i, Str acc) {
+    if (i >= bs.len()) { return acc; }
+    return build_lines(bs, i + 1, acc + "pylond " + bs[i].arch + " " + bs[i].file + " " + bs[i].code + "\n");
+}
+
+// Whether `hash` (hex) is the file hash for `arch`, or for any machine
+// type when arch is "".
+Bool build_has(List(Build) bs, Str arch, Str hash, Int i) {
+    if (i >= bs.len()) { return false; }
+    if ((arch == "" || bs[i].arch == arch) && bs[i].file == hash) { return true; }
+    return build_has(bs, arch, hash, i + 1);
+}
+
+// The code image: a Resid binary without its provenance trailer
+// (COSE_Sign1 || u32 length || "RESIDPROV2"), or the bytes unchanged.
+pub List(Int) code_image(List(Int) bin) {
+    List(Int) magic = bytes_of("RESIDPROV2");
+    Int n = bin.len();
+    if (n < 14 || !same_bytes(bin[(n - 10)..n], magic)) { return bin; }
+    Int len = (bin[n - 14] << 24) | (bin[n - 13] << 16) | (bin[n - 12] << 8) | bin[n - 11];
+    if (len + 14 > n) { return bin; }
+    return bin[0..(n - 14 - len)];
+}
+
+// ---- the log -------------------------------------------------------------------
+
+pub Str sth_body(Int size, List(Int) root) { return "pylond-log v1\nsize " + f"{size}" + "\nroot " + hex_encode(root) + "\n"; }
+
+pub type Proof = { Int size; List(Int) root; List(Str) sigs; Int index; List(List(Int)) path; List(Str) cons; Str err; };
+
+pub Proof parse_proof(Str t) {
+    Proof bad = Proof {.size = 0, .root = [], .sigs = [], .index = 0, .path = [], .cons = [], .err = "malformed log proof"};
+    Lines l = lines_of(t);
+    if (!l.ok || l.ls.len() < 4 || l.ls[0] != "pylond-proof v1") { return bad; }
+    Int n = dec(val(l.ls[1], "size"));
+    List(Int) root = hexn(val(l.ls[2], "root"), 32);
+    Int se = run_end(l.ls, 3, "sig ", true);
+    if (se >= l.ls.len()) { return bad; }
+    Int idx = dec(val(l.ls[se], "index"));
+    Int pe = run_end(l.ls, se + 1, "path ", true);
+    Int ce = run_end(l.ls, pe, "consistency ", true);
+    List(List(Int)) path = hashes_of(l.ls[(se + 1)..pe], 1, 0, []);
+    List(Str) sigs = l.ls[3..se];
+    Bool ok = n >= 1 && root.len() == 32 && idx >= 0 && idx < n && ce == l.ls.len() && path.len() == pe - se - 1 && sigs_ok(sigs, 0);
+    if (!ok) { return bad; }
+    return Proof {.size = n, .root = root, .sigs = sigs, .index = idx, .path = path, .cons = l.ls[pe..ce], .err = ""};
+}
+
+// The hashes in fields from `from` of each line.
+List(List(Int)) hashes_of(List(Str) ls, Int from, Int i, List(List(Int)) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(ls[i], " ");
+    List(List(Int)) hs = if (f.len() == from + 1) { field_hashes(f, from, []) } else { [] };
+    return hashes_of(ls, from, i + 1, if (hs.len() == 1 && hs[0].len() == 32) { acc.concat(hs) } else { acc });
+}
+
+List(List(Int)) field_hashes(List(Str) f, Int i, List(List(Int)) acc) {
+    if (i >= f.len()) { return acc; }
+    List(Int) h = hexn(f[i], 32);
+    if (h.len() != 32) { return [[]]; }
+    return field_hashes(f, i + 1, acc.concat([h]));
+}
+
+// The consistency proof from size m among a proof's lines; ok false when
+// the proof does not carry one.
+pub type Cons = { List(List(Int)) hs; Bool ok; };
+
+pub Cons cons_for(List(Str) ls, Int m, Int i) {
+    if (i >= ls.len()) { return Cons {.hs = [], .ok = false}; }
+    List(Str) f = str_split(ls[i], " ");
+    if (f.len() >= 3 && f[0] == "consistency" && dec(f[1]) == m) {
+        List(List(Int)) hs = field_hashes(f, 2, []);
+        Bool ok = hs.len() == f.len() - 2 && (hs.len() == 0 || hs[0].len() == 32);
+        return Cons {.hs = if (ok) { hs } else { [] }, .ok = ok};
+    }
+    return cons_for(ls, m, i + 1);
+}
+
+pub Str proof_text(Int size, List(Int) root, List(Str) sigs, Int index, List(List(Int)) path, List(Str) cons) {
+    return "pylond-proof v1\nsize " + f"{size}" + "\nroot " + hex_encode(root) + "\n" + joined(sigs)
+        + "index " + f"{index}" + "\n" + path_lines(path, 0, "") + joined(cons);
+}
+
+Str path_lines(List(List(Int)) p, Int i, Str acc) {
+    if (i >= p.len()) { return acc; }
+    return path_lines(p, i + 1, acc + "path " + hex_encode(p[i]) + "\n");
+}
+
+pub Str cons_line(Int m, List(List(Int)) hs) { return "consistency " + f"{m}" + hash_fields(hs, 0, ""); }
+
+Str hash_fields(List(List(Int)) hs, Int i, Str acc) {
+    if (i >= hs.len()) { return acc; }
+    return hash_fields(hs, i + 1, acc + " " + hex_encode(hs[i]));
+}
+
+// ---- the verdict ---------------------------------------------------------------
+
+// What the client accepted, and the state to keep: the newest log head
+// seen (a proof text, whose consistency lines prove older heads) and the
+// release accepted with the highest counter.
+pub type Verdict = { Bool ok; Str why; Str version; Int counter; Int index; Int size; Int signed; Str head; Str rel; };
+
+Verdict no(Str why) { return Verdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }
+
+// Whether `release` and `proof` (the bundled files) are a release of
+// pylond whose `arch` build ("" for any) has file hash `hash`, signed by
+// the release quorum of `roots`, in the log under a tree head signed by
+// the log quorum and consistent with the newest seen (`head`, "" for
+// none), and not older than the newest accepted (`rel`, "" for none).
+pub Verdict verify_release(Str roots, Str release, Str proof, Str arch, Str hash, Str head, Str rel) {
+    Roots r = parse_roots(roots);
+    if (str_len(r.err) > 0) { return no(r.err); }
+    Signed s = split_signed(release);
+    Manifest m = if (s.ok) { parse_manifest(s.body) } else { parse_manifest([]) };
+    if (!s.ok || str_len(m.err) > 0 || !sigs_ok(s.sigs, 0)) { return no("the release manifest is malformed"); }
+    Int signed = signers(joined(s.body), s.sigs, r.rel);
+    if (signed < r.rel_k) { return no("the release is signed by " + f"{signed}" + " of the " + f"{r.rel_k}" + " release keys it needs"); }
+    if (!build_has(m.builds, arch, hash, 0)) { return no("this pylond (sha256 " + hash + ") is not the " + (if (arch == "") { "" } else { arch + " " }) + "build in release " + m.version + "'s manifest"); }
+    Proof p = parse_proof(proof);
+    if (str_len(p.err) > 0) { return no("the log proof is malformed"); }
+    Int lsigned = signers(sth_body(p.size, p.root), p.sigs, r.log);
+    if (lsigned < r.log_k) { return no("the log's tree head is signed by " + f"{lsigned}" + " of the " + f"{r.log_k}" + " log keys it needs"); }
+    if (!inclusion_ok(p.index, p.size, leaf_hash(bytes_of(release)), p.path, p.root)) { return no("the release is not in the log (its inclusion proof does not verify)"); }
+    Str newest = if (str_len(head) == 0) { proof } else { newer_head(r, p, proof, head) };
+    if (str_starts_with(newest, "!")) { return no(str_slice(newest, 1, str_len(newest))); }
+    Str mh = hex_encode(sha256_bytes(bytes_of(joined(s.body))));
+    Lines rl = lines_of(rel);
+    Int before = if (rl.ok && rl.ls.len() >= 2) { dec(val(rl.ls[0], "counter")) } else { -1 };
+    Str bhash = if (before >= 0) { val(rl.ls[1], "manifest") } else { "" };
+    Str bver = if (before >= 0 && rl.ls.len() >= 3) { val(rl.ls[2], "version") } else { "" };
+    if (str_len(rel) > 0 && before < 0) { return no("the record of accepted releases is unreadable"); }
+    if (before > m.counter) { return no("rollback: release " + m.version + " (counter " + f"{m.counter}" + ") is older than release " + bver + " (counter " + f"{before}" + "), accepted before"); }
+    if (before == m.counter && bhash != mh) { return no("release " + m.version + " has counter " + f"{m.counter}" + ", as release " + bver + " accepted before, with another manifest"); }
+    Str nrel = "counter " + f"{m.counter}" + "\nmanifest " + mh + "\nversion " + m.version + "\n";
+    return Verdict {.ok = true, .why = "", .version = m.version, .counter = m.counter, .index = p.index, .size = p.size, .signed = signed, .head = newest, .rel = nrel};
+}
+
+// The newest head after seeing p (whose text is `proof`) with `head`
+// kept: the text to keep, or "!" and why they are not consistent.
+Str newer_head(Roots r, Proof p, Str proof, Str head) {
+    Proof s = parse_proof(head);
+    if (str_len(s.err) > 0 || signers(sth_body(s.size, s.root), s.sigs, r.log) < r.log_k) { return "!the log head kept from before is unreadable or not signed"; }
+    if (p.size == s.size) {
+        return if (same_bytes(p.root, s.root)) { head } else { "!the log's tree head of size " + f"{p.size}" + " differs from the one seen before: the log was forked or rewritten" };
+    }
+    Bool grew = p.size > s.size;
+    Cons c = if (grew) { cons_for(p.cons, s.size, 0) } else { cons_for(s.cons, p.size, 0) };
+    Bool ok = if (grew) { consistency_ok(s.size, p.size, s.root, p.root, c.hs) } else { consistency_ok(p.size, s.size, p.root, s.root, c.hs) };
+    if (!c.ok) { return "!no consistency proof between the log's tree heads of size " + f"{s.size}" + " (seen before) and " + f"{p.size}"; }
+    if (!ok) { return "!the log's tree head of size " + f"{p.size}" + " is not consistent with the one of size " + f"{s.size}" + " seen before: the log was forked or rewritten"; }
+    return if (grew) { proof } else { head };
+}
+
+// ---- producing proofs (tools/release, tests) -----------------------------------
+
+// The proof of entry `index` in the log of leaf hashes `hs`, under the tree
+// head signed by `sigs`, with consistency proofs from every smaller size.
+pub Str make_proof(List(List(Int)) hs, Int index, List(Str) sigs) {
+    return proof_text(hs.len(), tree_root(hs), sigs, index, inclusion_path(index, hs), cons_lines(hs, 1, []));
+}
+
+List(Str) cons_lines(List(List(Int)) hs, Int m, List(Str) acc) {
+    if (m >= hs.len()) { return acc; }
+    return cons_lines(hs, m + 1, acc.concat([cons_line(m, consistency_proof(m, hs))]));
+}
+
+// sig lines by each seed over body.
+pub List(Str) sign_all(List(List(Int)) seeds, Str body, Int i, List(Str) acc) {
+    if (i >= seeds.len()) { return acc; }
+    return sign_all(seeds, body, i + 1, acc.concat([sig_line(seeds[i], body)]));
+}
+
+// The roots text for release keys and log keys.
+pub Str roots_text(List(List(Int)) rel, Int rk, List(List(Int)) lg, Int lk) {
+    return "pylond-roots v1\nrelease-threshold " + f"{rk}" + "\n" + key_lines("release-key ", rel, 0, "") + "log-threshold " + f"{lk}" + "\n" + key_lines("log-key ", lg, 0, "");
+}
+
+Str key_lines(Str w, List(List(Int)) ks, Int i, Str acc) {
+    if (i >= ks.len()) { return acc; }
+    return key_lines(w, ks, i + 1, acc + w + hex_encode(ks[i]) + "\n");
+}
