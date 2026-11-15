@@ -1,0 +1,59 @@
+// The client's check of a pylond release before it is pushed (SPEC 8.2):
+// core/release.resid's verdict on the release files bundled with the
+// build, against the pinned roots (core/release_roots.resid) or a roots
+// file given for a local release, with the state that makes the log and
+// the counter mean something kept in
+//
+//   $PYLON_HOME/pylond-trust/ROOTS-ID/head      the newest log head seen
+//                                               (a proof file)
+//   $PYLON_HOME/pylond-trust/ROOTS-ID/release   the release accepted with
+//                                               the highest counter
+//
+// ROOTS-ID is the first 8 bytes of SHA-256 of the roots text, in hex, so
+// releases signed by test or local keys never move the record kept for
+// the pinned ones.
+
+import "crypto.resid";
+import "wire.resid";
+import "known.resid";
+import "release.resid";
+import "release_roots.resid";
+
+// Where a release's files are: DIR/pylond.release and, unless given,
+// DIR/pylond.proof.
+pub Str release_file(Str dir) { return dir + "/pylond.release"; }
+pub Str proof_file(Str dir) { return dir + "/pylond.proof"; }
+
+// The directory of a path ("." for a bare name).
+pub Str dir_of(Str path) {
+    List(Str) parts = str_split(path, "/");
+    if (parts.len() <= 1) { return "."; }
+    Str d = str_join(parts[0..(parts.len() - 1)], "/");
+    return if (str_len(d) == 0) { "/" } else { d };
+}
+
+// The verdict for the build of `arch` ("" for any) with hash `hash`, from
+// the release in `dir` and the proof at `proof`, against the roots in
+// `roots_path` ("" for the pinned ones). On acceptance the state is
+// updated before this returns; a verdict that cannot be recorded is a
+// refusal.
+@requires(filesystem, environment)
+pub Verdict release_gate(Str dir, Str proof, Str arch, Str hash, Str roots_path) {
+    Str roots = if (str_len(roots_path) > 0) { if (filesystem.exists(roots_path)) { filesystem.read_all(roots_path) } else { "" } } else { pinned_roots() };
+    if (str_len(roots) == 0) {
+        Str why = if (str_len(roots_path) > 0) { "cannot read the roots file " + roots_path } else { "this build of pylon pins no pylond release keys yet (SPEC 8.2)" };
+        return gate_no(why);
+    }
+    Str rf = release_file(dir);
+    if (!filesystem.exists(rf)) { return gate_no("no signed release beside this pylond (" + rf + ")"); }
+    if (!filesystem.exists(proof)) { return gate_no("no log proof for this release (" + proof + ")"); }
+    Str sd = pylon_home() + "/pylond-trust/" + hex_encode(sha256_bytes(bytes_of(roots))[0..8]);
+    Str head = if (filesystem.exists(sd + "/head")) { filesystem.read_all(sd + "/head") } else { "" };
+    Str rel = if (filesystem.exists(sd + "/release")) { filesystem.read_all(sd + "/release") } else { "" };
+    Verdict v = verify_release(roots, filesystem.read_all(rf), filesystem.read_all(proof), arch, hash, head, rel);
+    if (!v.ok) { return v; }
+    Bool kept = filesystem.create_dir(sd) && (v.head == head || filesystem.write_all(sd + "/head", v.head)) && (v.rel == rel || filesystem.write_all(sd + "/release", v.rel));
+    return if (kept) { v } else { gate_no("cannot record the accepted release in " + sd) };
+}
+
+Verdict gate_no(Str why) { return Verdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }

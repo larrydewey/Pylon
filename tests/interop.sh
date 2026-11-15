@@ -290,11 +290,92 @@ kill "$(cat "$WORK/target.pid")" 2>/dev/null
 
 # --- the Pylon protocol (EXPERIMENTAL): pylond, UDP, roaming --------------------
 PYLOND="$(dirname "$PYLON")/pylond"
+RELTOOL="$(dirname "$PYLON")/pylon-release"
 if [ -x "$PYLOND" ]; then
+    # Release integrity (SPEC 8.2): pylond goes out as a release signed by
+    # 2 of 3 test release keys and logged under a head signed by a test log
+    # key, made here with pylon-release; pylon trusts those keys only
+    # through --pylond-roots (this build pins no release keys yet).
+    PYF="--pylond-unverified --pylond $PYLOND"
+    if [ -x "$RELTOOL" ]; then
+        mkdir -p rk rel log
+        for k in r1 r2 r3 l1 x1; do "$RELTOOL" keygen rk/$k > /dev/null; done
+        "$RELTOOL" roots roots 2 rk/r1.pub rk/r2.pub rk/r3.pub --log 1 rk/l1.pub > /dev/null
+        # Release a (0.1.0, counter 1), then b (0.2.0, counter 2): a log of two.
+        newrel() {   # DIR VERSION COUNTER KEYS...
+            local d=$1 v=$2 n=$3; shift 3
+            mkdir -p "$d" && cp "$PYLOND" "$d/pylond-x86_64"
+            "$RELTOOL" manifest "$v" "$n" "$d" "$d/pylond.release" > /dev/null
+            for k in "$@"; do "$RELTOOL" sign "$d/pylond.release" rk/$k.key > /dev/null; done
+        }
+        logrel() {   # LOG DIR...: append each, sign the head, write each proof
+            local l=$1 d; shift
+            for d in "$@"; do "$RELTOOL" log-append "$l" "$d/pylond.release" > /dev/null; done
+            "$RELTOOL" sign "$l/head" rk/l1.key > /dev/null
+            for d in "$@"; do "$RELTOOL" proof "$l" "$d/pylond.release" "$d/pylond.proof" > /dev/null; done
+        }
+        newrel rel 0.1.0 1 r1 r2
+        newrel relb 0.2.0 2 r2 r3
+        logrel log rel relb
+        PYF="--pylond-roots $WORK/roots --pylond $WORK/rel"
+        check "release: pylon-release verifies the test release" 0 "signed by 2, entry 0 of 2" \
+            "$RELTOOL" verify roots rel
+        check "release: pylon pylond-check accepts it" 0 "pylond-x86_64 0.1.0 (release 1): signed by 2 release keys, entry 0 of the log's 2" \
+            "$PYLON" pylond-check --pylond-roots roots rel
+        check "release: refused under the pinned keys (none yet)" 1 "refusing to push pylond: this build of pylon pins no pylond release keys yet" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond rel "$USER_NAME@127.0.0.1"
+        # A tampered pylond: one byte more than the release names.
+        cp -r rel relt && printf 'x' >> relt/pylond-x86_64
+        TH=$(sha256sum relt/pylond-x86_64 | cut -d' ' -f1)
+        check "release: a tampered pylond is refused before it is pushed" 1 "refusing to push pylond: this pylond (sha256 $TH) is not the x86_64 build in release 0.1.0's manifest" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond relt "$USER_NAME@127.0.0.1"
+        check "release: the tampered pylond never reached the host" 0 "absent" \
+            bash -c "test -e \$HOME/.cache/pylon/pylond-$TH && echo present || echo absent"
+        # Its manifest edited to name the tampered build: the signatures fail.
+        sed -i "s/^pylond x86_64 [0-9a-f]*/pylond x86_64 $TH/" relt/pylond.release
+        check "release: an edited manifest loses its signatures" 1 "signed by 0 of the 2 release keys" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond relt "$USER_NAME@127.0.0.1"
+        # Signed by one key of the two needed, logged.
+        newrel rel1 0.1.1 3 r1; logrel log1 rel1
+        check "release: one signature of the two needed is refused" 1 "signed by 1 of the 2 release keys it needs" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond rel1 "$USER_NAME@127.0.0.1"
+        # Signed by an unpinned key with a pinned one.
+        newrel relx 0.1.1 3 r1 x1; logrel logx relx
+        check "release: an unpinned signer does not count" 1 "signed by 1 of the 2 release keys it needs" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond relx "$USER_NAME@127.0.0.1"
+        # Signed but not logged: the proof is another release's.
+        newrel relu 0.3.0 4 r1 r2; cp relb/pylond.proof relu/
+        check "release: an unlogged release is refused" 1 "the release is not in the log" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond relu "$USER_NAME@127.0.0.1"
+        # Its tree head signed by a release key instead of the log key.
+        newrel rels 0.3.0 4 r1 r2; "$RELTOOL" log-append logs rels/pylond.release > /dev/null
+        "$RELTOOL" sign logs/head rk/r1.key > /dev/null; "$RELTOOL" proof logs rels/pylond.release rels/pylond.proof > /dev/null
+        check "release: a tree head without the log key is refused" 1 "tree head is signed by 0 of the 1 log keys" \
+            "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond rels "$USER_NAME@127.0.0.1"
+        # Rollback and forks, in a home of their own: release b (counter 2)
+        # pushed, then a (counter 1) is refused; a log forked at the same
+        # size is refused.
+        mkdir -p rbhome && cp "$PYLON_HOME/known_hosts" rbhome/
+        check "release: pylond-check records release 2" 0 "0.2.0 (release 2)" \
+            env PYLON_HOME="$WORK/rbhome" "$PYLON" pylond-check --pylond-roots roots relb
+        check "release: a rollback to release 1 is refused" 1 "rollback: release 0.1.0 (counter 1) is older than release 0.2.0 (counter 2), accepted before" \
+            env PYLON_HOME="$WORK/rbhome" "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond rel "$USER_NAME@127.0.0.1"
+        newrel relf 0.2.0 2 r1 r3; cp rel/pylond.release relf0.release
+        mkdir -p logf && "$RELTOOL" log-append logf relf0.release > /dev/null
+        "$RELTOOL" log-append logf relf/pylond.release > /dev/null; "$RELTOOL" sign logf/head rk/l1.key > /dev/null
+        "$RELTOOL" proof logf relf/pylond.release relf/pylond.proof > /dev/null
+        check "release: a forked log (another head of the same size) is refused" 1 "differs from the one seen before: the log was forked or rewritten" \
+            env PYLON_HOME="$WORK/rbhome" "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond-roots roots --pylond relf "$USER_NAME@127.0.0.1"
+        # The developer escape hatch says what it skips.
+        check "release: --pylond-unverified pushes, with a warning" 0 "WARNING: pushing an unverified pylond" \
+            bash -c "mkdir -p \$HOME/pylon-interop-$PORT && echo unverified > unv.txt && '$PYLON' put -p $PORT --pylond-unverified --pylond '$PYLOND' unv.txt '$USER_NAME@127.0.0.1:pylon-interop-$PORT/unv.txt'"
+    else
+        echo "note: no $RELTOOL; the Pylon protocol cases run with --pylond-unverified"
+    fi
     mkdir -p www2 && echo pylon-proto-ok > www2/small.txt && head -c 3000000 /dev/urandom > www2/big.bin
     W2=$((PORT + 9)); L2=$((PORT + 10)); L3=$((PORT + 11))
     ( cd www2 && exec python3 -m http.server $W2 --bind 127.0.0.1 ) > /dev/null 2>&1 & WEB2=$!
-    "$PYLON" -p $PORT -N -L $L2:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pp.log & PP=$!
+    "$PYLON" -p $PORT -N -L $L2:127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pp.log & PP=$!
     for _ in $(seq 100); do grep -q "forwarding" pp.log && break; sleep 0.2; done
     PPORT=$(sed -n 's/.*session to 127.0.0.1:\([0-9]*\).*/\1/p' pp.log)
     check "pylon protocol: SSH closed after the bootstrap" 0 "SSH closed" cat pp.log
@@ -318,7 +399,7 @@ except socket.timeout:
     # SOCKS5 (-D) over the Pylon protocol: the handshake runs in the client,
     # pylond connects (and resolves names).
     DP=$((PORT + 13))
-    "$PYLON" -p $PORT -N -D $DP --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pd.log & PD=$!
+    "$PYLON" -p $PORT -N -D $DP $PYF "$USER_NAME@127.0.0.1" 2> pd.log & PD=$!
     for _ in $(seq 100); do grep -q "SOCKS5" pd.log && break; sleep 0.2; done
     check "pylon protocol: SOCKS5 (-D), a host name resolved by pylond" 0 "pylon-proto-ok" \
         curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://localhost:$W2/small.txt"
@@ -332,7 +413,7 @@ except socket.timeout:
     # Remote forwarding (-R) over the Pylon protocol: pylond (confined)
     # listens on its loopback, the client connects here.
     RP=$((PORT + 14))
-    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pR.log & PRR=$!
+    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pR.log & PRR=$!
     for _ in $(seq 100); do grep -q "from here" pR.log && break; sleep 0.2; done
     check "pylon protocol: -R, the server's port reaches here" 0 "pylon-proto-ok" \
         curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
@@ -342,7 +423,7 @@ except socket.timeout:
         bash -c "P=\$(printf '%04X' $RP); grep -q \" 0100007F:\$P 00000000:0000 0A\" /proc/net/tcp && ! grep -q \" 00000000:\$P 00000000:0000 0A\" /proc/net/tcp"
     check "pylon protocol: -R, the port is held by the confined daemon" 0 "Seccomp:	2" listener_seccomp $RP
     kill $PRR 2>/dev/null; wait $PRR 2>/dev/null
-    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pR2.log & PRR=$!
+    "$PYLON" -p $PORT -N -R $RP:127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pR2.log & PRR=$!
     for _ in $(seq 100); do grep -q "from here" pR2.log && break; sleep 0.2; done
     check "pylon protocol: -R, a new client takes the port over" 0 "pylon-proto-ok" \
         curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
@@ -352,37 +433,37 @@ except socket.timeout:
     HD="pylon-interop-$PORT"; mkdir -p "$HOME/$HD"; head -c 3000000 /dev/urandom > pf.bin
     PFSUM="$(sha256sum pf.bin | cut -d' ' -f1)"
     check "pylon protocol: put 3 MB (a path under \$HOME)" 0 "3000000 bytes" \
-        "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$HD/pf.bin"
+        "$PYLON" put -p $PORT $PYF pf.bin "$USER_NAME@127.0.0.1:$HD/pf.bin"
     check "pylon protocol: pylond wrote the same bytes" 0 "$PFSUM" sha256sum "$HOME/$HD/pf.bin"
     check "pylon protocol: get it back intact" 0 "$PFSUM" \
-        bash -c "'$PYLON' get -p $PORT --pylond '$PYLOND' '$USER_NAME@127.0.0.1:$HD/pf.bin' pg.bin 2>/dev/null && sha256sum pg.bin"
+        bash -c "'$PYLON' get -p $PORT $PYF '$USER_NAME@127.0.0.1:$HD/pf.bin' pg.bin 2>/dev/null && sha256sum pg.bin"
     check "pylon protocol: get refuses to replace a local file" 1 "or --resume to continue it" \
-        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/pf.bin" pg.bin
+        "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:$HD/pf.bin" pg.bin
     check "pylon protocol: an interrupted get" 1 "stopped" \
-        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
+        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
     check "pylon protocol: get --resume continues where it stopped" 0 "resumed at 983040" \
-        "$PYLON" get -p $PORT --pylond "$PYLOND" --resume "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
+        "$PYLON" get -p $PORT $PYF --resume "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
     check "pylon protocol: the resumed get is intact" 0 "$PFSUM" sha256sum pi.bin
     check "pylon protocol: an interrupted put" 1 "stopped" \
-        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
+        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" put -p $PORT $PYF pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
     check "pylon protocol: put --resume continues where it stopped" 0 "resumed at" \
-        "$PYLON" put -p $PORT --pylond "$PYLOND" --resume pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
+        "$PYLON" put -p $PORT $PYF --resume pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
     check "pylon protocol: the resumed put is intact" 0 "$PFSUM" sha256sum "$HOME/$HD/pp.bin"
     check "pylon protocol: a missing remote file" 1 "no such file" \
-        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/nope" nope.bin
+        "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:$HD/nope" nope.bin
     check "pylon protocol: a remote name with escape bytes is refused" 2 "printable ASCII" \
-        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/$(printf '\033[31mred')" red2.bin
+        "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:$HD/$(printf '\033[31mred')" red2.bin
     check "pylon protocol: a put outside \$HOME is refused (Landlock)" 1 "cannot write the file" \
-        "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$WORK/outside.bin"
+        "$PYLON" put -p $PORT $PYF pf.bin "$USER_NAME@127.0.0.1:$WORK/outside.bin"
     rm -rf "$HOME/$HD"
     # Roaming: the client moves to a new UDP socket mid-transfer.
-    PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
+    PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
     for _ in $(seq 100); do grep -q "forwarding" pr.log && break; sleep 0.2; done
     check "pylon protocol: roaming mid-transfer, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
         bash -c "curl -s -m 60 http://127.0.0.1:$L3/big.bin | sha256sum"
     check "pylon protocol: the client did change sockets" 0 "moved to a new UDP socket" cat pr.log
     # Rekeying every second during a transfer (the test hook; 2 minutes otherwise).
-    PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 12)):127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pk.log & PK=$!
+    PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 12)):127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pk.log & PK=$!
     for _ in $(seq 100); do grep -q "forwarding" pk.log && break; sleep 0.2; done
     check "pylon protocol: rekeying mid-transfer, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
         bash -c "sleep 2.5; curl -s -m 60 --limit-rate 600k http://127.0.0.1:$((PORT + 12))/big.bin | sha256sum"
@@ -390,11 +471,11 @@ except socket.timeout:
     kill $PK 2>/dev/null; wait $PK 2>/dev/null
     kill $PR $WEB2 2>/dev/null; wait $PR $WEB2 2>/dev/null
     check "pylon protocol: a terminal (type, resize, paste, exit status)" 0 "interactive ok" \
-        python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+        python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     check "pylon protocol: a terminal that roams mid-session" 0 "interactive ok" \
-        env PYLON_TEST_REBIND_AFTER=60 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+        env PYLON_TEST_REBIND_AFTER=60 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     check "pylon protocol: re-attach from a new client (screen and shell kept)" 0 "reattach ok" \
-        python3 "$(dirname "$HOSTILE")/attach_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+        python3 "$(dirname "$HOSTILE")/attach_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     # One daemon for every client: the confined daemon, its terminal
     # broker, and the original process waiting on the daemon.
     check "pylon protocol: one session daemon serves every client" 0 "3" \
@@ -402,15 +483,15 @@ except socket.timeout:
     check "pylond: confined (seccomp filter, no new privileges)" 0 "NoNewPrivs:	1 Seccomp:	2" \
         bash -c "for p in \$(pgrep -f 'pylond-[0-9a-f]* serve'); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
     check "pylon protocol: app mode over the Pylon protocol" 0 "app ok" \
-        python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
+        python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
-        "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
+        "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1" true
     # Under load pylond answers an init with a cookie and does no
     # asymmetric work until the init comes back with mac2 (a fresh daemon
     # started with the test hook that keeps it always under load).
     pkill -f "pylond-.* serve" 2>/dev/null; sleep 0.5
     ( cd www2 && exec python3 -m http.server $W2 --bind 127.0.0.1 ) > /dev/null 2>&1 & WEB2=$!
-    PYLON_TEST_BUSY=1 PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 15)):127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pc.log & PC=$!
+    PYLON_TEST_BUSY=1 PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 15)):127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pc.log & PC=$!
     for _ in $(seq 100); do grep -q "forwarding" pc.log && break; sleep 0.2; done
     check "pylon protocol: under load, the handshake takes a cookie (mac2)" 0 "sent a cookie; retrying with mac2" cat pc.log
     check "pylon protocol: under load, 3 MB intact while rekeying" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
