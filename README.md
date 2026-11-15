@@ -4,7 +4,8 @@ A security-first remote terminal: SSH, file transfer, port forwarding and
 roaming sessions, meant to replace Termius, ConnectBot, JuiceSSH and the
 SSH side of Termux.
 
-- **Strict SSH to every server.** A small modern subset (curve25519, AEAD
+- **Strict SSH to every server.** A small modern subset (ML-KEM-768 +
+  X25519 hybrid, curve25519, AEAD
   ciphers only, Ed25519/ECDSA/RSA-SHA2), strict key exchange (the Terrapin
   fix) required, no trust on first use, host keys pinned only against a
   fingerprint you obtained out of band.
@@ -30,7 +31,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 
 | | |
 |---|---|
-| Key exchange | `curve25519-sha256` with strict kex and ext-info |
+| Key exchange | `mlkem768x25519-sha256` (post-quantum hybrid, ML-KEM-768 from Resid) first, then `curve25519-sha256`; strict kex and ext-info |
 | Host keys | `ssh-ed25519`, `ecdsa-sha2-nistp256/384`, `rsa-sha2-512/256` (RSA ≥ 2048) |
 | Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` |
 | Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound |
@@ -43,13 +44,14 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-54 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
-ProxyJump and hostile-server cases in `tests/interop.sh`,
+58 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+ProxyJump, post-quantum and hostile-server cases in `tests/interop.sh`,
 known-answer tests for the key derivation in `tests/kex_test.resid`, and
 a mutation fuzzer in `tests/fuzz_proxy.py`.
 
-Next (SPEC 17): the hybrid post-quantum key exchanges
-(needs ML-KEM in Resid's standard library), then the Android app. Open
+Next (SPEC 17): an OpenSSH 10 interop run for the hybrid (OpenSSH 9.6
+here has no ML-KEM; it is checked against a reference server built on
+OpenSSL's primitives, `tests/pq_server.py`), then the Android app. Open
 compiler warnings: SPEC Appendix A, I6.
 
 ## Build and use

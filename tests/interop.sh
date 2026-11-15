@@ -220,6 +220,32 @@ ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger
 check "unknown user key fails cleanly"         1 "accepted none" \
     "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
 
+# --- post-quantum hybrid (mlkem768x25519-sha256) ------------------------------
+# OpenSSH 9.6 here has no ML-KEM, so a reference server built on OpenSSL's
+# primitives (pq_server.py) checks the hybrid exchange end to end.
+PQPORT=$((PORT + 8)); PQSEED=0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526
+PQFP=$(python3 -c "
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+import hashlib, base64, struct
+pk = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex('$PQSEED')).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+b = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + pk
+print('SHA256:' + base64.b64encode(hashlib.sha256(b).digest()).decode().rstrip('='))")
+python3 "$(dirname "$HOSTILE")/pq_server.py" $PQPORT $PQSEED ok > pq.log 2>&1 & PQ=$!
+sleep 0.5
+check "pq: pin verifies the hybrid exchange's signature" 0 "pinned" \
+    "$PYLON" pin -p $PQPORT 127.0.0.1 "$PQFP"
+check "pq: keys agree in both directions"      1 "post-quantum handshake verified" \
+    "$PYLON" -p $PQPORT "$USER_NAME@127.0.0.1" true
+check "pq: the server decrypted our packet"    0 "SERVER-DECRYPTED type 5: ssh-userauth" \
+    cat pq.log
+kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
+python3 "$(dirname "$HOSTILE")/pq_server.py" $PQPORT $PQSEED bad-ct > pq2.log 2>&1 & PQ=$!
+sleep 0.5
+check "pq: a corrupted ML-KEM ciphertext fails the signature" 1 "does not verify" \
+    "$PYLON" -p $PQPORT "$USER_NAME@127.0.0.1" true
+kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
+
 # --- hostile servers (refused before any key exchange completes) -------------
 hostile() {   # scenario expected-substring
     local hp=$((PORT + 1))

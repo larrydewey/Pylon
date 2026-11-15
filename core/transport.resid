@@ -285,13 +285,16 @@ pub Handshake handshake(Conn c0, Trust trust, Bool allow_no_strict) {
 
 @requires(network, declassify)
 Handshake run_kex(Conn c, Chosen ch, List(Int) i_c, List(Int) i_s, Trust trust) {
+    Bool hybrid = is_hybrid(ch.kex);
     Ecdh e = ecdh_new();
-    Conn c1 = send_packet(c, ecdh_init_payload(e));
+    Hybrid hy = if (hybrid) { hybrid_new() } else { Hybrid {.kem = MlkemKeys {.ek = [], .dk = []}, .x = e} };
+    Conn c1 = send_packet(c, if (hybrid) { hybrid_init_payload(hy) } else { ecdh_init_payload(e) });
     Pkt r = kex_packet(c1);
     if (!conn_ok(r.c)) { return Handshake {.c = r.c, .host = no_key(), .fingerprint = ""}; }
-    Reply rep = parse_ecdh_reply(r.p);
+    Reply rep = if (hybrid) { parse_hybrid_reply(r.p) } else { parse_ecdh_reply(r.p) };
     if (!rep.ok) { return Handshake {.c = conn_err(r.c, "malformed key exchange reply"), .host = no_key(), .fingerprint = ""}; }
-    Exchanged x = finish_ecdh(e, rep, our_version(), r.c.v_s, i_c, i_s, ch.hostkey, ch.c2s, ch.s2c, r.c.sid);
+    Exchanged x = if (hybrid) { finish_hybrid(hy, rep, our_version(), r.c.v_s, i_c, i_s, ch.hostkey, ch.c2s, ch.s2c, r.c.sid) }
+        else { finish_ecdh(e, rep, our_version(), r.c.v_s, i_c, i_s, ch.hostkey, ch.c2s, ch.s2c, r.c.sid) };
     if (str_len(x.err) > 0) { return Handshake {.c = conn_err(r.c, x.err), .host = x.host, .fingerprint = ""}; }
     Str fp = fingerprint(rep.host_blob);
     // On a rekey the host key must be the one verified at the start.

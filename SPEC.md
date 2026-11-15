@@ -685,7 +685,7 @@ content.
 
 | Phase | Content |
 |---|---|
-| 0 | SSH transport core in Resid: profile of 5 (key exchange `curve25519-sha256` only until Resid has ML-KEM), host verification against pinned keys, agent authentication with session binding, exec and shell channels; `pylon` CLI; interop tests against OpenSSH. *Done: exec and interactive shells with keystroke obfuscation, local forwarding, `Secret(T)` keying material.* |
+| 0 | SSH transport core in Resid: profile of 5 (key exchange `mlkem768x25519-sha256` and `curve25519-sha256`; `sntrup761x25519-sha512` not implemented), host verification against pinned keys, agent authentication with session binding, exec and shell channels; `pylon` CLI; interop tests against OpenSSH. *Done: exec and interactive shells with keystroke obfuscation, local forwarding, `Secret(T)` keying material.* |
 | 1 | Android app: host list, terminal emulator, Symbolon IPC, host trust of 6 with sync, SFTP, forwards, ProxyJump. |
 | 1b | Without Symbolon (7.6): hardware keys, external agents, imported key files, with the warning. |
 | 2 | `pylond`: delivery (8) with reproducible, logged releases; Pylon protocol (9); persistent sessions with signed re-attach, screen sync and scrollback (10); Pylon streams (11); formal models and external review. Linux desktop app. |

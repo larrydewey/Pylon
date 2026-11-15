@@ -13,13 +13,19 @@ import "sha256g.resid";
 import "wire.resid";
 import "hostkey.resid";
 import "cipher.resid";
+import "keccakg.resid";
+import "mlkem.resid";
 
 pub Int msg_kexinit() { return 20; }
 pub Int msg_newkeys() { return 21; }
 pub Int msg_kex_ecdh_init() { return 30; }
 pub Int msg_kex_ecdh_reply() { return 31; }
 
-pub List(Str) our_kex() { return ["curve25519-sha256", "curve25519-sha256@libssh.org"]; }
+// The post-quantum hybrid first (draft-ietf-sshm-mlkem-hybrid-kex, OpenSSH
+// 9.9+), then curve25519 for servers that do not have it yet.
+pub List(Str) our_kex() { return ["mlkem768x25519-sha256", "curve25519-sha256", "curve25519-sha256@libssh.org"]; }
+
+pub Bool is_hybrid(Str kex) { return kex == "mlkem768x25519-sha256"; }
 
 pub List(Str) our_host_key_algs() {
     return ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "rsa-sha2-512", "rsa-sha2-256"];
@@ -89,7 +95,7 @@ pub Chosen choose(Peer s, List(Str) host_algs, Bool first) {
     Bool zc = s.comp_c2s.contains("none") && s.comp_s2c.contains("none");
     Bool strict = first && s.kex.contains("kex-strict-s-v00@openssh.com");
     Str err = if (!s.ok) { "malformed KEXINIT" }
-        else { if (kex == "") { "no common key exchange method (Pylon offers only curve25519-sha256)" }
+        else { if (kex == "") { "no common key exchange method (Pylon offers mlkem768x25519-sha256 and curve25519-sha256)" }
         else { if (hk == "") { "no common host key algorithm" }
         else { if (c2s == "" || s2c == "") { "no common AEAD cipher (Pylon offers only chacha20-poly1305 and AES-GCM)" }
         else { if (!zc) { "server requires compression" }
@@ -114,6 +120,18 @@ pub Ecdh ecdh_new() {
 pub List(Int) ecdh_init_payload(Ecdh e) { return [msg_kex_ecdh_init()].concat(sstring(e.pub)); }
 
 pub type Reply = { Bool ok; List(Int) host_blob; List(Int) q_s; List(Int) sig; };
+
+// The hybrid reply: the host key, S_REPLY = ML-KEM ciphertext (1088
+// bytes) || server X25519 share (32), and the signature; q_s carries
+// S_REPLY.
+pub Reply parse_hybrid_reply(List(Int) p) {
+    GotInt t = rd_byte(rd(p));
+    Got ks = rd_str(t.r);
+    Got sr = rd_str(ks.r);
+    Got sig = rd_str(sr.r);
+    Bool ok = t.v == msg_kex_ecdh_reply() && rd_ok(sig.r) && rd_done(sig.r) && sr.v.len() == 1088 + 32;
+    return Reply {.ok = ok, .host_blob = ks.v, .q_s = sr.v, .sig = sig.v};
+}
 
 pub Reply parse_ecdh_reply(List(Int) p) {
     GotInt t = rd_byte(rd(p));
@@ -258,6 +276,43 @@ pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List
     Int kc = cipher_key_len(c2s);
     Int ks = cipher_key_len(s2c);
     Derived d = derive_all(shared, hin, old_sid, ivc, ivs, kc, ks);
+    List(Int) h = pub_hash(d.h);
+    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
+    Material m = Material {.h = h, .iv_c = pub_iv(d.iv_c), .iv_s = pub_iv(d.iv_s), .key_c = d.key_c, .key_s = d.key_s};
+    return Exchanged {.err = "", .m = m, .host = host};
+}
+
+// ============================================================================
+// mlkem768x25519-sha256
+// ============================================================================
+//
+// C_INIT = ML-KEM-768 encapsulation key || X25519 share; the server
+// answers S_REPLY = ciphertext || its X25519 share. K = SHA-256(K_mlkem ||
+// K_x25519), and K enters the exchange hash and the key derivation as an
+// SSH string (its length is fixed, so no encoding depends on its value).
+
+pub type Hybrid = { MlkemKeys kem; Ecdh x; };
+
+@requires(declassify)
+pub Hybrid hybrid_new() { return Hybrid {.kem = mlkem768_keygen(), .x = ecdh_new()}; }
+
+pub List(Int) hybrid_init(Hybrid h) { return h.kem.ek.concat(h.x.pub); }
+
+pub List(Int) hybrid_init_payload(Hybrid h) { return [msg_kex_ecdh_init()].concat(sstring(hybrid_init(h))); }
+
+@requires(declassify)
+pub Exchanged finish_hybrid(Hybrid hy, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg, Str c2s, Str s2c, List(Int) old_sid) {
+    Option(PubKey) ok = key_of_blob(r.host_blob);
+    PubKey host = ok else { no_key() };
+    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
+    List(Secret(UInt(8))) kpq = mlkem768_decaps(hy.kem.dk, r.q_s[0..1088]);
+    // Empty when the X25519 result is all zeros (a low-order point).
+    List(Secret(UInt(8))) kcl = x25519g_shared(hy.x.priv, r.q_s[1088..1120]);
+    if (kpq.len() != 32 || kcl.len() != 32) { return Exchanged {.err = "the server's key share is invalid", .m = no_material(), .host = host}; }
+    List(Secret(UInt(8))) kenc = lift(u32_be(32)).concat(sha256g(kpq.concat(kcl)));
+    List(Int) hin = sstr(v_c).concat(sstr(v_s)).concat(sstring(i_c)).concat(sstring(i_s))
+        .concat(sstring(r.host_blob)).concat(sstring(hybrid_init(hy))).concat(sstring(r.q_s));
+    Derived d = derive_shape(kenc, hin, old_sid, cipher_iv_len(c2s), cipher_iv_len(s2c), cipher_key_len(c2s), cipher_key_len(s2c));
     List(Int) h = pub_hash(d.h);
     if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
     Material m = Material {.h = h, .iv_c = pub_iv(d.iv_c), .iv_s = pub_iv(d.iv_s), .key_c = d.key_c, .key_s = d.key_s};
