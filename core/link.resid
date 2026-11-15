@@ -20,8 +20,15 @@
 //   SESSIONS 12 | nonce (4) | count (1) | count x            pylond -> client
 //            (session (4) | attached (1) | rows (2) | cols (2) | idle s (4) |
 //             title length (1) | title)
-// LIST and SESSIONS are not acknowledged: the client asks again until it
-// has an answer for its nonce.
+//   LISTEN 13 | port (4)                                     client -> pylond
+//   LISTENING 14 | port (4) | ok (1)                         pylond -> client
+//   CONNECT 15 | sid (4) | port (2)                          pylond -> client
+//   FILE   16 | sid (4) | op (1) | flags (1) | path          client -> pylond
+// LIST and SESSIONS, LISTEN and LISTENING are not acknowledged: the client
+// asks again until it has an answer for its nonce (port).
+// OPEN, CONNECT and FILE are confirmed by the peer's ACK (offset 0) or by
+// any frame of the stream, and sent again every rto until then; a repeat
+// of one for a stream the peer has is confirmed again.
 // Reliability is go-back-N: a sender keeps its unacknowledged bytes and,
 // after 300 ms without progress, sends them again from the first one; a
 // receiver takes only the next byte it expects. The window is 256 KiB.
@@ -54,27 +61,31 @@ pub Int key_life_ns() { return 180000000000; }
 // external stream the bytes received and not yet taken, and the exit code
 // to put in (or taken from) the FIN, -1 when none.
 pub type St = { Int id; Int fd; Int acked; List(Int) unacked; Int next; Int recv; Bool eof; Int fin_at; Bool fin_in; Int progress;
-    Bool ext; List(Int) inbox; Int code; };
+    Bool ext; List(Int) inbox; Int code; List(Int) opening; Bool socks; };
 
 // What happened that the program must act on: terminals asked for
 // ([sid, rows, cols]), resizes ([sid, rows, cols]), terminal exits
 // ([sid, code]), attaches ([sid, session, rows, cols]), session lists
 // asked for ([nonce]) and received ([nonce, payload...]).
-pub type Ev = { List(List(Int)) shells; List(List(Int)) resizes; List(List(Int)) exits; List(List(Int)) attaches; List(List(Int)) lists; List(List(Int)) sessions; };
+pub type Ev = { List(List(Int)) shells; List(List(Int)) resizes; List(List(Int)) exits; List(List(Int)) attaches; List(List(Int)) lists; List(List(Int)) sessions;
+    List(List(Int)) connects; List(List(Int)) listens; List(List(Int)) listening; List(List(Int)) files; };
 
 pub type Link = {
     Bool server; Int udp; List(Int) addr; Int port; SessionKeys k; Int tx_ctr; Window win;
     List(St) streams; Int next_sid; Int last_rx; Int last_tx; Str err; Ev ev; Int keyed;
 };
 
-Ev ev_none() { return Ev {.shells = [], .resizes = [], .exits = [], .attaches = [], .lists = [], .sessions = []}; }
+Ev ev_none() { return Ev {.shells = [], .resizes = [], .exits = [], .attaches = [], .lists = [], .sessions = [], .connects = [], .listens = [], .listening = [], .files = []}; }
 
-// One event added: kind 0 shell, 1 resize, 2 exit, 3 attach, 4 list, 5 sessions.
+// One event added: kind 0 shell, 1 resize, 2 exit, 3 attach, 4 list, 5 sessions,
+// 6 connect, 7 listen, 8 listening, 9 file.
 Link ev_add(Link l, Int kind, List(Int) v) {
     Ev e = l.ev;
     Ev n = Ev {.shells = if (kind == 0) { e.shells.concat([v]) } else { e.shells }, .resizes = if (kind == 1) { e.resizes.concat([v]) } else { e.resizes },
         .exits = if (kind == 2) { e.exits.concat([v]) } else { e.exits }, .attaches = if (kind == 3) { e.attaches.concat([v]) } else { e.attaches },
-        .lists = if (kind == 4 && e.lists.len() < 4) { e.lists.concat([v]) } else { e.lists }, .sessions = if (kind == 5) { e.sessions.concat([v]) } else { e.sessions }};
+        .lists = if (kind == 4 && e.lists.len() < 4) { e.lists.concat([v]) } else { e.lists }, .sessions = if (kind == 5) { e.sessions.concat([v]) } else { e.sessions },
+        .connects = if (kind == 6) { e.connects.concat([v]) } else { e.connects }, .listens = if (kind == 7 && e.listens.len() < 16) { e.listens.concat([v]) } else { e.listens },
+        .listening = if (kind == 8) { e.listening.concat([v]) } else { e.listening }, .files = if (kind == 9) { e.files.concat([v]) } else { e.files }};
     return with_ev(l, n);
 }
 
@@ -149,46 +160,62 @@ List(St) drop(List(St) ss, Int i) { return ss[0..i].concat(ss[i + 1..ss.len()]);
 
 pub St st_new(Int id, Int fd, Int now) {
     return St {.id = id, .fd = fd, .acked = 0, .unacked = [], .next = 0, .recv = 0, .eof = false, .fin_at = -1, .fin_in = false, .progress = now,
-        .ext = fd < 0, .inbox = [], .code = -1};
+        .ext = fd < 0, .inbox = [], .code = -1, .opening = [], .socks = false};
 }
 
 // Copies of a stream with one part changed.
 St st_sent(St s, List(Int) unacked, Int next, Int progress) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = unacked, .next = next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = progress,
-        .ext = s.ext, .inbox = s.inbox, .code = s.code};
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_ended(St s, Int at, Int code, Int now) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = true, .fin_at = at, .fin_in = s.fin_in, .progress = now,
-        .ext = s.ext, .inbox = s.inbox, .code = code};
+        .ext = s.ext, .inbox = s.inbox, .code = code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_progress(St s, Int now) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = now,
-        .ext = s.ext, .inbox = s.inbox, .code = s.code};
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_recv(St s, Int recv, List(Int) inbox) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
-        .ext = s.ext, .inbox = inbox, .code = s.code};
+        .ext = s.ext, .inbox = inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_acked(St s, Int d, Int fin_at, Int now) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked + d, .unacked = s.unacked[d..s.unacked.len()], .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = fin_at, .fin_in = s.fin_in, .progress = now,
-        .ext = s.ext, .inbox = s.inbox, .code = s.code};
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_fin_in(St s, Bool fin_in, Int code) {
     return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = fin_in, .progress = s.progress,
-        .ext = s.ext, .inbox = s.inbox, .code = if (code >= 0) { code } else { s.code }};
+        .ext = s.ext, .inbox = s.inbox, .code = if (code >= 0) { code } else { s.code }, .opening = s.opening, .socks = s.socks};
 }
 
-// A new outgoing stream (the client's -L): OPEN, then the stream.
+// A stream that waits for its peer's confirmation (an ACK or DATA): its
+// opening frame is sent again every rto until then.
+St st_opening(St s, List(Int) f, Bool socks) {
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = f, .socks = socks};
+}
+
+// A SOCKS5 reply with an unspecified bound address (RFC 1928 6).
+pub List(Int) socks_reply(Int code) { return [5, code, 0, 1, 0, 0, 0, 0, 0, 0]; }
+
+// A new outgoing stream (the client's -L, -D): OPEN, then the stream.
 @requires(network, declassify)
-pub Link open_stream(Link l, Int fd, Str host, Int port, Int now) {
+pub Link open_stream(Link l, Int fd, Str host, Int port, Int now) { return open_stream_as(l, fd, host, port, false, now); }
+
+// The same for a SOCKS client (-D), which waits for its reply: success
+// once pylond confirms the stream, failure when it resets it.
+@requires(network, declassify)
+pub Link open_stream_as(Link l, Int fd, Str host, Int port, Bool socks, Int now) {
     Int sid = l.next_sid;
-    Link l2 = send_frame(l, f_open(sid, host, port), now);
-    Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, fd, now)]));
+    List(Int) f = f_open(sid, host, port);
+    Link l2 = send_frame(l, f, now);
+    Link l3 = with_streams(l2, l2.streams.concat([st_opening(st_new(sid, fd, now), f, socks)]));
     return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
         .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
 }
@@ -219,6 +246,51 @@ pub Link attach(Link l, Int session, Int rows, Int cols, Int now) {
 // Ask pylond for its sessions (answered with SESSIONS for this nonce).
 @requires(network, declassify)
 pub Link ask_sessions(Link l, Int nonce, Int now) { return send_frame(l, [11].concat(u32_be(nonce)), now); }
+
+// Ask pylond to listen on its loopback port (-R; answered with LISTENING).
+@requires(network, declassify)
+pub Link ask_listen(Link l, Int port, Int now) { return send_frame(l, [13].concat(u32_be(port)), now); }
+
+// pylond's answer to LISTEN.
+@requires(network, declassify)
+pub Link answer_listen(Link l, Int port, Bool ok, Int now) { return send_frame(l, [14].concat(u32_be(port)).concat([if (ok) { 1 } else { 0 }]), now); }
+
+// pylond: a connection accepted on a client's -R port becomes a stream
+// toward the client (CONNECT, sent again until the client confirms).
+@requires(network, declassify)
+pub Link connect_back(Link l, Int fd, Int port, Int now) {
+    Int sid = l.next_sid;
+    List(Int) f = [15].concat(u32_be(sid)).concat(u16(port));
+    Link l2 = send_frame(l, f, now);
+    Link l3 = with_streams(l2, l2.streams.concat([st_opening(st_new(sid, fd, now), f, false)]));
+    return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
+}
+
+// The client: a CONNECT it accepted (fd connected to the -R forward's
+// destination), confirmed with an ACK.
+@requires(network, declassify)
+pub Link accept_connect(Link l, Int sid, Int fd, Int now) {
+    if (open_sid(l, sid)) { return l; }
+    _ = resid_tcp_deadline(fd, 0);
+    return send_frame(with_streams(l, l.streams.concat([st_new(sid, fd, now)])), f_ack(sid, 0), now);
+}
+
+// A file transfer (the client): FILE, then an external stream carrying
+// the transfer (core/files.resid). op 0 get, 1 put; flags bit 0 resume.
+@requires(network, declassify)
+pub Link open_file(Link l, Int op, Int flags, List(Int) path, Int now) {
+    Int sid = l.next_sid;
+    List(Int) f = [16].concat(u32_be(sid)).concat([op, flags]).concat(path);
+    Link l2 = send_frame(l, f, now);
+    Link l3 = with_streams(l2, l2.streams.concat([st_opening(st_new(sid, -1, now), f, false)]));
+    return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
+}
+
+// pylond: a FILE request it took on (the stream is confirmed).
+@requires(network, declassify)
+pub Link confirm(Link l, Int sid, Int now) { return send_frame(l, f_ack(sid, 0), now); }
 
 // The client's terminal changed size. Sent twice: it is not acknowledged,
 // and the latest size is sent again with every keepalive (resend_size).
@@ -318,10 +390,11 @@ Link read_local(Link l, Int i, Int now) {
 pub Link retransmit(Link l, Int i, Int now) {
     if (i >= l.streams.len()) { return l; }
     St s = l.streams[i];
-    Bool waiting = s.unacked.len() > 0 || (s.fin_at >= 0 && s.acked <= s.fin_at);
+    Bool waiting = s.unacked.len() > 0 || (s.fin_at >= 0 && s.acked <= s.fin_at) || s.opening.len() > 0;
     if (!waiting || now - s.progress < rto_ns()) { return retransmit(l, i + 1, now); }
     St s2 = st_progress(s, now);
-    Link l1 = send_from(with_streams(l, put(l.streams, i, s2)), s2, 0, 64, now);
+    Link l0 = if (s.opening.len() > 0) { send_frame(l, s.opening, now) } else { l };
+    Link l1 = send_from(with_streams(l0, put(l0.streams, i, s2)), s2, 0, 64, now);
     Link l2 = if (s.fin_at >= 0 && s.unacked.len() == 0) { send_frame(l1, f_fin(s.id, s.fin_at, s.code), now) } else { l1 };
     return retransmit(l2, i + 1, now);
 }
@@ -330,8 +403,10 @@ pub Link retransmit(Link l, Int i, Int now) {
 // Receiving
 // ============================================================================
 
-// One authenticated datagram's frame. Only pylond accepts OPEN, SHELL
-// and RESIZE.
+// One authenticated datagram's frame. Only pylond accepts OPEN, SHELL,
+// RESIZE, ATTACH, LIST, LISTEN and FILE; only the client CONNECT,
+// SESSIONS and LISTENING. A repeated OPEN or CONNECT (its confirmation
+// was lost) is confirmed again.
 @requires(network, declassify)
 pub Link on_frame(Link l, List(Int) f, Int now) {
     if (f.len() == 0) { return l; }
@@ -340,7 +415,20 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
     if (f.len() < 5) { return l; }
     Int sid = be32(f, 1);
     Int i = find(l.streams, sid, 0);
-    if (t == 1) { return if (l.server && i < 0) { on_open(l, sid, f, now) } else { l }; }
+    if (t == 1 || t == 15) {
+        Bool mine = if (t == 1) { l.server } else { !l.server };
+        if (!mine) { return l; }
+        if (i >= 0) { return send_frame(l, f_ack(sid, l.streams[i].recv), now); }
+        if (t == 1) { return on_open(l, sid, f, now); }
+        return if (f.len() == 7 && sid % 2 == 0) { ev_add(l, 6, [sid, f[5] * 256 + f[6]]) } else { l };
+    }
+    if (t == 13) { return if (l.server && f.len() == 5) { ev_add(l, 7, [sid]) } else { l }; }
+    if (t == 14) { return if (!l.server && f.len() == 6) { ev_add(l, 8, [sid, f[5]]) } else { l }; }
+    if (t == 16) {
+        if (!l.server || sid % 2 != 1 || f.len() < 8 || f.len() > 4096 + 7) { return l; }
+        if (i >= 0) { return send_frame(l, f_ack(sid, l.streams[i].recv), now); }
+        return ev_add(with_streams(l, l.streams.concat([st_new(sid, -1, now)])), 9, [sid, f[5], f[6]].concat(f[7..f.len()]));
+    }
     if (t == 7) { return if (l.server && i < 0 && f.len() == 9 && sid % 2 == 1) { on_shell(l, sid, f, now) } else { l }; }
     if (t == 9) {
         Bool ok = l.server && i >= 0 && f.len() == 9 && l.streams[i].ext;
@@ -353,13 +441,25 @@ pub Link on_frame(Link l, List(Int) f, Int now) {
     if (t == 11) { return if (l.server && f.len() == 5) { ev_add(l, 4, [sid]) } else { l }; }
     if (t == 12) { return if (!l.server) { ev_add(l, 5, [sid].concat(f[5..f.len()])) } else { l }; }
     if (i < 0) { return if (t == 2 || t == 4) { send_frame(l, f_rst(sid), now) } else { l }; }
-    St s = l.streams[i];
+    St s0 = l.streams[i];
     if (t == 5) {
-        _ = if (s.ext) { true } else { resid_tcp_close(s.fd) };
+        _ = if (s0.socks && s0.opening.len() > 0) { resid_tcp_send_bin(s0.fd, socks_reply(5)) } else { true };
+        _ = if (s0.ext) { true } else { resid_tcp_close(s0.fd) };
         Link gone = with_streams(l, drop(l.streams, i));
-        return if (s.ext) { ev_add(gone, 2, [sid, -1]) } else { gone };
+        return if (s0.ext) { ev_add(gone, 2, [sid, -1]) } else { gone };
     }
     if (f.len() < 13) { return l; }
+    // The peer has the stream: it is confirmed (a SOCKS client gets its
+    // success reply now).
+    Bool confirmed = s0.opening.len() > 0 && (t == 2 || t == 3 || t == 4);
+    _ = if (confirmed && s0.socks) { resid_tcp_send_bin(s0.fd, socks_reply(0)) } else { true };
+    St s = if (confirmed) { st_opening(s0, [], false) } else { s0 };
+    return on_stream(if (confirmed) { with_streams(l, put(l.streams, i, s)) } else { l }, t, sid, i, s, f, now);
+}
+
+// DATA, ACK and FIN for stream i (s).
+@requires(network, declassify)
+Link on_stream(Link l, Int t, Int sid, Int i, St s, List(Int) f, Int now) {
     Int off = be64(f, 5);
     if (t == 2) {
         List(Int) b = f[13..f.len()];
@@ -416,7 +516,7 @@ Link on_open(Link l, Int sid, List(Int) f, Int now) {
     Int fd = resid_tcp_connect(host, port);
     if (fd < 0) { return send_frame(l, f_rst(sid), now); }
     _ = resid_tcp_deadline(fd, 0);
-    return with_streams(l, l.streams.concat([st_new(sid, fd, now)]));
+    return send_frame(with_streams(l, l.streams.concat([st_new(sid, fd, now)])), f_ack(sid, 0), now);
 }
 
 // pylond: SHELL makes an external stream and asks the program for a

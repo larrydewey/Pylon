@@ -165,7 +165,7 @@ Mux accept_all(Mux m, List(Int) ready, Int at, Int i) {
 
 // The address a SOCKS client asked for, or host "" with the reply code
 // to send when the request is refused.
-type Target = { Str host; Int port; Int refuse; };
+pub type Target = { Str host; Int port; Int refuse; };
 
 @requires(network)
 List(Int) recv_n(Int fd, Int n, List(Int) acc) {
@@ -178,7 +178,7 @@ List(Int) recv_n(Int fd, Int n, List(Int) acc) {
 // The handshake runs on the new local connection with a 5 s deadline
 // (it holds the loop for at most that long; the client is local).
 @requires(network)
-Target socks_request(Int fd) {
+pub Target socks_request(Int fd) {
     _ = resid_tcp_deadline(fd, 5000);
     List(Int) h = recv_n(fd, 2, []);
     if (h.len() != 2 || h[0] != 5 || h[1] < 1) { return Target {.host = "", .port = 0, .refuse = -1}; }

@@ -104,11 +104,12 @@ List(Int) ipv4_at(List(Str) p, Int i, List(Int) acc) {
 pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after, Rk rk) {
     if (str_len(l.err) > 0) { return l; }
     Int now = clock.monotonic_ns();
+    Link lc = serve_connects(events_taken(l), fs, events(l).connects, 0, now);
     List(Int) lfd = listen_fds(fs, 0, []);
-    List(Int) sfds = stream_fds(l.streams, 0, []);
-    List(Int) fds = [l.udp].concat(lfd).concat(sfds);
+    List(Int) sfds = stream_fds(lc.streams, 0, []);
+    List(Int) fds = [lc.udp].concat(lfd).concat(sfds);
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
-    Drained g0 = drain(l, now, 64, []);
+    Drained g0 = drain(lc, now, 64, []);
     Rekeyed rr = rekey_step(g0.l, rk, g0.other, now);
     Link a = accept_into(rr.l, fs, ready, 1, 0, now);
     Link b = retransmit(read_streams(a, sfds, ready, 1 + fs.len(), 0, now), 0, now);
@@ -140,18 +141,70 @@ List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n
 Link accept_into(Link l, List(Fwd) fs, List(Int) ready, Int at, Int i, Int now) {
     if (i >= fs.len()) { return l; }
     Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
-    Int fd = if (r) { resid_tcp_accept_now(fs[i].lfd) } else { -1 };
-    Link n = if (fd >= 0) { open_stream(l, fd, fs[i].host, fs[i].hport, now) } else { l };
+    Int fd = if (r && fs[i].kind != 2) { resid_tcp_accept_now(fs[i].lfd) } else { -1 };
+    Link n = if (fd < 0) { l } else { if (fs[i].kind == 1) { socks_open(l, fd, now) } else { open_stream(l, fd, fs[i].host, fs[i].hport, now) } };
     return accept_into(n, fs, ready, at, i + 1, now);
 }
 
-// Local listeners for -L over the Pylon protocol.
+// -D: the SOCKS5 handshake runs here (forward.resid: CONNECT only, host
+// names checked); the address asked for goes to pylond in OPEN, and the
+// client hears success once pylond has connected.
+@requires(network, declassify)
+Link socks_open(Link l, Int fd, Int now) {
+    Target t = socks_request(fd);
+    if (t.refuse != 0) {
+        _ = if (t.refuse > 0) { resid_tcp_send_bin(fd, socks_reply(t.refuse)) } else { true };
+        _ = resid_tcp_close(fd);
+        return l;
+    }
+    return open_stream_as(l, fd, t.host, t.port, true, now);
+}
+
+// Local listeners for -L and -D over the Pylon protocol (a -R forward has
+// none here: its slot is -1, which poll skips).
 @requires(network)
 pub List(Fwd) listen_local(List(Fwd) fs, Int i, List(Fwd) acc) {
     if (i >= fs.len()) { return acc; }
-    Int l = resid_tcp_listen(fs[i].lport);
-    if (l < 0) { return []; }
-    return listen_local(fs, i + 1, acc.concat([Fwd {.kind = 0, .lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l}]));
+    Int l = if (fs[i].kind == 2) { -1 } else { resid_tcp_listen(fs[i].lport) };
+    if (l < 0 && fs[i].kind != 2) { return []; }
+    return listen_local(fs, i + 1, acc.concat([Fwd {.kind = fs[i].kind, .lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l}]));
+}
+
+// -R: pylond asked to listen on each remote port (its loopback only),
+// LISTEN sent until it answers (ten tries, 300 ms apart). The link with
+// err set when a port was refused or never answered.
+@requires(network, declassify, clock(readonly))
+pub Link listen_remote(Link l, List(Fwd) fs, Int i, Int tries) {
+    if (i >= fs.len()) { return l; }
+    if (fs[i].kind != 2) { return listen_remote(l, fs, i + 1, 0); }
+    if (tries >= 10) { return link_err(l, "pylond did not answer the request to listen on its port " + f"{fs[i].lport}"); }
+    Link l1 = ask_listen(l, fs[i].lport, clock.monotonic_ns());
+    _ = resid_tcp_poll([l1.udp], [1], 300);
+    Drained g = drain(l1, clock.monotonic_ns(), 64, []);
+    List(Int) got = answer(events(g.l).listening, fs[i].lport, 0);
+    Link l2 = events_taken(g.l);
+    if (got.len() == 0) { return listen_remote(l2, fs, i, tries + 1); }
+    if (got[0] != 1) { return link_err(l2, "pylond cannot listen on its port " + f"{fs[i].lport}" + " (it may be in use)"); }
+    return listen_remote(l2, fs, i + 1, 0);
+}
+
+// -R: each CONNECT pylond sent (a connection to one of our remote ports)
+// goes to that port's destination here; any other port is reset.
+@requires(network, declassify)
+pub Link serve_connects(Link l, List(Fwd) fs, List(List(Int)) cs, Int i, Int now) {
+    if (i >= cs.len()) { return l; }
+    Int sid = cs[i][0];
+    Int k = remote_at(fs, cs[i][1], 0);
+    if (open_sid(l, sid)) { return serve_connects(l, fs, cs, i + 1, now); }
+    Int fd = if (k >= 0) { resid_tcp_connect(fs[k].host, fs[k].hport) } else { -1 };
+    Link n = if (fd >= 0) { accept_connect(l, sid, fd, now) } else { refuse(l, sid, now) };
+    return serve_connects(n, fs, cs, i + 1, now);
+}
+
+Int remote_at(List(Fwd) fs, Int port, Int i) {
+    if (i >= fs.len()) { return -1; }
+    if (fs[i].kind == 2 && fs[i].lport == port) { return i; }
+    return remote_at(fs, port, i + 1);
 }
 
 // ============================================================================
@@ -176,7 +229,7 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     Int code = exit_of(e.exits, h.sid, 0);
     if (code != -2) { return if (code >= 0) { code } else { 255 }; }
     if (!open_sid(h.l, h.sid)) { return 255; }
-    Link l0 = events_taken(take_inbox(h.l, h.sid, show.len()));
+    Link l0 = serve_connects(events_taken(take_inbox(h.l, h.sid, show.len())), fs, e.connects, 0, now);
     List(Int) lfd = listen_fds(fs, 0, []);
     List(Int) sfds = stream_fds(l0.streams, 0, []);
     List(Int) kb = if (h.in_eof) { [] } else { [0] };

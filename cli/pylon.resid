@@ -60,7 +60,7 @@ Int usage() {
     eprintln("                       [-R [localhost:]RPORT:HOST:HOSTPORT] ... USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
-    eprintln("       pylon --pylond FILE [-N -L ...] USER@HOST   a terminal or -L forwards over the");
+    eprintln("       pylon --pylond FILE [-N -L/-D/-R ...] USER@HOST   a terminal or forwards over the");
     eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
@@ -261,7 +261,7 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     Bool shell = shell0 && !sessions;
     List(Int) addr = ipv4(host);
     if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return 2; }
-    if (!only_local(fs, 0)) { eprintln("pylon: the Pylon protocol (v1) carries -L forwards only"); return 2; }
+    if (has_remote(fs, 0)) { eprintln("pylon: the Pylon protocol (v1) carries -L and -D forwards only"); return 2; }
     // A directory holds one build per machine type: pylond-x86_64, pylond-aarch64.
     Bool dir = filesystem.is_dir(path);
     Arch ar = if (dir) { host_arch(c) } else { Arch {.c = c, .arch = "", .err = ""} };
@@ -282,11 +282,13 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     if (!k.ok) { eprintln("pylon: no handshake with pylond on UDP port " + f"{st.b.port}"); return 1; }
     List(Fwd) ls = listen_local(fs, 0, []);
     if (ls.len() != fs.len()) { eprintln("pylon: cannot listen on a local port"); return 1; }
+    Link lr = listen_remote(link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns()), ls, 0, 0);
+    if (str_len(lr.err) > 0) { eprintln("pylon: " + lr.err); return 1; }
+    Link l0 = lr;
     eprintln("pylon: Pylon protocol session to " + host + ":" + f"{st.b.port}" + " (experimental); SSH closed");
     _ = announce(ls, 0);
     Str rb = environment.get("PYLON_TEST_REBIND_AFTER");
     Int rebind_after = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 };
-    Link l0 = link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns());
     Str rks = environment.get("PYLON_TEST_REKEY_SECS");
     Rk rk = rk_new(st.b, st.bc.c, if (str_is_int(rks) && str_parse_int(rks) > 0) { str_parse_int(rks) * 1000000000 } else { 120000000000 });
     if (sessions) {
@@ -312,9 +314,9 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     return 1;
 }
 
-Bool only_local(List(Fwd) fs, Int i) {
-    if (i >= fs.len()) { return true; }
-    return fs[i].kind == 0 && only_local(fs, i + 1);
+Bool has_remote(List(Fwd) fs, Int i) {
+    if (i >= fs.len()) { return false; }
+    return fs[i].kind == 2 || has_remote(fs, i + 1);
 }
 
 List(Fwd) parse_fwds(List(Str) specs, Int i, List(Fwd) acc) {

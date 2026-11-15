@@ -574,6 +574,13 @@ PING 6
 ```
 
 Go-back-N per stream, 256 KiB window, 300 ms retransmission timeout.
+pylond confirms an OPEN with `ACK sid 0` once it has connected (or
+answers RST); the client sends the OPEN again every 300 ms until it is
+confirmed, and a repeated OPEN for a known stream is confirmed again.
+`-D` runs the SOCKS5 handshake (CONNECT only, host names limited to
+letters, digits, dots and hyphens) in the client and sends the address in
+an OPEN; the SOCKS client hears success when the OPEN is confirmed and
+"connection refused" when it is reset.
 
 Further frames (v1): `SHELL 7 | sid | rows (2) | cols (2)` starts the
 principal's login shell on a pseudo-terminal, `RESIZE 9 | sid | rows |
@@ -596,7 +603,7 @@ Rekeying (9.5): the client starts a new handshake every 2 minutes;
 pylond switches keys when it answers and refuses data under keys older
 than 3 minutes. Streams carry on.
 
-Limits of v1: `-L` forwards only over the Pylon protocol (`-D`/`-R` stay
+Limits of v1: `-L` and `-D` forwards over the Pylon protocol (`-R` stays
 on SSH), an IPv4 literal host, no padding to 64 bytes, no cookie
 (`mac2`), no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).

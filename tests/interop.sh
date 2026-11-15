@@ -304,6 +304,20 @@ try:
 except socket.timeout:
     print('no reply')"
     kill $PP 2>/dev/null; wait $PP 2>/dev/null
+    # SOCKS5 (-D) over the Pylon protocol: the handshake runs in the client,
+    # pylond connects (and resolves names).
+    DP=$((PORT + 13))
+    "$PYLON" -p $PORT -N -D $DP --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pd.log & PD=$!
+    for _ in $(seq 100); do grep -q "SOCKS5" pd.log && break; sleep 0.2; done
+    check "pylon protocol: SOCKS5 (-D), a host name resolved by pylond" 0 "pylon-proto-ok" \
+        curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://localhost:$W2/small.txt"
+    check "pylon protocol: SOCKS5 (-D), 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "curl -s -m 60 --socks5 127.0.0.1:$DP http://127.0.0.1:$W2/big.bin | sha256sum"
+    check "pylon protocol: SOCKS5 (-D), a closed port is refused (reply 5)" 7 "" \
+        curl -s -m 10 --socks5 "127.0.0.1:$DP" "http://127.0.0.1:1/"
+    check "pylon protocol: SOCKS5 (-D), a name with odd bytes is refused" 97 "" \
+        curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://a_b.example:$W2/"
+    kill $PD 2>/dev/null; wait $PD 2>/dev/null
     # Roaming: the client moves to a new UDP socket mid-transfer.
     PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
     for _ in $(seq 100); do grep -q "forwarding" pr.log && break; sleep 0.2; done
