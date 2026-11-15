@@ -1,7 +1,19 @@
-// Local port forwarding (RFC 4254 7.2, SPEC 11): `pylon -N -L
-// [127.0.0.1:]PORT:HOST:HOSTPORT USER@SERVER`. Each connection to the
-// local port becomes a direct-tcpip channel to HOST:HOSTPORT as seen from
-// the server, with flow control in both directions.
+// Port forwarding (RFC 4254 7, SPEC 11), in a forwarding-only session
+// (`pylon -N ...`), with flow control in both directions:
+//
+//   -L [127.0.0.1:]PORT:HOST:HOSTPORT  a connection to the local port
+//       becomes a direct-tcpip channel to HOST:HOSTPORT as the server sees
+//       it.
+//   -D [127.0.0.1:]PORT  the local port speaks SOCKS5 (no authentication,
+//       CONNECT only); each request becomes a direct-tcpip channel to the
+//       address the client asked for, answered once the server confirms.
+//   -R [localhost:]RPORT:HOST:HOSTPORT  the server listens on its own
+//       loopback port RPORT; each connection it accepts arrives as a
+//       forwarded-tcpip channel and is connected to HOST:HOSTPORT here.
+//       Only ports Pylon asked for are accepted, and each goes only to the
+//       destination given for it: the server cannot make Pylon connect
+//       anywhere else. Every other channel the server offers (an agent,
+//       X11) is refused.
 //
 // The listener binds loopback only (SPEC 11; on Android the shared
 // loopback is further restricted by the app, SPEC 11 "Local forwards on a
@@ -14,44 +26,71 @@ import "wire.resid";
 import "transport.resid";
 import "session.resid";
 
-pub type Fwd = { Int lport; Str host; Int hport; Int lfd; };
+// kind: 0 local (-L), 1 dynamic (-D), 2 remote (-R). For -R, lport is
+// the port on the server and lfd is unused.
+pub type Fwd = { Int kind; Int lport; Str host; Int hport; Int lfd; };
+
+Fwd no_fwd() { return Fwd {.kind = 0, .lport = 0, .host = "", .hport = 0, .lfd = -1}; }
 
 // A forwarded connection's channel. id: our number. remote: the
 // server's. fd: the local socket. state: 0 opening, 1 open, 2 we sent
 // CLOSE. window / rwin / rmax: as in Chan.
-pub type FC = { Int id; Int remote; Int fd; Int window; Int rwin; Int rmax; Int state; };
+// socks: a SOCKS5 client waits for the reply to its CONNECT.
+pub type FC = { Int id; Int remote; Int fd; Int window; Int rwin; Int rmax; Int state; Bool socks; };
 
 pub type Mux = { Conn c; List(Fwd) fwds; List(FC) chans; Int next_id; Str err; Int opened; };
 
 Int fwd_window() { return 2097152; }
 Int fwd_max_packet() { return 32768; }
 
-// "[127.0.0.1:]PORT:HOST:HOSTPORT", or a Fwd with lport 0 when malformed.
-// Only a loopback bind address is accepted.
-pub Fwd parse_fwd(Str spec) {
+// A forward spec of `kind`, or one with lport 0 when malformed. Only a
+// loopback bind address is accepted, on either side.
+pub Fwd parse_fwd(Int kind, Str spec) {
     List(Str) p = str_split(spec, ":");
+    if (kind == 1) {
+        Bool b1 = p.len() == 2;
+        if (!(p.len() == 1 || b1) || (b1 && p[0] != "127.0.0.1" && p[0] != "localhost")) { return no_fwd(); }
+        Str ps = p[p.len() - 1];
+        Int lp1 = if (str_is_int(ps)) { str_parse_int(ps) } else { 0 };
+        if (lp1 < 1 || lp1 > 65535) { return no_fwd(); }
+        return Fwd {.kind = 1, .lport = lp1, .host = "", .hport = 0, .lfd = -1};
+    }
     Bool bound = p.len() == 4;
-    if (!(p.len() == 3 || bound)) { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
-    if (bound && p[0] != "127.0.0.1" && p[0] != "localhost") { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
+    if (!(p.len() == 3 || bound)) { return no_fwd(); }
+    if (bound && p[0] != "127.0.0.1" && p[0] != "localhost") { return no_fwd(); }
     Int o = if (bound) { 1 } else { 0 };
     Bool ok = str_is_int(p[o]) && str_is_int(p[o + 2]) && str_len(p[o + 1]) > 0 && str_len(p[o + 1]) < 256;
     Int lp = if (ok) { str_parse_int(p[o]) } else { 0 };
     Int hp = if (ok) { str_parse_int(p[o + 2]) } else { 0 };
-    if (!ok || lp < 1 || lp > 65535 || hp < 1 || hp > 65535) { return Fwd {.lport = 0, .host = "", .hport = 0, .lfd = -1}; }
-    return Fwd {.lport = lp, .host = p[o + 1], .hport = hp, .lfd = -1};
+    if (!ok || lp < 1 || lp > 65535 || hp < 1 || hp > 65535) { return no_fwd(); }
+    return Fwd {.kind = kind, .lport = lp, .host = p[o + 1], .hport = hp, .lfd = -1};
 }
 
-// Open the listeners; a Mux with err set when one cannot listen.
-@requires(network)
+Int msg_request_success() { return 81; }
+
+// Open the local listeners and ask the server for the remote ones; a Mux
+// with err set when any of them cannot be had.
+@requires(network, declassify)
 pub Mux mux_new(Conn c, List(Fwd) fs) { return listen_all(Mux {.c = c, .fwds = [], .chans = [], .next_id = 1, .err = "", .opened = 0}, fs, 0); }
 
-@requires(network)
+@requires(network, declassify)
 Mux listen_all(Mux m, List(Fwd) fs, Int i) {
-    if (i >= fs.len()) { return m; }
+    if (i >= fs.len() || str_len(m.err) > 0) { return m; }
+    if (fs[i].kind == 2) { return listen_all(remote_listen(m, fs[i]), fs, i + 1); }
     Int l = resid_tcp_listen(fs[i].lport);
     if (l < 0) { return with_err(m, "cannot listen on 127.0.0.1:" + f"{fs[i].lport}"); }
-    Fwd f = Fwd {.lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l};
+    Fwd f = Fwd {.kind = fs[i].kind, .lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l};
     return listen_all(Mux {.c = m.c, .fwds = m.fwds.concat([f]), .chans = m.chans, .next_id = m.next_id, .err = m.err, .opened = m.opened}, fs, i + 1);
+}
+
+// tcpip-forward on the server's loopback (RFC 4254 7.1).
+@requires(network, declassify)
+Mux remote_listen(Mux m, Fwd f) {
+    List(Int) p = [msg_global_request()].concat(sstr("tcpip-forward")).concat(sbool(true)).concat(sstr("localhost")).concat(u32_be(f.lport));
+    Pkt k = next_msg(send_packet(m.c, p));
+    if (!conn_ok(k.c)) { return with_err(m, k.c.err); }
+    if (k.p[0] != msg_request_success()) { return with_err(m, "the server refused to listen on its port " + f"{f.lport}" + " (it may be in use, or forwarding is disabled)"); }
+    return Mux {.c = k.c, .fwds = m.fwds.concat([f]), .chans = m.chans, .next_id = m.next_id, .err = m.err, .opened = m.opened};
 }
 
 Mux with_err(Mux m, Str e) { return Mux {.c = conn_err(m.c, e), .fwds = m.fwds, .chans = m.chans, .next_id = m.next_id, .err = e, .opened = m.opened}; }
@@ -73,8 +112,8 @@ Int find(List(FC) cs, Int id, Int i) {
 List(FC) put(List(FC) cs, Int i, FC v) { return cs[0..i].concat([v]).concat(cs[i + 1..cs.len()]); }
 List(FC) drop(List(FC) cs, Int i) { return cs[0..i].concat(cs[i + 1..cs.len()]); }
 
-FC fc_flow(FC f, Int window, Int rwin) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = window, .rwin = rwin, .rmax = f.rmax, .state = f.state}; }
-FC fc_state(FC f, Int st) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = f.window, .rwin = f.rwin, .rmax = f.rmax, .state = st}; }
+FC fc_flow(FC f, Int window, Int rwin) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = window, .rwin = rwin, .rmax = f.rmax, .state = f.state, .socks = f.socks}; }
+FC fc_state(FC f, Int st) { return FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = f.window, .rwin = f.rwin, .rmax = f.rmax, .state = st, .socks = f.socks}; }
 
 // ============================================================================
 // The loop
@@ -97,9 +136,11 @@ pub Mux serve(Mux m, Int limit) {
 
 List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
 
+// One poll slot per forward (a remote one has no local listener: -1,
+// which poll skips), so slot i is forward i.
 List(Int) lfds(List(Fwd) fs, Int i, List(Int) acc) {
     if (i >= fs.len()) { return acc; }
-    return lfds(fs, i + 1, acc.concat([fs[i].lfd]));
+    return lfds(fs, i + 1, acc.concat([if (fs[i].kind == 2) { -1 } else { fs[i].lfd }]));
 }
 
 // Local sockets worth reading: open channels the server has window for.
@@ -113,10 +154,96 @@ List(Int) cfds(List(FC) cs, Int i, List(Int) acc) {
 Mux accept_all(Mux m, List(Int) ready, Int at, Int i) {
     if (i >= m.fwds.len() || str_len(m.err) > 0) { return m; }
     Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
-    Int fd = if (r) { resid_tcp_accept_now(m.fwds[i].lfd) } else { -1 };
-    Mux n = if (fd >= 0) { open_direct(m, m.fwds[i], fd) } else { m };
+    Int fd = if (r && m.fwds[i].kind != 2) { resid_tcp_accept_now(m.fwds[i].lfd) } else { -1 };
+    Mux n = if (fd < 0) { m } else { if (m.fwds[i].kind == 1) { socks_accept(m, fd) } else { open_direct(m, m.fwds[i], fd) } };
     return accept_all(n, ready, at, i + 1);
 }
+
+// ============================================================================
+// SOCKS5 (RFC 1928): no authentication, CONNECT only
+// ============================================================================
+
+// The address a SOCKS client asked for, or host "" with the reply code
+// to send when the request is refused.
+type Target = { Str host; Int port; Int refuse; };
+
+@requires(network)
+List(Int) recv_n(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_tcp_recv_some(fd, n - acc.len());
+    if (more.len() == 0) { return acc; }
+    return recv_n(fd, n, acc.concat(more));
+}
+
+// The handshake runs on the new local connection with a 5 s deadline
+// (it holds the loop for at most that long; the client is local).
+@requires(network)
+Target socks_request(Int fd) {
+    _ = resid_tcp_deadline(fd, 5000);
+    List(Int) h = recv_n(fd, 2, []);
+    if (h.len() != 2 || h[0] != 5 || h[1] < 1) { return Target {.host = "", .port = 0, .refuse = -1}; }
+    List(Int) methods = recv_n(fd, h[1], []);
+    if (methods.len() != h[1] || !methods.contains(0)) {
+        _ = resid_tcp_send_bin(fd, [5, 255]);
+        return Target {.host = "", .port = 0, .refuse = -1};
+    }
+    _ = resid_tcp_send_bin(fd, [5, 0]);
+    List(Int) req = recv_n(fd, 4, []);
+    if (req.len() != 4 || req[0] != 5) { return Target {.host = "", .port = 0, .refuse = -1}; }
+    if (req[1] != 1) { return Target {.host = "", .port = 0, .refuse = 7}; }
+    Int atyp = req[3];
+    List(Int) addr = if (atyp == 1) { recv_n(fd, 4, []) } else { if (atyp == 4) { recv_n(fd, 16, []) } else { if (atyp == 3) { domain(fd) } else { [] } } };
+    List(Int) pb = recv_n(fd, 2, []);
+    _ = resid_tcp_deadline(fd, 0);
+    if (atyp != 1 && atyp != 3 && atyp != 4) { return Target {.host = "", .port = 0, .refuse = 8}; }
+    Int port = if (pb.len() == 2) { pb[0] * 256 + pb[1] } else { 0 };
+    Str host = if (atyp == 1 && addr.len() == 4) { f"{addr[0]}.{addr[1]}.{addr[2]}.{addr[3]}" }
+        else { if (atyp == 4 && addr.len() == 16) { ipv6_text(addr, 0, "") } else { if (atyp == 3 && name_ok(addr, 0)) { ascii_text(addr) } else { "" } } };
+    if (str_len(host) == 0 || port < 1) { return Target {.host = "", .port = 0, .refuse = 1}; }
+    return Target {.host = host, .port = port, .refuse = 0};
+}
+
+@requires(network)
+List(Int) domain(Int fd) {
+    List(Int) n = recv_n(fd, 1, []);
+    if (n.len() != 1 || n[0] == 0) { return []; }
+    return recv_n(fd, n[0], []);
+}
+
+// A host name the server will be asked for: letters, digits, dots and
+// hyphens only, so nothing a client sends can be read as something else.
+Bool name_ok(List(Int) b, Int i) {
+    if (b.len() == 0 || b.len() > 253) { return false; }
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    Bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 45;
+    return ok && name_ok(b, i + 1);
+}
+
+Str ipv6_text(List(Int) a, Int i, Str acc) {
+    if (i >= 16) { return acc; }
+    Str g = hex_encode([a[i], a[i + 1]]);
+    return ipv6_text(a, i + 2, if (i == 0) { g } else { acc + ":" + g });
+}
+
+@requires(network, declassify)
+Mux socks_accept(Mux m, Int fd) {
+    Target t = socks_request(fd);
+    if (t.refuse != 0) {
+        _ = if (t.refuse > 0) { resid_tcp_send_bin(fd, socks_reply(t.refuse)) } else { true };
+        _ = resid_tcp_close(fd);
+        return m;
+    }
+    Mux n = open_direct(m, Fwd {.kind = 0, .lport = 0, .host = t.host, .hport = t.port, .lfd = -1}, fd);
+    // Mark the new channel: its client waits for the SOCKS reply.
+    Int k = n.chans.len() - 1;
+    FC f = n.chans[k];
+    FC w = FC {.id = f.id, .remote = f.remote, .fd = f.fd, .window = f.window, .rwin = f.rwin, .rmax = f.rmax, .state = f.state, .socks = true};
+    return with_chans(n, n.c, put(n.chans, k, w));
+}
+
+// A SOCKS5 reply with an unspecified bound address.
+List(Int) socks_reply(Int code) { return [5, code, 0, 1, 0, 0, 0, 0, 0, 0]; }
 
 @requires(network, declassify)
 pub Mux open_direct(Mux m, Fwd f, Int fd) {
@@ -124,7 +251,7 @@ pub Mux open_direct(Mux m, Fwd f, Int fd) {
     List(Int) p = [msg_channel_open()].concat(sstr("direct-tcpip")).concat(u32_be(id)).concat(u32_be(fwd_window())).concat(u32_be(fwd_max_packet()))
         .concat(sstr(f.host)).concat(u32_be(f.hport)).concat(sstr("127.0.0.1")).concat(u32_be(0));
     Conn c2 = send_packet(m.c, p);
-    FC fc = FC {.id = id, .remote = -1, .fd = fd, .window = fwd_window(), .rwin = 0, .rmax = 0, .state = 0};
+    FC fc = FC {.id = id, .remote = -1, .fd = fd, .window = fwd_window(), .rwin = 0, .rmax = 0, .state = 0, .socks = false};
     Mux n = with_chans(m, c2, m.chans.concat([fc]));
     return Mux {.c = n.c, .fwds = n.fwds, .chans = n.chans, .next_id = id + 1, .err = n.err, .opened = m.opened + 1};
 }
@@ -168,6 +295,7 @@ Mux on_packet(Mux m) {
     if (!conn_ok(k.c)) { return with_err(m, k.c.err); }
     if (k.p.len() == 0) { return with_c(m, k.c); }
     Int t = k.p[0];
+    if (t == msg_channel_open()) { return on_open(m, k); }
     if (t < msg_channel_open_confirmation() || t > msg_channel_failure()) { return with_c(m, k.c); }
     GotInt rc = rd_u32(rd_at(k.p, 1));
     Int i = if (rd_ok(rc.r)) { find(m.chans, rc.v, 0) } else { -1 };
@@ -179,10 +307,12 @@ Mux on_packet(Mux m) {
         GotInt maxp = rd_u32(win.r);
         if (!rd_ok(maxp.r) || f.state != 0 || maxp.v < 1) { return with_err(m, "malformed channel open confirmation"); }
         Int rmax = if (maxp.v > fwd_max_packet()) { fwd_max_packet() } else { maxp.v };
-        FC o = FC {.id = f.id, .remote = theirs.v, .fd = f.fd, .window = f.window, .rwin = win.v, .rmax = rmax, .state = 1};
+        FC o = FC {.id = f.id, .remote = theirs.v, .fd = f.fd, .window = f.window, .rwin = win.v, .rmax = rmax, .state = 1, .socks = false};
+        _ = if (f.socks) { resid_tcp_send_bin(f.fd, socks_reply(0)) } else { true };
         return with_chans(m, k.c, put(m.chans, i, o));
     }
     if (t == msg_channel_open_failure()) {
+        _ = if (f.socks) { resid_tcp_send_bin(f.fd, socks_reply(5)) } else { true };
         _ = resid_tcp_close(f.fd);
         return with_chans(m, k.c, drop(m.chans, i));
     }
@@ -217,4 +347,43 @@ Mux on_packet(Mux m) {
         return with_c(m, c2);
     }
     return with_c(m, k.c);
+}
+
+// ============================================================================
+// Channels the server opens
+// ============================================================================
+
+List(Int) open_failure(Int recipient, Int reason, Str why) {
+    return [msg_channel_open_failure()].concat(u32_be(recipient)).concat(u32_be(reason)).concat(sstr(why)).concat(sstr(""));
+}
+
+Int remote_fwd(List(Fwd) fs, Int port, Int i) {
+    if (i >= fs.len()) { return -1; }
+    if (fs[i].kind == 2 && fs[i].lport == port) { return i; }
+    return remote_fwd(fs, port, i + 1);
+}
+
+// forwarded-tcpip for a port Pylon asked for: connect to that port's
+// destination here. Anything else (another port, x11, an agent channel,
+// a session) is refused (reason 1, administratively prohibited).
+@requires(network, declassify)
+Mux on_open(Mux m, Pkt k) {
+    GotText kind = rd_text(rd_at(k.p, 1));
+    GotInt sender = rd_u32(kind.r);
+    GotInt win = rd_u32(sender.r);
+    GotInt maxp = rd_u32(win.r);
+    Got caddr = rd_str(maxp.r);
+    GotInt cport = rd_u32(caddr.r);
+    if (!rd_ok(maxp.r)) { return with_err(m, "the server sent a malformed channel open"); }
+    Int fi = if (kind.v == "forwarded-tcpip" && rd_ok(cport.r)) { remote_fwd(m.fwds, cport.v, 0) } else { -1 };
+    if (fi < 0) { return with_c(m, send_packet(k.c, open_failure(sender.v, 1, "not requested"))); }
+    Fwd f = m.fwds[fi];
+    Int fd = resid_tcp_connect(f.host, f.hport);
+    if (fd < 0) { return with_c(m, send_packet(k.c, open_failure(sender.v, 2, "connect failed"))); }
+    Int id = m.next_id;
+    Int rmax = if (maxp.v > fwd_max_packet() || maxp.v < 1) { fwd_max_packet() } else { maxp.v };
+    FC fc = FC {.id = id, .remote = sender.v, .fd = fd, .window = fwd_window(), .rwin = win.v, .rmax = rmax, .state = 1, .socks = false};
+    List(Int) conf = [msg_channel_open_confirmation()].concat(u32_be(sender.v)).concat(u32_be(id)).concat(u32_be(fwd_window())).concat(u32_be(fwd_max_packet()));
+    Mux n = with_chans(m, send_packet(k.c, conf), m.chans.concat([fc]));
+    return Mux {.c = n.c, .fwds = n.fwds, .chans = n.chans, .next_id = id + 1, .err = n.err, .opened = m.opened + 1};
 }

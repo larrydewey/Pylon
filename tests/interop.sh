@@ -150,7 +150,26 @@ check "forward: 5 MiB intact (flow control)"  0 "$(sha256sum www/big.bin | cut -
     bash -c "curl -s http://127.0.0.1:$LPORT/big.bin | sha256sum"
 check "forward: four connections at once"      0 "4 of 4" \
     bash -c "for i in 1 2 3 4; do curl -s http://127.0.0.1:$LPORT/small.txt > c\$i.out & done; wait; echo \"\$(cat c?.out | grep -c forwarded-ok) of 4\""
+kill $FWD 2>/dev/null; wait $FWD 2>/dev/null
+# SOCKS5 (-D) and remote (-R) forwarding, against the same web server.
+DPORT=$((PORT + 6)); RPORT=$((PORT + 7))
+"$PYLON" -p $PORT -N -D $DPORT -R $RPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1" 2> fwd2.log & FWD=$!
+for _ in $(seq 50); do grep -q "SOCKS5" fwd2.log && grep -q "from here" fwd2.log && break; sleep 0.1; done
+check "socks: an IPv4 address through -D"      0 "forwarded-ok" \
+    curl -s --socks5 "127.0.0.1:$DPORT" "http://127.0.0.1:$WPORT/small.txt"
+check "socks: a host name, resolved by the server" 0 "forwarded-ok" \
+    curl -s --socks5-hostname "127.0.0.1:$DPORT" "http://localhost:$WPORT/small.txt"
+check "socks: 5 MiB intact"                    0 "$(sha256sum www/big.bin | cut -d' ' -f1)" \
+    bash -c "curl -s --socks5 127.0.0.1:$DPORT http://127.0.0.1:$WPORT/big.bin | sha256sum"
+check "socks: a name with odd bytes is refused" 97 "" \
+    curl -s --socks5-hostname "127.0.0.1:$DPORT" "http://a_b.example:$WPORT/"
+check "remote: the server's port reaches here" 0 "forwarded-ok" \
+    curl -s "http://127.0.0.1:$RPORT/small.txt"
+check "remote: the server bound loopback only" 0 "" \
+    bash -c "P=\$(printf '%04X' $RPORT); grep -q \" 0100007F:\$P 00000000:0000 0A\" /proc/net/tcp && ! grep -q \" 00000000:\$P 00000000:0000 0A\" /proc/net/tcp"
 kill $FWD $WEB 2>/dev/null; wait $FWD $WEB 2>/dev/null
+check "remote: refuses a non-loopback bind"    2 "only loopback" \
+    "$PYLON" -p $PORT -N -R 0.0.0.0:$RPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1"
 check "forward: refuses a non-loopback bind"   2 "only loopback" \
     "$PYLON" -p $PORT -N -L 0.0.0.0:$LPORT:127.0.0.1:$WPORT "$USER_NAME@127.0.0.1"
 
