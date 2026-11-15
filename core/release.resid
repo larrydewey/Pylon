@@ -349,16 +349,16 @@ Str hash_fields(List(List(Int)) hs, Int i, Str acc) {
 // What the client accepted, and the state to keep: the newest log head
 // seen (a proof text, whose consistency lines prove older heads) and the
 // release accepted with the highest counter.
-pub type Verdict = { Bool ok; Str why; Str version; Int counter; Int index; Int size; Int signed; Str head; Str rel; };
+pub type ReleaseVerdict = { Bool ok; Str why; Str version; Int counter; Int index; Int size; Int signed; Str head; Str rel; };
 
-Verdict no(Str why) { return Verdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }
+ReleaseVerdict no(Str why) { return ReleaseVerdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }
 
 // Whether `release` and `proof` (the bundled files) are a release of
 // pylond whose `arch` build ("" for any) has file hash `hash`, signed by
 // the release quorum of `roots`, in the log under a tree head signed by
 // the log quorum and consistent with the newest seen (`head`, "" for
 // none), and not older than the newest accepted (`rel`, "" for none).
-pub Verdict verify_release(Str roots, Str release, Str proof, Str arch, Str hash, Str head, Str rel) {
+pub ReleaseVerdict verify_release(Str roots, Str release, Str proof, Str arch, Str hash, Str head, Str rel) {
     Roots r = parse_roots(roots);
     if (str_len(r.err) > 0) { return no(r.err); }
     Signed s = split_signed(release);
@@ -383,7 +383,7 @@ pub Verdict verify_release(Str roots, Str release, Str proof, Str arch, Str hash
     if (before > m.counter) { return no("rollback: release " + m.version + " (counter " + f"{m.counter}" + ") is older than release " + bver + " (counter " + f"{before}" + "), accepted before"); }
     if (before == m.counter && bhash != mh) { return no("release " + m.version + " has counter " + f"{m.counter}" + ", as release " + bver + " accepted before, with another manifest"); }
     Str nrel = "counter " + f"{m.counter}" + "\nmanifest " + mh + "\nversion " + m.version + "\n";
-    return Verdict {.ok = true, .why = "", .version = m.version, .counter = m.counter, .index = p.index, .size = p.size, .signed = signed, .head = newest, .rel = nrel};
+    return ReleaseVerdict {.ok = true, .why = "", .version = m.version, .counter = m.counter, .index = p.index, .size = p.size, .signed = signed, .head = newest, .rel = nrel};
 }
 
 // The newest head after seeing p (whose text is `proof`) with `head`

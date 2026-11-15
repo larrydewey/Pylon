@@ -193,7 +193,7 @@ List(Str) log3() {
 
 test "release: a signed, logged release is accepted" {
     List(Str) rs = log3();
-    Verdict v = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
+    ReleaseVerdict v = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
     expect(v.why).toEqual("");
     expect(v.ok).toEqual(true);
     expect(v.version).toEqual("0.2.0");
@@ -208,7 +208,7 @@ test "release: a signed, logged release is accepted" {
 
 test "release: k-1 signatures are refused" {
     List(Str) rs = [release("0.1.0", 1, "bin1", [seed("r1")])];
-    Verdict v = verify_release(roots(), rs[0], proof(rs, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "");
+    ReleaseVerdict v = verify_release(roots(), rs[0], proof(rs, 0, [seed("l1")]), "x86_64", fake_hash("bin1"), "", "");
     expect(v.ok).toEqual(false);
     expect(v.why).toEqual("the release is signed by 1 of the 2 release keys it needs");
     // The same key twice counts once; an unpinned key does not count.
@@ -228,10 +228,10 @@ test "release: a tampered manifest or another binary is refused" {
     Signed s = split_signed(rs[1]);
     Str forged = b + joined(s.sigs);
     List(Str) logged = [rs[0], forged, rs[2]];
-    Verdict v = verify_release(roots(), forged, proof(logged, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
+    ReleaseVerdict v = verify_release(roots(), forged, proof(logged, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
     expect(v.why).toEqual("the release is signed by 0 of the 2 release keys it needs");
     // A binary the manifest does not name.
-    Verdict w = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
+    ReleaseVerdict w = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("evil"), "", "");
     expect(w.ok).toEqual(false);
     expect(str_contains(w.why, "is not the x86_64 build")).toEqual(true);
     // The aarch64 build is not the x86_64 one.
@@ -245,7 +245,7 @@ test "release: not in the log, or a head without the log quorum, is refused" {
     List(Str) rs = log3();
     // Logged without this release.
     List(Str) without = [rs[0], rs[2]];
-    Verdict v = verify_release(roots(), rs[1], proof(without, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
+    ReleaseVerdict v = verify_release(roots(), rs[1], proof(without, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), "", "");
     expect(v.why).toEqual("the release is not in the log (its inclusion proof does not verify)");
     // The head signed by a release key, not a log key.
     expect(verify_release(roots(), rs[1], proof(rs, 1, [seed("r1")]), "x86_64", fake_hash("bin2"), "", "").why).toEqual("the log's tree head is signed by 0 of the 1 log keys it needs");
@@ -271,13 +271,13 @@ test "release: tree heads must be consistent with the newest seen" {
     Str p2 = proof(two, 1, [seed("l1")]);
     Str p3 = proof(rs, 1, [seed("l1")]);
     // First the head of size 2, then the log grew to 3: the newer head is kept.
-    Verdict a = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), "", "");
+    ReleaseVerdict a = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), "", "");
     expect(a.ok).toEqual(true);
-    Verdict b = verify_release(roots(), rs[1], p3, "x86_64", fake_hash("bin2"), a.head, a.rel);
+    ReleaseVerdict b = verify_release(roots(), rs[1], p3, "x86_64", fake_hash("bin2"), a.head, a.rel);
     expect(b.ok).toEqual(true);
     expect(b.head).toEqual(p3);
     // Back to the bundled head of size 2: proved by the kept head's consistency proof.
-    Verdict c = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), b.head, b.rel);
+    ReleaseVerdict c = verify_release(roots(), rs[1], p2, "x86_64", fake_hash("bin2"), b.head, b.rel);
     expect(c.ok).toEqual(true);
     expect(c.head).toEqual(p3);
     // A forked log: another third entry, a head of size 3 that differs.
@@ -300,20 +300,20 @@ test "release: tree heads must be consistent with the newest seen" {
 
 test "release: rollback to a lower counter is refused" {
     List(Str) rs = log3();
-    Verdict v3 = verify_release(roots(), rs[2], proof(rs, 2, [seed("l1")]), "x86_64", fake_hash("bin3"), "", "");
+    ReleaseVerdict v3 = verify_release(roots(), rs[2], proof(rs, 2, [seed("l1")]), "x86_64", fake_hash("bin3"), "", "");
     expect(v3.ok).toEqual(true);
-    Verdict v2 = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), v3.head, v3.rel);
+    ReleaseVerdict v2 = verify_release(roots(), rs[1], proof(rs, 1, [seed("l1")]), "x86_64", fake_hash("bin2"), v3.head, v3.rel);
     expect(v2.ok).toEqual(false);
     expect(v2.why).toEqual("rollback: release 0.2.0 (counter 2) is older than release 0.3.0 (counter 3), accepted before");
     // The same release again is fine.
     expect(verify_release(roots(), rs[2], proof(rs, 2, [seed("l1")]), "x86_64", fake_hash("bin3"), v3.head, v3.rel).ok).toEqual(true);
     // Another manifest under the same counter is refused.
     List(Str) more = rs.concat([release("0.3.1", 3, "bin31", rel_seeds())]);
-    Verdict w = verify_release(roots(), more[3], proof(more, 3, [seed("l1")]), "x86_64", fake_hash("bin31"), v3.head, v3.rel);
+    ReleaseVerdict w = verify_release(roots(), more[3], proof(more, 3, [seed("l1")]), "x86_64", fake_hash("bin31"), v3.head, v3.rel);
     expect(w.why).toEqual("release 0.3.1 has counter 3, as release 0.3.0 accepted before, with another manifest");
     // A newer one moves the record forward.
     List(Str) next = rs.concat([release("0.4.0", 4, "bin4", rel_seeds())]);
-    Verdict v4 = verify_release(roots(), next[3], proof(next, 3, [seed("l1")]), "x86_64", fake_hash("bin4"), v3.head, v3.rel);
+    ReleaseVerdict v4 = verify_release(roots(), next[3], proof(next, 3, [seed("l1")]), "x86_64", fake_hash("bin4"), v3.head, v3.rel);
     expect(v4.ok).toEqual(true);
     expect(str_starts_with(v4.rel, "counter 4\n")).toEqual(true);
 }

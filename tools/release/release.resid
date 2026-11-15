@@ -216,7 +216,7 @@ Int verify_builds(Str roots, Str dir, Str rel, Str prf, List(Build) bs, Int i) {
     Str f = dir + "/pylond-" + bs[i].arch;
     if (!filesystem.exists(f)) { eprintln("pylon-release: no " + f + " (named in the manifest)"); return 1; }
     List(Int) bin = filesystem.read_bytes(f);
-    Verdict v = verify_release(roots, rel, prf, bs[i].arch, hex_encode(sha256_bytes(bin)), "", "");
+    ReleaseVerdict v = verify_release(roots, rel, prf, bs[i].arch, hex_encode(sha256_bytes(bin)), "", "");
     if (!v.ok) { eprintln("pylon-release: " + f + ": " + v.why); return 1; }
     if (hex_encode(sha256_bytes(code_image(bin))) != bs[i].code) { eprintln("pylon-release: " + f + ": its code image is not the manifest's"); return 1; }
     println(f + ": " + v.version + " (release " + f"{v.counter}" + "), signed by " + f"{v.signed}" + ", entry " + f"{v.index}" + " of " + f"{v.size}");

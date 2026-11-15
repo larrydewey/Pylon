@@ -402,7 +402,7 @@ Bool pylond_vetted(Str dir, Str arch, Str hash, List(Str) pflags) {
         return true;
     }
     Str roots = flag_value(pflags, "roots=");
-    Verdict v = release_gate(dir, proof_file(dir), arch, hash, roots);
+    ReleaseVerdict v = release_gate(dir, proof_file(dir), arch, hash, roots);
     if (!v.ok) {
         eprintln("pylon: refusing to push pylond: " + v.why);
         eprintln("pylon: (a local build of pylond: --pylond-roots ROOTS with a release signed by your own keys, or --pylond-unverified)");
@@ -441,7 +441,7 @@ Int check_builds(Str dir, Str proof, Str roots, List(Str) archs, Int i, Int seen
     Str f = dir + "/pylond-" + archs[i];
     if (!filesystem.exists(f)) { return check_builds(dir, proof, roots, archs, i + 1, seen); }
     Str hash = hex_encode(sha256_bytes(filesystem.read_bytes(f)));
-    Verdict v = release_gate(dir, proof, archs[i], hash, roots);
+    ReleaseVerdict v = release_gate(dir, proof, archs[i], hash, roots);
     if (!v.ok) { eprintln("pylon: pylond-" + archs[i] + ": " + v.why); return 1; }
     println("pylond-" + archs[i] + " " + v.version + " (release " + f"{v.counter}" + "): signed by " + f"{v.signed}" + " release keys, entry " + f"{v.index}" + " of the log's " + f"{v.size}");
     return check_builds(dir, proof, roots, archs, i + 1, seen + 1);

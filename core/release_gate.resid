@@ -38,7 +38,7 @@ pub Str dir_of(Str path) {
 // updated before this returns; a verdict that cannot be recorded is a
 // refusal.
 @requires(filesystem, environment)
-pub Verdict release_gate(Str dir, Str proof, Str arch, Str hash, Str roots_path) {
+pub ReleaseVerdict release_gate(Str dir, Str proof, Str arch, Str hash, Str roots_path) {
     Str roots = if (str_len(roots_path) > 0) { if (filesystem.exists(roots_path)) { filesystem.read_all(roots_path) } else { "" } } else { pinned_roots() };
     if (str_len(roots) == 0) {
         Str why = if (str_len(roots_path) > 0) { "cannot read the roots file " + roots_path } else { "this build of pylon pins no pylond release keys yet (SPEC 8.2)" };
@@ -50,10 +50,10 @@ pub Verdict release_gate(Str dir, Str proof, Str arch, Str hash, Str roots_path)
     Str sd = pylon_home() + "/pylond-trust/" + hex_encode(sha256_bytes(bytes_of(roots))[0..8]);
     Str head = if (filesystem.exists(sd + "/head")) { filesystem.read_all(sd + "/head") } else { "" };
     Str rel = if (filesystem.exists(sd + "/release")) { filesystem.read_all(sd + "/release") } else { "" };
-    Verdict v = verify_release(roots, filesystem.read_all(rf), filesystem.read_all(proof), arch, hash, head, rel);
+    ReleaseVerdict v = verify_release(roots, filesystem.read_all(rf), filesystem.read_all(proof), arch, hash, head, rel);
     if (!v.ok) { return v; }
     Bool kept = filesystem.create_dir(sd) && (v.head == head || filesystem.write_all(sd + "/head", v.head)) && (v.rel == rel || filesystem.write_all(sd + "/release", v.rel));
     return if (kept) { v } else { gate_no("cannot record the accepted release in " + sd) };
 }
 
-Verdict gate_no(Str why) { return Verdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }
+ReleaseVerdict gate_no(Str why) { return ReleaseVerdict {.ok = false, .why = why, .version = "", .counter = 0, .index = 0, .size = 0, .signed = 0, .head = "", .rel = ""}; }
