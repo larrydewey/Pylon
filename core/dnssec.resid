@@ -1,0 +1,803 @@
+// DNSSEC validation for SSHFP (SPEC 6.1.2): Pylon's own validator, from
+// the IANA root trust anchors through DS, DNSKEY and RRSIG down to the
+// host's SSHFP RRset (RFC 4033-4035, 5155, 6840, 4255, 6594), and the
+// NSEC/NSEC3 proofs that let it say "no SSHFP" or "this zone is not
+// signed" securely.
+//
+// It is sans-I/O: a Walk asks for one (name, type) at a time and is fed
+// the parsed response; core/resolver.resid does the asking over UDP/TCP,
+// and the tests feed recorded or constructed responses. The walk goes
+// down the host name one label at a time, asking for the DS RRset at
+// each: a signed DS moves it into the child zone (whose DNSKEY RRset
+// must then match a DS and be signed by that key), a proven absence of DS
+// at a delegation ends it as insecure, and a proven absence at a name
+// that is no delegation lets it go on in the same zone.
+//
+// Only a "secure" verdict says anything. Insecure (an unsigned zone, an
+// opt-out span, only unsupported algorithms), bogus (a signature or proof
+// that fails) and indeterminate (no answer, an alias, a wildcard) are
+// reported as such and never make a key trusted.
+//
+// Algorithms: 8 (RSA/SHA-256, keys of 2048 bits or more, as the rest of
+// Pylon), 13 (ECDSA P-256/SHA-256), 14 (ECDSA P-384/SHA-384), 15
+// (Ed25519). DS digests: 2 (SHA-256) and 4 (SHA-384). NSEC3: SHA-1 with
+// at most 150 iterations (RFC 9276; more is treated as insecure).
+
+import "crypto.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "ed25519.resid";
+import "rsa.resid";
+import "dns.resid";
+
+// ============================================================================
+// Records
+// ============================================================================
+
+pub type Key = { List(Int) owner; Int flags; Int proto; Int alg; List(Int) key; List(Int) rdata; Int tag; };
+pub type Ds = { Int tag; Int alg; Int dtype; List(Int) digest; };
+pub type Sig = { Bool ok; Int covered; Int alg; Int labels; Int ottl; Int exp; Int inc; Int tag; List(Int) signer; List(Int) sig; List(Int) head; };
+pub type Sshfp = { Int alg; Int fptype; List(Int) fp; };
+
+// The key tag of a DNSKEY RDATA (RFC 4034 appendix B).
+pub Int key_tag(List(Int) rdata) {
+    Int ac = kt_acc(rdata, 0, 0);
+    return (ac + ((ac >> 16) & 65535)) & 65535;
+}
+Int kt_acc(List(Int) b, Int i, Int ac) {
+    if (i >= b.len()) { return ac; }
+    return kt_acc(b, i + 1, ac + if ((i & 1) == 1) { b[i] } else { b[i] << 8 });
+}
+
+pub Key key_of(RR r) {
+    List(Int) d = r.rdata;
+    if (d.len() < 5) { return Key {.owner = r.name, .flags = 0, .proto = 0, .alg = 0, .key = [], .rdata = d, .tag = -1}; }
+    return Key {.owner = r.name, .flags = rr_u16(d, 0), .proto = d[2], .alg = d[3], .key = d[4..d.len()], .rdata = d, .tag = key_tag(d)};
+}
+
+List(Key) keys_of(List(RR) rs, Int i, List(Key) acc) {
+    if (i >= rs.len()) { return acc; }
+    return keys_of(rs, i + 1, acc.concat([key_of(rs[i])]));
+}
+
+// A zone key Pylon may use: the Zone Key flag, not revoked, protocol 3.
+pub Bool key_usable(Key k) { return (k.flags & 256) != 0 && (k.flags & 128) == 0 && k.proto == 3 && k.tag >= 0; }
+
+pub Ds ds_of(List(Int) d) {
+    if (d.len() < 5) { return Ds {.tag = -1, .alg = 0, .dtype = 0, .digest = []}; }
+    return Ds {.tag = rr_u16(d, 0), .alg = d[2], .dtype = d[3], .digest = d[4..d.len()]};
+}
+
+List(Ds) dss_of(List(RR) rs, Int i, List(Ds) acc) {
+    if (i >= rs.len()) { return acc; }
+    return dss_of(rs, i + 1, acc.concat([ds_of(rs[i].rdata)]));
+}
+
+pub Sshfp sshfp_of(List(Int) d) {
+    if (d.len() < 3) { return Sshfp {.alg = 0, .fptype = 0, .fp = []}; }
+    return Sshfp {.alg = d[0], .fptype = d[1], .fp = d[2..d.len()]};
+}
+
+List(Sshfp) sshfps_of(List(RR) rs, Int i, List(Sshfp) acc) {
+    if (i >= rs.len()) { return acc; }
+    return sshfps_of(rs, i + 1, acc.concat([sshfp_of(rs[i].rdata)]));
+}
+
+pub Sig sig_of(List(Int) d) {
+    Int sl = if (d.len() > 18) { plain_name_len(d, 18) } else { -1 };
+    if (sl < 0 || 18 + sl >= d.len()) { return Sig {.ok = false, .covered = 0, .alg = 0, .labels = 0, .ottl = 0, .exp = 0, .inc = 0, .tag = -1, .signer = [], .sig = [], .head = []}; }
+    List(Int) signer = lower_bytes(d[18..18 + sl]);
+    return Sig {.ok = true, .covered = rr_u16(d, 0), .alg = d[2], .labels = d[3], .ottl = rr_u32(d, 4), .exp = rr_u32(d, 8), .inc = rr_u32(d, 12),
+        .tag = rr_u16(d, 16), .signer = signer, .sig = d[18 + sl..d.len()], .head = d[0..18].concat(signer)};
+}
+
+// A DS digest of the DNSKEY RDATA under its owner (RFC 4034 5.1.4,
+// RFC 6605 for SHA-384); [] for a digest type Pylon does not accept
+// (SHA-1, type 1, among them).
+pub List(Int) ds_digest(List(Int) owner, List(Int) rdata, Int dtype) {
+    if (dtype == 2) { return sha256_bytes(lower_bytes(owner).concat(rdata)); }
+    if (dtype == 4) { return sha384_bytes(lower_bytes(owner).concat(rdata)); }
+    return [];
+}
+
+pub Bool alg_supported(Int alg) { return alg == 8 || alg == 13 || alg == 14 || alg == 15; }
+pub Bool dtype_supported(Int t) { return t == 2 || t == 4; }
+
+// ============================================================================
+// Signatures
+// ============================================================================
+
+List(Int) pad_to(List(Int) b, Int n) {
+    if (b.len() >= n) { return b; }
+    return pad_to([0].concat(b), n);
+}
+
+// Does sig verify over data under the DNSKEY public key `key` of `alg`?
+pub Bool alg_verify(Int alg, List(Int) key, List(Int) data, List(Int) sig) {
+    if (alg == 15) { return key.len() == 32 && sig.len() == 64 && verify_sig_bytes(data, sig, key); }
+    if (alg == 13) { return key.len() == 64 && sig.len() == 64 && ec_public_ok(P256, [4].concat(key)) && ecdsa_verify_raw(P256, Sha256, [4].concat(key), data, sig); }
+    if (alg == 14) { return key.len() == 96 && sig.len() == 96 && ec_public_ok(P384, [4].concat(key)) && ecdsa_verify_raw(P384, Sha384, [4].concat(key), data, sig); }
+    if (alg == 8) {
+        // RFC 3110: exponent length (one byte, or zero then two), exponent, modulus.
+        if (key.len() < 3) { return false; }
+        Int el = if (key[0] == 0) { key[1] * 256 + key[2] } else { key[0] };
+        Int at = if (key[0] == 0) { 3 } else { 1 };
+        if (el == 0 || at + el >= key.len()) { return false; }
+        RsaPub r = rsa_pub(key[at + el..key.len()], key[at..at + el]);
+        if (!r.ok || sig.len() > r.k) { return false; }
+        return rsa_pkcs1_verify(Sha256, r, data, pad_to(sig, r.k));
+    }
+    return false;
+}
+
+// a <= b in 32-bit serial number arithmetic (RFC 1982), as RRSIG times are.
+Bool serial_le(Int a, Int b) { return ((b - a) & 4294967295) < 2147483648; }
+
+pub Bool sig_time_ok(Sig s, Int now) {
+    Int n = now & 4294967295;
+    return serial_le(s.inc, n) && serial_le(n, s.exp);
+}
+
+// The canonical RRset (RFC 4034 6.3): RDATA sorted as unsigned bytes,
+// duplicates once.
+List(List(Int)) rdatas_sorted(List(RR) rs, Int i, List(List(Int)) acc) {
+    if (i >= rs.len()) { return acc; }
+    return rdatas_sorted(rs, i + 1, insert_rdata(acc, rs[i].rdata, 0));
+}
+List(List(Int)) insert_rdata(List(List(Int)) xs, List(Int) d, Int i) {
+    if (i >= xs.len()) { return xs.concat([d]); }
+    Int c = bytes_cmp(d, xs[i], 0);
+    if (c == 0) { return xs; }
+    if (c < 0) { return xs[0..i].concat([d]).concat(xs[i..xs.len()]); }
+    return insert_rdata(xs, d, i + 1);
+}
+
+List(Int) u16b(Int v) { return [(v >> 8) & 255, v & 255]; }
+List(Int) u32b(Int v) { return [(v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+// What an RRSIG signs: its RDATA before the signature (signer in
+// canonical form), then each RR of the set in canonical form and order.
+pub List(Int) signed_data(Sig s, List(Int) owner, Int rtype, List(RR) rs) {
+    List(Int) pre = lower_bytes(owner).concat(u16b(rtype)).concat([0, 1]).concat(u32b(s.ottl));
+    return s.head.concat(sd_acc(pre, rdatas_sorted(rs, 0, []), 0, []));
+}
+List(Int) sd_acc(List(Int) pre, List(List(Int)) ds, Int i, List(Int) acc) {
+    if (i >= ds.len()) { return acc; }
+    return sd_acc(pre, ds, i + 1, acc.concat(pre).concat(u16b(ds[i].len())).concat(ds[i]));
+}
+
+// The labels an RRSIG over `owner` must state: the owner's, less a
+// leading "*" (RFC 4034 3.1.3).
+Int sig_labels_of(List(Int) owner) {
+    Int k = name_count(owner);
+    return if (owner.len() > 2 && owner[0] == 1 && owner[1] == 42) { k - 1 } else { k };
+}
+
+// The result of checking an RRset: code 0 secure, 1 bogus, 2 unsupported
+// (a wildcard expansion, which Pylon does not accept).
+pub type Checked = { Int code; Str why; };
+
+// Check the RRset `rs` (owner `owner`, type `rtype`) against the RRSIG
+// records `sigs` (all those at the owner) and the zone keys `keys` of
+// `zone`: at least one RRSIG by the zone, for this type, within its
+// validity at `now`, must verify under a usable key with its tag and
+// algorithm.
+//
+// The work is bounded whatever a resolver sends (the KeyTrap class of
+// attacks, CVE-2023-50387): at most 8 RRSIGs at an owner are looked at,
+// and each is tried with at most 4 keys of its tag and algorithm.
+pub Checked check_rrset(List(Int) owner, Int rtype, List(RR) rs, List(RR) sigs0, List(Key) keys, List(Int) zone, Int now) {
+    if (rs.len() == 0) { return Checked {.code = 1, .why = "an empty RRset"}; }
+    List(RR) sigs = if (sigs0.len() > 8) { sigs0[0..8] } else { sigs0 };
+    return cr_acc(owner, rtype, rs, sigs, keys, zone, now, 0, "no signature covers it");
+}
+
+Checked cr_acc(List(Int) owner, Int rtype, List(RR) rs, List(RR) sigs, List(Key) keys, List(Int) zone, Int now, Int i, Str why) {
+    if (i >= sigs.len()) { return Checked {.code = if (str_starts_with(why, "a wildcard") || str_starts_with(why, "a weak key")) { 2 } else { 1 }, .why = why}; }
+    Sig s = sig_of(sigs[i].rdata);
+    Str w = sig_problem(s, owner, rtype, rs, keys, zone, now);
+    if (str_len(w) == 0) { return Checked {.code = 0, .why = ""}; }
+    // Keep the most telling reason: one from an RRSIG that covers this type.
+    Str keep = if (s.ok && s.covered == rtype && (why == "no signature covers it" || w != "no signature covers it")) { w } else { why };
+    return cr_acc(owner, rtype, rs, sigs, keys, zone, now, i + 1, keep);
+}
+
+Str sig_problem(Sig s, List(Int) owner, Int rtype, List(RR) rs, List(Key) keys, List(Int) zone, Int now) {
+    if (!s.ok || s.covered != rtype) { return "no signature covers it"; }
+    if (!name_eq(s.signer, zone)) { return "it is signed by " + name_text(s.signer) + ", not by its zone " + name_text(zone); }
+    if (!alg_supported(s.alg)) { return "its signature uses algorithm " + f"{s.alg}" + ", which Pylon does not validate"; }
+    Int want = sig_labels_of(owner);
+    if (s.labels > want) { return "its signature states more labels than its owner has"; }
+    if (s.labels < want) { return "a wildcard expansion (Pylon does not accept those for SSHFP)"; }
+    if (!sig_time_ok(s, now)) { return if (serial_le(s.exp, now & 4294967295)) { "its signature has expired" } else { "its signature is not valid yet" }; }
+    if (s.alg == 8 && only_weak(keys, s, 0, false)) { return "a weak key: it is signed with an RSA key shorter than 2048 bits, which Pylon does not accept"; }
+    List(Int) data = signed_data(s, owner, rtype, rs);
+    if (!verify_any(keys, s, data, 0, 0)) { return "its signature does not verify"; }
+    return "";
+}
+
+// Are the keys that could have made s all RSA keys Pylon refuses (seen:
+// at least one such key)?
+Bool only_weak(List(Key) keys, Sig s, Int i, Bool seen) {
+    if (i >= keys.len()) { return seen; }
+    Key k = keys[i];
+    if (!(key_usable(k) && k.tag == s.tag && k.alg == s.alg)) { return only_weak(keys, s, i + 1, seen); }
+    if (rsa_key_ok(k.key)) { return false; }
+    return only_weak(keys, s, i + 1, true);
+}
+
+Bool rsa_key_ok(List(Int) key) {
+    if (key.len() < 3) { return false; }
+    Int el = if (key[0] == 0) { key[1] * 256 + key[2] } else { key[0] };
+    Int at = if (key[0] == 0) { 3 } else { 1 };
+    if (el == 0 || at + el >= key.len()) { return false; }
+    return rsa_pub(key[at + el..key.len()], key[at..at + el]).ok;
+}
+
+Bool verify_any(List(Key) keys, Sig s, List(Int) data, Int i, Int tried) {
+    if (i >= keys.len() || tried >= 4) { return false; }
+    Key k = keys[i];
+    Bool cand = key_usable(k) && k.tag == s.tag && k.alg == s.alg;
+    if (cand && alg_verify(k.alg, k.key, data, s.sig)) { return true; }
+    return verify_any(keys, s, data, i + 1, if (cand) { tried + 1 } else { tried });
+}
+
+// ============================================================================
+// Zone keys from DS
+// ============================================================================
+
+// state: 0 secure (keys are the zone's usable keys), 1 insecure (no DS
+// with an algorithm and digest Pylon supports), 2 bogus, 3 indeterminate
+// (signed with a key Pylon refuses: RSA under 2048 bits).
+pub type ZoneKeys = { Int state; Str why; List(Key) keys; };
+
+// The zone keys of `zone` from its DNSKEY RRset `rs` (and the RRSIGs at
+// the apex, `sigs`), authenticated by one of the validated DS `dss`.
+pub ZoneKeys zone_keys(List(Int) zone, List(Ds) dss, List(RR) rs, List(RR) sigs, Int now) {
+    List(Ds) good = supported_ds(dss, 0, []);
+    if (good.len() == 0) { return ZoneKeys {.state = 1, .why = name_text(zone) + " is signed only with algorithms or digests Pylon does not validate", .keys = []}; }
+    if (rs.len() == 0) { return ZoneKeys {.state = 2, .why = name_text(zone) + " has a DS but no DNSKEY RRset", .keys = []}; }
+    List(Key) ks = keys_of(rs, 0, []);
+    return zk_acc(zone, good, ks, rs, sigs, now, 0, name_text(zone) + ": no DNSKEY matches its DS");
+}
+
+List(Ds) supported_ds(List(Ds) dss, Int i, List(Ds) acc) {
+    if (i >= dss.len()) { return acc; }
+    Bool ok = dss[i].tag >= 0 && alg_supported(dss[i].alg) && dtype_supported(dss[i].dtype);
+    return supported_ds(dss, i + 1, if (ok) { acc.concat([dss[i]]) } else { acc });
+}
+
+ZoneKeys zk_acc(List(Int) zone, List(Ds) dss, List(Key) ks, List(RR) rs, List(RR) sigs, Int now, Int i, Str why) {
+    if (i >= ks.len()) { return ZoneKeys {.state = 2, .why = why, .keys = []}; }
+    Key k = ks[i];
+    Bool matches = key_usable(k) && ds_names(dss, k, 0);
+    Checked c = if (matches) { check_rrset(zone, t_dnskey(), rs, sigs, [k], zone, now) } else { Checked {.code = 1, .why = why} };
+    if (matches && c.code == 0) { return ZoneKeys {.state = 0, .why = "", .keys = usable(ks, 0, [])}; }
+    if (matches && c.code == 2) { return ZoneKeys {.state = 3, .why = name_text(zone) + " DNSKEY: " + c.why, .keys = []}; }
+    return zk_acc(zone, dss, ks, rs, sigs, now, i + 1, if (matches) { name_text(zone) + " DNSKEY: " + c.why } else { why });
+}
+
+Bool ds_names(List(Ds) dss, Key k, Int i) {
+    if (i >= dss.len()) { return false; }
+    Ds d = dss[i];
+    if (d.tag == k.tag && d.alg == k.alg && same_digest(ds_digest(k.owner, k.rdata, d.dtype), d.digest)) { return true; }
+    return ds_names(dss, k, i + 1);
+}
+
+Bool same_digest(List(Int) a, List(Int) b) { return a.len() > 0 && a.len() == b.len() && ct_equal(a, b); }
+
+List(Key) usable(List(Key) ks, Int i, List(Key) acc) {
+    if (i >= ks.len()) { return acc; }
+    return usable(ks, i + 1, if (key_usable(ks[i])) { acc.concat([ks[i]]) } else { acc });
+}
+
+// ============================================================================
+// Trust anchors
+// ============================================================================
+
+// The IANA root zone KSKs as DS records (data.iana.org/root-anchors):
+// KSK-2017 (key tag 20326) and KSK-2024 (key tag 38696), both RSA/SHA-256.
+pub List(Ds) iana_anchors() {
+    return [ds_text("20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"),
+            ds_text("38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16")];
+}
+
+// A DS from its presentation form "TAG ALG DIGESTTYPE HEX" (tag -1 when
+// malformed).
+pub Ds ds_text(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    Bool ok = f.len() == 4 && str_is_int(f[0]) && str_is_int(f[1]) && str_is_int(f[2]);
+    List(Int) dg = if (ok) { hex_bytes(f[3]) } else { [] };
+    if (!ok || dg.len() == 0) { return Ds {.tag = -1, .alg = 0, .dtype = 0, .digest = []}; }
+    return Ds {.tag = str_parse_int(f[0]), .alg = str_parse_int(f[1]), .dtype = str_parse_int(f[2]), .digest = dg};
+}
+
+Int hexval(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// Hex text as bytes; [] when it is not (an even number of hex digits).
+pub List(Int) hex_bytes(Str s) {
+    if (str_len(s) % 2 != 0) { return []; }
+    return hb_acc(s, 0, []);
+}
+List(Int) hb_acc(Str s, Int i, List(Int) acc) {
+    if (i >= str_len(s)) { return acc; }
+    Int a = hexval(str_char_at(s, i));
+    Int b = hexval(str_char_at(s, i + 1));
+    if (a < 0 || b < 0) { return []; }
+    return hb_acc(s, i + 2, acc.concat([a * 16 + b]));
+}
+
+// ============================================================================
+// Denial of existence
+// ============================================================================
+
+// Does the type bitmap (RFC 4034 4.1.2) hold type t?
+pub Bool bitmap_has(List(Int) bm, Int t) { return bm_acc(bm, 0, t); }
+Bool bm_acc(List(Int) bm, Int at, Int t) {
+    if (at + 2 > bm.len()) { return false; }
+    Int win = bm[at];
+    Int len = bm[at + 1];
+    if (len < 1 || len > 32 || at + 2 + len > bm.len()) { return false; }
+    if (win == (t >> 8)) {
+        Int byte = (t & 255) >> 3;
+        return byte < len && ((bm[at + 2 + byte] >> (7 - (t & 7))) & 1) == 1;
+    }
+    return bm_acc(bm, at + 2 + len, t);
+}
+
+pub type Nsec = { List(Int) owner; List(Int) next; List(Int) bitmap; };
+
+Nsec nsec_of(RR r) {
+    Int nl = plain_name_len(r.rdata, 0);
+    if (nl < 0) { return Nsec {.owner = [], .next = [], .bitmap = []}; }
+    return Nsec {.owner = r.name, .next = lower_bytes(r.rdata[0..nl]), .bitmap = r.rdata[nl..r.rdata.len()]};
+}
+
+pub type Nsec3 = { List(Int) hash; Int flags; Int iter; List(Int) salt; List(Int) next; List(Int) bitmap; };
+
+Nsec3 nsec3_bad() { return Nsec3 {.hash = [], .flags = -1, .iter = 0, .salt = [], .next = [], .bitmap = []}; }
+
+// An NSEC3 record of `zone` with hash algorithm 1 and flags 0 or 1
+// (RFC 5155 8.2: others are ignored); hash [] otherwise.
+Nsec3 nsec3_of(RR r, List(Int) zone) {
+    List(Int) d = r.rdata;
+    if (d.len() < 6 || !name_eq(name_parent(r.name), zone) || r.name.len() < 2) { return nsec3_bad(); }
+    Int sl = d[4];
+    if (5 + sl >= d.len()) { return nsec3_bad(); }
+    Int hl = d[5 + sl];
+    if (d[0] != 1 || d[1] > 1 || hl != 20 || 6 + sl + hl > d.len()) { return nsec3_bad(); }
+    List(Int) h = b32hex_decode(r.name[1..1 + r.name[0]]);
+    if (h.len() != 20) { return nsec3_bad(); }
+    return Nsec3 {.hash = h, .flags = d[1], .iter = rr_u16(d, 2), .salt = d[5..5 + sl], .next = d[6 + sl..6 + sl + hl], .bitmap = d[6 + sl + hl..d.len()]};
+}
+
+Int b32val(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 118) { return c - 87; }
+    if (c >= 65 && c <= 86) { return c - 55; }
+    return -1;
+}
+
+// Base32hex without padding (RFC 4648 7), as NSEC3 owner labels are; []
+// when malformed.
+pub List(Int) b32hex_decode(List(Int) s) { return b32_acc(s, 0, 0, 0, []); }
+List(Int) b32_acc(List(Int) s, Int i, Int buf, Int bits, List(Int) acc) {
+    if (i >= s.len()) { return if (bits >= 5 || (buf & ((1 << bits) - 1)) != 0) { [] } else { acc }; }
+    Int v = b32val(s[i]);
+    if (v < 0) { return []; }
+    Int nb = (buf << 5) | v;
+    Int nbits = bits + 5;
+    if (nbits >= 8) { return b32_acc(s, i + 1, nb & ((1 << (nbits - 8)) - 1), nbits - 8, acc.concat([(nb >> (nbits - 8)) & 255])); }
+    return b32_acc(s, i + 1, nb, nbits, acc);
+}
+
+pub Str b32hex_encode(List(Int) b) { return b32e_acc(b, 0, 0, 0, ""); }
+Str b32e_acc(List(Int) b, Int i, Int buf, Int bits, Str acc) {
+    if (bits >= 5) { return b32e_acc(b, i, buf & ((1 << (bits - 5)) - 1), bits - 5, acc + b32_char((buf >> (bits - 5)) & 31)); }
+    if (i >= b.len()) { return if (bits > 0) { acc + b32_char((buf << (5 - bits)) & 31) } else { acc }; }
+    return b32e_acc(b, i + 1, (buf << 8) | b[i], bits + 8, acc);
+}
+Str b32_char(Int v) { return str_slice("0123456789abcdefghijklmnopqrstuv", v, v + 1); }
+
+// The NSEC3 hash of a name (RFC 5155 5): SHA-1, iterated.
+pub List(Int) nsec3_hash(List(Int) name, List(Int) salt, Int iter) { return n3h_acc(sha1_bytes(lower_bytes(name).concat(salt)), salt, iter); }
+List(Int) n3h_acc(List(Int) h, List(Int) salt, Int left) {
+    if (left <= 0) { return h; }
+    return n3h_acc(sha1_bytes(h.concat(salt)), salt, left - 1);
+}
+
+pub Int max_nsec3_iterations() { return 150; }
+
+// What a negative answer proves. kind: 0 nothing (bogus), 1 no data of
+// the type at the name, 2 no such name, 3 an insecure delegation (NS and
+// no DS), 4 an opt-out span (insecure), 5 the name exists and is no
+// delegation (for a DS query: carry on in this zone), 6 NSEC3 beyond the
+// iteration limit (insecure), 7 a denial signed with a key Pylon refuses
+// (indeterminate).
+pub type Proof = { Int kind; Str why; };
+
+Proof no_proof(Str why) { return Proof {.kind = 0, .why = why}; }
+
+// The NSEC and NSEC3 records of `auth` that verify under the zone keys
+// (at most 8 are looked at; a proof needs no more than 3).
+List(RR) checked_typed(List(RR) auth, Int t, List(Key) keys, List(Int) zone, Int now, Int i, List(RR) acc) {
+    if (i >= auth.len() || i >= 64 || acc.len() >= 8) { return acc; }
+    RR r = auth[i];
+    Bool ok = r.rtype == t && r.class == 1 && name_under(r.name, zone)
+        && check_rrset(r.name, t, [r], rrs_of(auth, r.name, t_rrsig()), keys, zone, now).code == 0;
+    return checked_typed(auth, t, keys, zone, now, i + 1, if (ok) { acc.concat([r]) } else { acc });
+}
+
+// The proof in a negative response (authority section `auth`) for
+// (qname, qtype) in `zone`; nx: the response was NXDOMAIN.
+pub Proof deny(List(RR) auth, List(Int) qname, Int qtype, Bool nx, List(Key) keys, List(Int) zone, Int now) {
+    List(RR) n1 = checked_typed(auth, t_nsec(), keys, zone, now, 0, []);
+    if (n1.len() > 0) { return deny_nsec(nsecs(n1, 0, []), qname, qtype, nx, zone); }
+    List(RR) n3 = checked_typed(auth, t_nsec3(), keys, zone, now, 0, []);
+    if (n3.len() > 0) { return deny_nsec3(nsec3s(n3, zone, 0, []), qname, qtype, nx, zone); }
+    List(RR) any = rrs_typed(auth, t_nsec()).concat(rrs_typed(auth, t_nsec3()));
+    Bool unsigned = any.len() == 0;
+    Checked first = if (unsigned) { Checked {.code = 1, .why = ""} } else { check_rrset(any[0].name, any[0].rtype, [any[0]], rrs_of(auth, any[0].name, t_rrsig()), keys, zone, now) };
+    if (first.code == 2) { return Proof {.kind = 7, .why = "the denial for " + name_text(qname) + " is " + first.why}; }
+    return no_proof(if (unsigned) { "the answer for " + name_text(qname) + " carries no NSEC or NSEC3 proof" } else { "the NSEC/NSEC3 proof for " + name_text(qname) + " does not verify" });
+}
+
+List(Nsec) nsecs(List(RR) rs, Int i, List(Nsec) acc) {
+    if (i >= rs.len()) { return acc; }
+    Nsec n = nsec_of(rs[i]);
+    return nsecs(rs, i + 1, if (n.owner.len() > 0) { acc.concat([n]) } else { acc });
+}
+
+List(Nsec3) nsec3s(List(RR) rs, List(Int) zone, Int i, List(Nsec3) acc) {
+    if (i >= rs.len()) { return acc; }
+    Nsec3 n = nsec3_of(rs[i], zone);
+    return nsec3s(rs, zone, i + 1, if (n.hash.len() > 0) { acc.concat([n]) } else { acc });
+}
+
+// --- NSEC (RFC 4035 5.4) ---------------------------------------------------
+
+// Does the NSEC n cover `name` (name strictly between owner and next, the
+// last NSEC of a zone wrapping round to its apex)?
+Bool nsec_covers(Nsec n, List(Int) name) {
+    Bool after = name_cmp(n.owner, name) < 0;
+    Bool wraps = name_cmp(n.next, n.owner) <= 0;
+    return after && (wraps || name_cmp(name, n.next) < 0);
+}
+
+Proof deny_nsec(List(Nsec) ns, List(Int) qname, Int qtype, Bool nx, List(Int) zone) {
+    Int m = nsec_match(ns, qname, 0);
+    if (m >= 0) {
+        if (nx) { return no_proof("an NXDOMAIN answer with an NSEC record for the name itself"); }
+        List(Int) bm = ns[m].bitmap;
+        if (bitmap_has(bm, qtype) || bitmap_has(bm, t_cname())) { return no_proof("the NSEC record for " + name_text(qname) + " lists the type it denies"); }
+        Bool deleg = bitmap_has(bm, t_ns()) && !bitmap_has(bm, t_soa());
+        if (qtype == t_ds()) {
+            if (bitmap_has(bm, t_soa())) { return no_proof("a DS denial from the child zone's apex"); }
+            return Proof {.kind = if (deleg) { 3 } else { 5 }, .why = ""};
+        }
+        if (deleg) { return no_proof(name_text(qname) + " is a delegation the walk did not follow"); }
+        return Proof {.kind = 1, .why = ""};
+    }
+    // An empty non-terminal: an NSEC covers the name and the next name is below it.
+    Int e = nsec_ent(ns, qname, 0);
+    if (e >= 0) {
+        if (nx) { return no_proof("an NXDOMAIN answer for a name that has names below it"); }
+        return Proof {.kind = if (qtype == t_ds()) { 5 } else { 1 }, .why = ""};
+    }
+    Int c = nsec_cover(ns, qname, 0);
+    if (c < 0) { return no_proof(if (nx) { "no NSEC record covers " + name_text(qname) } else { "no NSEC record proves that " + name_text(qname) + " has no such data" }); }
+    List(Int) a1 = common_ancestor(qname, ns[c].owner);
+    List(Int) a2 = common_ancestor(qname, ns[c].next);
+    List(Int) ce = if (name_count(a1) >= name_count(a2)) { a1 } else { a2 };
+    if (!name_under(ce, zone)) { return no_proof("the NSEC proof for " + name_text(qname) + " is outside its zone"); }
+    if (!nx) {
+        // No data through a wildcard (RFC 4035 3.1.3.4): the name is
+        // covered and the wildcard's NSEC lacks the type.
+        Int w = nsec_match(ns, wildcard_of(ce), 0);
+        if (w < 0 || bitmap_has(ns[w].bitmap, qtype) || bitmap_has(ns[w].bitmap, t_cname())) { return no_proof("no NSEC record proves that " + name_text(qname) + " has no such data"); }
+        return Proof {.kind = if (qtype == t_ds()) { 5 } else { 1 }, .why = ""};
+    }
+    if (nsec_cover(ns, wildcard_of(ce), 0) < 0) { return no_proof("no NSEC record proves that there is no wildcard at " + name_text(ce)); }
+    return Proof {.kind = 2, .why = ""};
+}
+
+Int nsec_match(List(Nsec) ns, List(Int) name, Int i) {
+    if (i >= ns.len()) { return -1; }
+    if (name_eq(ns[i].owner, name)) { return i; }
+    return nsec_match(ns, name, i + 1);
+}
+
+Int nsec_ent(List(Nsec) ns, List(Int) name, Int i) {
+    if (i >= ns.len()) { return -1; }
+    if (nsec_covers(ns[i], name) && name_under(ns[i].next, name) && !name_eq(ns[i].next, name)) { return i; }
+    return nsec_ent(ns, name, i + 1);
+}
+
+Int nsec_cover(List(Nsec) ns, List(Int) name, Int i) {
+    if (i >= ns.len()) { return -1; }
+    if (nsec_covers(ns[i], name) && !(name_under(ns[i].next, name) && !name_eq(ns[i].next, name))) { return i; }
+    return nsec_cover(ns, name, i + 1);
+}
+
+// --- NSEC3 (RFC 5155 8) ------------------------------------------------------
+
+Bool n3_covers(Nsec3 n, List(Int) h) {
+    Bool after = bytes_cmp(n.hash, h, 0) < 0;
+    Bool wraps = bytes_cmp(n.next, n.hash, 0) <= 0;
+    return after && (wraps || bytes_cmp(h, n.next, 0) < 0);
+}
+
+Int n3_match(List(Nsec3) ns, List(Int) h, Int i) {
+    if (i >= ns.len()) { return -1; }
+    if (bytes_cmp(ns[i].hash, h, 0) == 0) { return i; }
+    return n3_match(ns, h, i + 1);
+}
+
+Int n3_cover(List(Nsec3) ns, List(Int) h, Int i) {
+    if (i >= ns.len()) { return -1; }
+    if (n3_covers(ns[i], h)) { return i; }
+    return n3_cover(ns, h, i + 1);
+}
+
+// Records with the parameters of the first (RFC 5155 8.2: one set).
+List(Nsec3) same_params(List(Nsec3) ns, Nsec3 p, Int i, List(Nsec3) acc) {
+    if (i >= ns.len()) { return acc; }
+    Bool same = ns[i].iter == p.iter && bytes_cmp(ns[i].salt, p.salt, 0) == 0;
+    return same_params(ns, p, i + 1, if (same) { acc.concat([ns[i]]) } else { acc });
+}
+
+// The closest encloser of qname: the longest ancestor (below or at the
+// zone apex) with a matching NSEC3, whose next closer name is covered.
+// ce_k: its label count, -1 when there is no such proof; optout: the
+// covering record has the opt-out flag.
+type Encloser = { Int ce_k; Bool optout; Str why; };
+
+Encloser closest(List(Nsec3) ns, List(Int) qname, List(Int) zone, Nsec3 p, Int k) {
+    if (k < name_count(zone)) { return Encloser {.ce_k = -1, .optout = false, .why = "no NSEC3 record proves a closest encloser of " + name_text(qname)}; }
+    List(Int) cand = name_suffix(qname, k);
+    Int m = n3_match(ns, nsec3_hash(cand, p.salt, p.iter), 0);
+    if (m < 0) { return closest(ns, qname, zone, p, k - 1); }
+    Nsec3 at = ns[m];
+    if (bitmap_has(at.bitmap, t_dname()) || (bitmap_has(at.bitmap, t_ns()) && !bitmap_has(at.bitmap, t_soa()))) {
+        return Encloser {.ce_k = -1, .optout = false, .why = "the closest encloser of " + name_text(qname) + " is a delegation or DNAME"};
+    }
+    Int c = n3_cover(ns, nsec3_hash(name_suffix(qname, k + 1), p.salt, p.iter), 0);
+    if (c < 0) { return Encloser {.ce_k = -1, .optout = false, .why = "no NSEC3 record covers the next closer name of " + name_text(qname)}; }
+    return Encloser {.ce_k = k, .optout = (ns[c].flags & 1) == 1, .why = ""};
+}
+
+Proof deny_nsec3(List(Nsec3) all, List(Int) qname, Int qtype, Bool nx, List(Int) zone) {
+    if (all.len() == 0) { return no_proof("no usable NSEC3 record"); }
+    Nsec3 p = all[0];
+    if (p.iter > max_nsec3_iterations()) { return Proof {.kind = 6, .why = "the zone's NSEC3 uses " + f"{p.iter}" + " iterations (more than " + f"{max_nsec3_iterations()}" + ")"}; }
+    List(Nsec3) ns = same_params(all, p, 0, []);
+    Int m = n3_match(ns, nsec3_hash(qname, p.salt, p.iter), 0);
+    if (m >= 0) {
+        if (nx) { return no_proof("an NXDOMAIN answer with an NSEC3 record for the name itself"); }
+        List(Int) bm = ns[m].bitmap;
+        if (bitmap_has(bm, qtype) || bitmap_has(bm, t_cname())) { return no_proof("the NSEC3 record for " + name_text(qname) + " lists the type it denies"); }
+        Bool deleg = bitmap_has(bm, t_ns()) && !bitmap_has(bm, t_soa());
+        if (qtype == t_ds()) {
+            if (bitmap_has(bm, t_soa())) { return no_proof("a DS denial from the child zone's apex"); }
+            return Proof {.kind = if (deleg) { 3 } else { 5 }, .why = ""};
+        }
+        if (deleg) { return no_proof(name_text(qname) + " is a delegation the walk did not follow"); }
+        return Proof {.kind = 1, .why = ""};
+    }
+    if (name_eq(qname, zone)) { return no_proof("no NSEC3 record for the zone apex"); }
+    Encloser e = closest(ns, qname, zone, p, name_count(qname) - 1);
+    if (e.ce_k < 0) { return no_proof(e.why); }
+    if (!nx) {
+        // No match: only a DS query in an opt-out span (RFC 5155 8.6).
+        if (qtype == t_ds() && e.optout && e.ce_k == name_count(qname) - 1) { return Proof {.kind = 4, .why = ""}; }
+        // Or no data through a wildcard (RFC 5155 8.7).
+        Int w = n3_match(ns, nsec3_hash(wildcard_of(name_suffix(qname, e.ce_k)), p.salt, p.iter), 0);
+        if (w >= 0 && !bitmap_has(ns[w].bitmap, qtype) && !bitmap_has(ns[w].bitmap, t_cname())) { return Proof {.kind = if (qtype == t_ds()) { 5 } else { 1 }, .why = ""}; }
+        return no_proof("no NSEC3 record matches " + name_text(qname));
+    }
+    List(Int) wc = wildcard_of(name_suffix(qname, e.ce_k));
+    if (n3_cover(ns, nsec3_hash(wc, p.salt, p.iter), 0) < 0) { return no_proof("no NSEC3 record proves that there is no wildcard at " + name_text(name_suffix(qname, e.ce_k))); }
+    if (e.optout) { return Proof {.kind = 4, .why = ""}; }
+    return Proof {.kind = 2, .why = ""};
+}
+
+// ============================================================================
+// The walk
+// ============================================================================
+
+// state: "secure", "insecure", "bogus" or "indeterminate". zone: the last
+// zone validated. exists: false for a secure "no such name". recs: the
+// validated SSHFP records (secure only; empty is a secure "none").
+pub type Verdict = { Str state; List(Int) qname; List(Int) zone; Bool exists; List(Sshfp) recs; Str why; };
+
+pub Verdict verdict(Str state, List(Int) qname, List(Int) zone, Str why) {
+    return Verdict {.state = state, .qname = qname, .zone = zone, .exists = true, .recs = [], .why = why};
+}
+
+// DNS was not asked (a pinned host, an address literal).
+pub Verdict no_dns() { return verdict("", [0], [0], ""); }
+
+// phase: 0 the root DNSKEY, 1 DS at the ancestor with depth+1 labels,
+// 2 DNSKEY of `child` (its DS in `ds`), 3 SSHFP at qname, 4 done.
+pub type Walk = { Int phase; Verdict v; List(Int) qname; Int depth; List(Int) zone; List(Key) keys; List(Ds) ds; List(Int) child; List(Ds) anchors; Int now; Int asked; };
+
+pub Int max_queries() { return 40; }
+
+pub Walk walk_start(List(Int) qname, List(Ds) anchors, Int now) {
+    return Walk {.phase = 0, .v = verdict("indeterminate", qname, [0], "not checked"), .qname = qname, .depth = 0, .zone = [0], .keys = [], .ds = anchors, .child = [0], .anchors = anchors, .now = now, .asked = 0};
+}
+
+pub Bool walk_done(Walk w) { return w.phase == 4; }
+
+// The (name, type) the walk needs next.
+pub List(Int) walk_name(Walk w) {
+    if (w.phase == 0) { return [0]; }
+    if (w.phase == 1) { return name_suffix(w.qname, w.depth + 1); }
+    if (w.phase == 2) { return w.child; }
+    return w.qname;
+}
+
+pub Int walk_type(Walk w) {
+    if (w.phase == 0 || w.phase == 2) { return t_dnskey(); }
+    if (w.phase == 1) { return t_ds(); }
+    return t_sshfp();
+}
+
+Walk finish(Walk w, Verdict v) {
+    return Walk {.phase = 4, .v = v, .qname = w.qname, .depth = w.depth, .zone = w.zone, .keys = w.keys, .ds = w.ds, .child = w.child, .anchors = w.anchors, .now = w.now, .asked = w.asked};
+}
+
+Walk end_as(Walk w, Str state, Str why) { return finish(w, verdict(state, w.qname, w.zone, why)); }
+
+// In `zone` with `keys`, at `depth` labels: ask for the next DS, or for
+// the SSHFP RRset once the whole name is reached.
+Walk go_on(Walk w, List(Int) zone, List(Key) keys, Int depth) {
+    Int ph = if (depth < name_count(w.qname)) { 1 } else { 3 };
+    return Walk {.phase = ph, .v = w.v, .qname = w.qname, .depth = depth, .zone = zone, .keys = keys, .ds = [], .child = [0], .anchors = w.anchors, .now = w.now, .asked = w.asked};
+}
+
+// Feed the walk the response to its question (a transport failure as a
+// Msg that is not ok).
+pub Walk walk_feed(Walk w0, Msg m) {
+    Walk w = Walk {.phase = w0.phase, .v = w0.v, .qname = w0.qname, .depth = w0.depth, .zone = w0.zone, .keys = w0.keys, .ds = w0.ds, .child = w0.child, .anchors = w0.anchors, .now = w0.now, .asked = w0.asked + 1};
+    if (w.phase == 4) { return w; }
+    if (w.asked > max_queries()) { return end_as(w, "indeterminate", "too many queries"); }
+    List(Int) qn = walk_name(w);
+    Int qt = walk_type(w);
+    if (!m.ok) { return end_as(w, "indeterminate", "no usable answer for " + name_text(qn) + ": " + m.err); }
+    if (m.rcode != 0 && m.rcode != 3) { return end_as(w, "indeterminate", "the resolver answered " + rcode_name(m.rcode) + " for " + name_text(qn)); }
+    if (rrs_of(m.an, qn, t_cname()).len() > 0 || rrs_of(m.an, qn, t_dname()).len() > 0) { return end_as(w, "indeterminate", name_text(qn) + " is an alias (CNAME/DNAME); Pylon does not follow aliases for SSHFP"); }
+    if (w.phase == 0 || w.phase == 2) { return fed_keys(w, m, qn); }
+    if (w.phase == 1) { return fed_ds(w, m, qn); }
+    return fed_sshfp(w, m, qn);
+}
+
+pub Str rcode_name(Int r) {
+    if (r == 2) { return "SERVFAIL"; }
+    if (r == 5) { return "REFUSED"; }
+    if (r == 1) { return "FORMERR"; }
+    if (r == 4) { return "NOTIMP"; }
+    return "rcode " + f"{r}";
+}
+
+Walk fed_keys(Walk w, Msg m, List(Int) qn) {
+    ZoneKeys zk = zone_keys(qn, w.ds, rrs_of(m.an, qn, t_dnskey()), rrs_of(m.an, qn, t_rrsig()), w.now);
+    if (zk.state == 1) { return end_as(w, "insecure", zk.why); }
+    if (zk.state == 3) { return end_as(w, "indeterminate", zk.why); }
+    if (zk.state != 0) { return end_as(w, "bogus", if (w.phase == 0) { "the root DNSKEY RRset does not match the trust anchor: " + zk.why } else { zk.why }); }
+    return go_on(w, qn, zk.keys, if (w.phase == 0) { 0 } else { w.depth + 1 });
+}
+
+Walk fed_ds(Walk w, Msg m, List(Int) qn) {
+    List(RR) ds = rrs_of(m.an, qn, t_ds());
+    if (ds.len() > 0) {
+        Checked c = check_rrset(qn, t_ds(), ds, rrs_of(m.an, qn, t_rrsig()), w.keys, w.zone, w.now);
+        if (c.code == 2) { return end_as(w, "indeterminate", "the DS RRset of " + name_text(qn) + " is " + c.why); }
+        if (c.code != 0) { return end_as(w, "bogus", "the DS RRset of " + name_text(qn) + ": " + c.why); }
+        return Walk {.phase = 2, .v = w.v, .qname = w.qname, .depth = w.depth, .zone = w.zone, .keys = w.keys, .ds = dss_of(ds, 0, []), .child = qn, .anchors = w.anchors, .now = w.now, .asked = w.asked};
+    }
+    Proof p = deny(m.ns, qn, t_ds(), m.rcode == 3, w.keys, w.zone, w.now);
+    if (p.kind == 2) { return finish(w, Verdict {.state = "secure", .qname = w.qname, .zone = w.zone, .exists = false, .recs = [], .why = name_text(qn) + " does not exist"}); }
+    if (p.kind == 3) { return end_as(w, "insecure", "the delegation to " + name_text(qn) + " is not signed (no DS)"); }
+    if (p.kind == 4) { return end_as(w, "insecure", name_text(qn) + " is in an NSEC3 opt-out span of " + name_text(w.zone)); }
+    if (p.kind == 6) { return end_as(w, "insecure", p.why); }
+    if (p.kind == 7) { return end_as(w, "indeterminate", p.why); }
+    if (p.kind == 5 || p.kind == 1) { return go_on(w, w.zone, w.keys, w.depth + 1); }
+    return end_as(w, "bogus", p.why);
+}
+
+Walk fed_sshfp(Walk w, Msg m, List(Int) qn) {
+    List(RR) rs = rrs_of(m.an, qn, t_sshfp());
+    if (rs.len() > 0) {
+        Checked c = check_rrset(qn, t_sshfp(), rs, rrs_of(m.an, qn, t_rrsig()), w.keys, w.zone, w.now);
+        if (c.code == 2) { return end_as(w, "indeterminate", "the SSHFP RRset is " + c.why); }
+        if (c.code != 0) { return end_as(w, "bogus", "the SSHFP RRset of " + name_text(qn) + ": " + c.why); }
+        return finish(w, Verdict {.state = "secure", .qname = w.qname, .zone = w.zone, .exists = true, .recs = sshfps_of(rs, 0, []), .why = ""});
+    }
+    Proof p = deny(m.ns, qn, t_sshfp(), m.rcode == 3, w.keys, w.zone, w.now);
+    if (p.kind == 1) { return finish(w, Verdict {.state = "secure", .qname = w.qname, .zone = w.zone, .exists = true, .recs = [], .why = "no SSHFP records"}); }
+    if (p.kind == 2) { return finish(w, Verdict {.state = "secure", .qname = w.qname, .zone = w.zone, .exists = false, .recs = [], .why = name_text(qn) + " does not exist"}); }
+    if (p.kind == 4 || p.kind == 6) { return end_as(w, "insecure", if (p.kind == 4) { name_text(qn) + " is in an NSEC3 opt-out span" } else { p.why }); }
+    if (p.kind == 7) { return end_as(w, "indeterminate", p.why); }
+    return end_as(w, "bogus", p.why);
+}
+
+// ============================================================================
+// SSHFP and host keys (RFC 4255, RFC 6594, RFC 7479)
+// ============================================================================
+
+// The SSHFP algorithm number of an SSH key blob's type, or 0.
+pub Int sshfp_alg_of(List(Int) blob) {
+    Int n = if (blob.len() >= 4) { (blob[0] << 24) | (blob[1] << 16) | (blob[2] << 8) | blob[3] } else { 0 };
+    if (n <= 0 || n > 64 || 4 + n > blob.len()) { return 0; }
+    Str t = sb_text(blob[4..4 + n], 0, "");
+    if (t == "ssh-rsa") { return 1; }
+    if (str_starts_with(t, "ecdsa-sha2-")) { return 3; }
+    if (t == "ssh-ed25519") { return 4; }
+    return 0;
+}
+Str sb_text(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    return sb_text(b, i + 1, acc + if (b[i] >= 32 && b[i] < 127) { str_from_code(b[i]) } else { "?" });
+}
+
+// How a secure verdict's records bear on a host key blob: "match" (a
+// SHA-256 record for the key's type equals its fingerprint), "mismatch"
+// (SHA-256 records for its type exist and none matches) or "none" (no
+// SHA-256 record for its type; SHA-1 records are never used).
+pub Str sshfp_match(Verdict v, List(Int) blob) {
+    if (v.state != "secure") { return "none"; }
+    Int alg = sshfp_alg_of(blob);
+    List(Int) fp = sha256_bytes(blob);
+    return sm_acc(v.recs, alg, fp, 0, "none");
+}
+Str sm_acc(List(Sshfp) rs, Int alg, List(Int) fp, Int i, Str acc) {
+    if (i >= rs.len()) { return acc; }
+    Sshfp r = rs[i];
+    if (alg == 0 || r.alg != alg || r.fptype != 2) { return sm_acc(rs, alg, fp, i + 1, acc); }
+    if (r.fp.len() == 32 && ct_equal(r.fp, fp)) { return "match"; }
+    return sm_acc(rs, alg, fp, i + 1, "mismatch");
+}
+
+// The SSH key types a secure verdict has SHA-256 records for, to offer
+// first in the key exchange.
+pub List(Str) sshfp_key_types(Verdict v) {
+    if (v.state != "secure") { return []; }
+    return kt_types(v.recs, 0, []);
+}
+List(Str) kt_types(List(Sshfp) rs, Int i, List(Str) acc) {
+    if (i >= rs.len()) { return acc; }
+    Sshfp r = rs[i];
+    List(Str) t = if (r.fptype != 2) { [] } else { if (r.alg == 1) { ["ssh-rsa"] } else { if (r.alg == 4) { ["ssh-ed25519"] } else { if (r.alg == 3) { ["ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384"] } else { [] } } } };
+    return kt_types(rs, i + 1, acc.concat(t));
+}
+
+// One line saying what DNS says about the host, for the principal.
+pub Str verdict_line(Verdict v) {
+    Str n = name_text(v.qname);
+    if (v.state == "secure") {
+        if (!v.exists) { return "SSHFP: none (DNSSEC proves that " + n + " does not exist)"; }
+        if (sha256_count(v.recs, 0, 0) == 0) { return "SSHFP: none for " + n + (if (v.recs.len() > 0) { " with SHA-256 (only SHA-1 records, which Pylon does not use)" } else { "" }) + " (secure, DNSSEC-validated in " + name_text(v.zone) + ")"; }
+        return "SSHFP: " + f"{sha256_count(v.recs, 0, 0)}" + " SHA-256 record(s) for " + n + " (secure, DNSSEC-validated in " + name_text(v.zone) + ")";
+    }
+    if (v.state == "insecure") { return "SSHFP: not usable for " + n + ": insecure (" + v.why + "); unsigned DNS is never trusted"; }
+    if (v.state == "bogus") { return "SSHFP: not usable for " + n + ": BOGUS (" + v.why + "); this can be an attack on DNS"; }
+    return "SSHFP: not checked for " + n + ": indeterminate (" + v.why + ")";
+}
+
+Int sha256_count(List(Sshfp) rs, Int i, Int n) {
+    if (i >= rs.len()) { return n; }
+    return sha256_count(rs, i + 1, if (rs[i].fptype == 2 && rs[i].fp.len() == 32) { n + 1 } else { n });
+}
+
+// The records as presentation lines ("ALG TYPE HEX").
+pub List(Str) sshfp_lines(Verdict v) { return sl_acc(v.recs, 0, []); }
+List(Str) sl_acc(List(Sshfp) rs, Int i, List(Str) acc) {
+    if (i >= rs.len()) { return acc; }
+    return sl_acc(rs, i + 1, acc.concat([f"{rs[i].alg} {rs[i].fptype} " + hex_encode(rs[i].fp)]));
+}

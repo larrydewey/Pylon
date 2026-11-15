@@ -1,0 +1,277 @@
+// The DNSSEC validator (core/dnssec.resid, SPEC 6.1.2).
+//
+// Known answers from outside Pylon: the IANA root KSKs (their DNSKEYs as
+// DNSViz ships them, checked against the DS records Pylon carries), the
+// Ed25519 example of RFC 8080 6.1, an ECDSA P-256 signature from
+// dnspython's test suite, and the NSEC3 hashes of RFC 5155 appendix A.
+//
+// Then whole walks over constructed, signed zones (tests/dnssec_fixtures.resid,
+// written by tests/dnssec_zone.py): secure SSHFP, secure absence by NSEC
+// and NSEC3, insecure delegations and opt-out, and bogus answers (a
+// tampered signature, an expired or not yet valid RRSIG, a wrong DS, a
+// stripped signature, a missing wildcard proof, a wrong root key).
+
+import "crypto.resid";
+import "../core/dns.resid";
+import "../core/dnssec.resid";
+import "dnssec_fixtures.resid";
+
+List(Int) nm(Str s) { return name_from_text(s); }
+
+RR rr(Str owner, Int t, Int ttl, List(Int) rdata) { return RR {.name = nm(owner), .rtype = t, .class = 1, .ttl = ttl, .rdata = rdata}; }
+
+List(Int) u16l(Int v) { return [(v >> 8) & 255, v & 255]; }
+List(Int) u32l(Int v) { return [(v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+List(Int) rrsig_rdata(Int covered, Int alg, Int labels, Int ottl, Int exp, Int inc, Int tag, Str signer, Str sig) {
+    return u16l(covered).concat([alg, labels]).concat(u32l(ottl)).concat(u32l(exp)).concat(u32l(inc)).concat(u16l(tag)).concat(nm(signer)).concat(base64_decode(sig));
+}
+
+List(Int) dnskey_rdata(Int flags, Int alg, Str key) { return u16l(flags).concat([3, alg]).concat(base64_decode(key)); }
+
+Str root_2017() { return "AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIzuDWfdRUfhHdY6+cn8HFRm+2hM8AnXGXws9555KrUB5qihylGa8subX2Nn6UwNR1AkUTV74bU="; }
+Str root_2024() { return "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc="; }
+
+test "the IANA root anchors are the DS of KSK-2017 and KSK-2024" {
+    List(Ds) a = iana_anchors();
+    assert(a.len() == 2, "two anchors");
+    List(Int) k17 = dnskey_rdata(257, 8, root_2017());
+    List(Int) k24 = dnskey_rdata(257, 8, root_2024());
+    assert(key_tag(k17) == 20326, "KSK-2017 key tag");
+    assert(key_tag(k24) == 38696, "KSK-2024 key tag");
+    assert(a[0].tag == 20326 && a[0].alg == 8 && a[0].dtype == 2, "anchor 0 fields");
+    assert(hex_encode(ds_digest([0], k17, 2)) == hex_encode(a[0].digest), "KSK-2017 DS digest");
+    assert(hex_encode(ds_digest([0], k24, 2)) == hex_encode(a[1].digest), "KSK-2024 DS digest");
+}
+
+// RFC 8080 6.1: the Ed25519 example (MX 10 mail.example.com.).
+List(Int) mx_rdata(Int pref) { return u16l(pref).concat(nm("mail.example.com")); }
+RR ed_key() { return rr("example.com", 48, 3600, dnskey_rdata(257, 15, "l02Woi0iS8Aa25FQkUd9RMzZHJpBoRQwAQEX1SxZJA4=")); }
+RR ed_sig() { return rr("example.com", 46, 3600, rrsig_rdata(15, 15, 2, 3600, 1440021600, 1438207200, 3613, "example.com", "oL9krJun7xfBOIWcGHi7mag5/hdZrKWw15jPGrHpjQeRAvTdszaPD+QLs3fx8A4M3e23mRZ9VrbpMngwcrqNAg==")); }
+
+test "RFC 8080: Ed25519 key tag, DS and signature" {
+    Key k = key_of(ed_key());
+    assert(k.tag == 3613, "key tag 3613");
+    Ds d = ds_text("3613 15 2 3aa5ab37efce57f737fc1627013fee07bdf241bd10f3b1964ab55c78e79a304b");
+    assert(hex_encode(ds_digest(nm("example.com"), k.rdata, 2)) == hex_encode(d.digest), "the RFC's DS");
+    Checked c = check_rrset(nm("example.com"), 15, [rr("example.com", 15, 3600, mx_rdata(10))], [ed_sig()], [k], nm("example.com"), 1440021600);
+    assert(c.code == 0, "verifies: " + c.why);
+    Checked other = check_rrset(nm("example.com"), 15, [rr("example.com", 15, 3600, mx_rdata(11))], [ed_sig()], [k], nm("example.com"), 1440021600);
+    assert(other.code == 1 && other.why == "its signature does not verify", "another RRset does not: " + other.why);
+    Checked late = check_rrset(nm("example.com"), 15, [rr("example.com", 15, 3600, mx_rdata(10))], [ed_sig()], [k], nm("example.com"), 1440021601);
+    assert(late.code == 1 && late.why == "its signature has expired", "expired: " + late.why);
+    Checked early = check_rrset(nm("example.com"), 15, [rr("example.com", 15, 3600, mx_rdata(10))], [ed_sig()], [k], nm("example.com"), 1438207199);
+    assert(early.code == 1 && early.why == "its signature is not valid yet", "not yet: " + early.why);
+    Checked wrongzone = check_rrset(nm("example.com"), 15, [rr("example.com", 15, 3600, mx_rdata(10))], [ed_sig()], [k], nm("com"), 1440021600);
+    assert(wrongzone.code == 1, "signer must be the zone");
+}
+
+// dnspython's ECDSA P-256 vector (testAbsoluteECDSA256Good).
+List(Int) soa_rdata(Int minimum) { return nm("ns1.example").concat(nm("hostmaster.example")).concat(u32l(4)).concat(u32l(10800)).concat(u32l(3600)).concat(u32l(604800)).concat(u32l(minimum)); }
+
+test "ECDSA P-256 signature (dnspython's vector)" {
+    List(Key) ks = [key_of(rr("example", 48, 86400, dnskey_rdata(256, 13, "+3ss1sCpdARVA61DJigEsL/8quo2a8MszKtn2gkkfxgzFs8S2UHtpb4NfY+XFmNW+JK6MsCkI3jHYN8eEQUgMw=="))),
+                    key_of(rr("example", 48, 86400, dnskey_rdata(257, 13, "eJCEVH7AS3wnoaQpaNlAXH0W8wxymtT9P6P3qjN2ZCV641ED8pF7wZ5VyWfOpgTs6oaZevbJgehl/GaRPUgVyQ==")))];
+    RR sig = rr("example", 46, 86400, rrsig_rdata(6, 13, 1, 86400, 1379801873, 1379801798, 7460, "example", "Sm09SOGz1ULB5D/duwdE2Zpn8bWbVBM77H6N1wPkc42LevvVO+kZEjpq2nq4GOMJcih52667GIAbMrwmU5P2MQ=="));
+    assert(ks[0].tag == 7460, "key tag 7460");
+    Checked c = check_rrset(nm("example"), 6, [rr("example", 6, 86400, soa_rdata(86400))], [sig], ks, nm("example"), 1379801800);
+    assert(c.code == 0, "verifies: " + c.why);
+    Checked bad = check_rrset(nm("example"), 6, [rr("example", 6, 86400, soa_rdata(86401))], [sig], ks, nm("example"), 1379801800);
+    assert(bad.code == 1, "another SOA does not");
+}
+
+test "NSEC3 hashes (RFC 5155 appendix A)" {
+    List(Int) salt = [170, 187, 204, 221];
+    assert(b32hex_encode(nsec3_hash(nm("example"), salt, 12)) == "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", "example");
+    assert(b32hex_encode(nsec3_hash(nm("a.example"), salt, 12)) == "35mthgpgcu1qg68fab165klnsnk3dpvl", "a.example");
+    assert(b32hex_encode(nsec3_hash(wildcard_of(nm("w.example")), salt, 12)) == "r53bq7cc2uvmubfu5ocmm6pers9tk9en", "*.w.example");
+    assert(b32hex_encode(nsec3_hash(nm("x.y.w.EXAMPLE"), salt, 12)) == "2vptu5timamqttgl4luu9kg21e0aor3s", "case-insensitive");
+    assert(hex_encode(b32hex_decode(bytes_of("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom"))) == hex_encode(nsec3_hash(nm("example"), salt, 12)), "base32hex decode");
+    assert(b32hex_decode(bytes_of("0p9mhaveqvm6t7vbl5lop2u3t2rp3to!")).len() == 0, "malformed base32hex");
+}
+
+test "names: canonical order, ancestors, text" {
+    assert(name_cmp(nm("example"), nm("a.example")) < 0, "parent first");
+    assert(name_cmp(nm("a.example"), nm("yljkjljk.a.example")) < 0, "then children");
+    assert(name_cmp(nm("yljkjljk.a.example"), nm("z.a.example")) < 0, "label order");
+    assert(name_cmp(nm("z.a.example"), nm("zabc.a.example")) < 0, "prefix first");
+    assert(name_cmp(nm("zabc.a.example"), nm("z.example")) < 0, "rightmost labels decide");
+    assert(name_cmp(nm("Z.A.example"), nm("z.a.EXAMPLE")) == 0, "case-insensitive");
+    assert(name_cmp(nm("z.example"), wildcard_of(nm("z.example"))) < 0, "a wildcard below");
+    assert(hex_encode(common_ancestor(nm("a.b.example.org"), nm("c.b.example.org"))) == hex_encode(nm("b.example.org")), "common ancestor");
+    assert(name_text(nm("Host.Example.org.")) == "host.example.org.", "lower-cased text");
+    assert(nm("192.0.2.1").len() == 0, "an IPv4 literal is no name");
+    assert(nm("a..b").len() == 0 && nm("bad name").len() == 0, "malformed names refused");
+    assert(name_under(nm("a.b.example"), nm("example")) && !name_under(nm("example"), nm("a.example")), "under");
+}
+
+test "type bitmaps" {
+    // A, NS, SOA, RRSIG, NSEC, DNSKEY in window 0.
+    List(Int) bm = [0, 7, 98, 0, 0, 0, 0, 3, 128];
+    assert(bitmap_has(bm, 1) && bitmap_has(bm, 2) && bitmap_has(bm, 6) && bitmap_has(bm, 46) && bitmap_has(bm, 47) && bitmap_has(bm, 48), "present");
+    assert(!bitmap_has(bm, 43) && !bitmap_has(bm, 44) && !bitmap_has(bm, 5) && !bitmap_has(bm, 300), "absent");
+}
+
+// ============================================================================
+// Whole walks over the recorded responses
+// ============================================================================
+
+List(Str) scen_entries(List(Str) es, Str prefix, Int i, List(Str) acc) {
+    if (i >= es.len()) { return acc; }
+    return scen_entries(es, prefix, i + 1, if (str_starts_with(es[i], prefix)) { acc.concat([es[i]]) } else { acc });
+}
+
+Str find_msg(List(Str) es, Str name, Int t, Int i) {
+    if (i >= es.len()) { return ""; }
+    List(Str) f = str_split(es[i], "|");
+    if (f.len() == 5 && f[3] == name && f[2] == f"{t}") { return f[4]; }
+    return find_msg(es, name, t, i + 1);
+}
+
+Walk drive(Walk w, List(Str) es) {
+    if (walk_done(w)) { return w; }
+    List(Int) n = walk_name(w);
+    Int t = walk_type(w);
+    Str hx = find_msg(es, name_text(n), t, 0);
+    Msg m = if (str_len(hx) == 0) { msg_err("no recorded answer") } else { parse_response(hex_bytes(hx), 0, n, t) };
+    return drive(walk_feed(w, m), es);
+}
+
+Verdict run_with(Str scen, List(Ds) anchors) {
+    List(Str) es = scen_entries(fx_entries(), scen + "|", 0, []);
+    List(Str) f = str_split(es[0], "|");
+    return drive(walk_start(nm(f[1]), anchors, fx_now()), es).v;
+}
+
+Ds fx_anchor(Str scen) {
+    List(Str) es = scen_entries(fx_entries(), scen + "|", 0, []);
+    List(Str) f = str_split(es[es.len() - 1], "|");
+    return ds_text(f[4]);
+}
+
+Verdict run(Str scen) { return run_with(scen, [fx_anchor(scen)]); }
+
+Str vshow(Verdict v) { return v.state + ": " + v.why; }
+
+// An SSH key blob of type `t` whose SHA-256 the fixtures' SSHFP records hold.
+List(Int) fake_blob(Str t) { return u32l(str_len(t)).concat(bytes_of(t)); }
+
+test "secure SSHFP: RSA root, ECDSA test. with NSEC3, Ed25519 example.test. with NSEC" {
+    Verdict v = run("secure");
+    assert(v.state == "secure" && v.exists, vshow(v));
+    assert(v.recs.len() == 3, "three records, SHA-1 one included");
+    assert(name_text(v.zone) == "example.test.", "validated in example.test.");
+    List(Str) ls = sshfp_lines(v);
+    assert(ls.contains("4 1 " + hex_encode(sha1_bytes(bytes_of("x")))), "the SHA-1 record is listed");
+    // The fixture's records hold SHA-256 of these strings, not of key blobs;
+    // matching is checked on synthetic verdicts below.
+    assert(sshfp_key_types(v).contains("ssh-ed25519") && sshfp_key_types(v).contains("ssh-rsa"), "key types to offer");
+    assert(str_contains(verdict_line(v), "2 SHA-256 record(s)"), verdict_line(v));
+}
+
+test "matching a host key against secure records" {
+    List(Int) ed = fake_blob("ssh-ed25519").concat([0, 0, 0, 1, 7]);
+    List(Int) rsa = fake_blob("ssh-rsa").concat([0, 0, 0, 1, 9]);
+    List(Int) ec = fake_blob("ecdsa-sha2-nistp256").concat([0, 0, 0, 1, 3]);
+    Verdict v = Verdict {.state = "secure", .qname = nm("h.example"), .zone = nm("example"), .exists = true,
+        .recs = [Sshfp {.alg = 4, .fptype = 2, .fp = sha256_bytes(ed)}, Sshfp {.alg = 1, .fptype = 1, .fp = sha1_bytes(rsa)}], .why = ""};
+    assert(sshfp_match(v, ed) == "match", "the Ed25519 key matches");
+    assert(sshfp_match(v, fake_blob("ssh-ed25519").concat([0, 0, 0, 1, 8])) == "mismatch", "another Ed25519 key does not");
+    assert(sshfp_match(v, rsa) == "none", "a SHA-1 record never matches");
+    assert(sshfp_match(v, ec) == "none", "no record for ECDSA");
+    Verdict ins = Verdict {.state = "insecure", .qname = v.qname, .zone = v.zone, .exists = true, .recs = v.recs, .why = "x"};
+    assert(sshfp_match(ins, ed) == "none", "records of an insecure verdict are never used");
+}
+
+test "secure absence: NSEC NODATA and NXDOMAIN" {
+    Verdict a = run("nodata-nsec");
+    assert(a.state == "secure" && a.exists && a.recs.len() == 0, vshow(a));
+    assert(str_contains(verdict_line(a), "SSHFP: none for nossh.example.test. (secure"), verdict_line(a));
+    Verdict b = run("nxdomain-nsec");
+    assert(b.state == "secure" && !b.exists, vshow(b));
+    assert(str_contains(verdict_line(b), "does not exist"), verdict_line(b));
+}
+
+test "NSEC3: secure SSHFP, NODATA, an empty non-terminal, NXDOMAIN (SHA-384 DS)" {
+    Verdict a = run("nsec3-secure");
+    assert(a.state == "secure" && a.recs.len() == 1, vshow(a));
+    Verdict b = run("nsec3-nodata");
+    assert(b.state == "secure" && b.exists && b.recs.len() == 0, vshow(b));
+    Verdict c = run("nsec3-ent");
+    assert(c.state == "secure" && c.exists && c.recs.len() == 0, vshow(c));
+    Verdict d = run("nsec3-nxdomain");
+    assert(d.state == "secure" && !d.exists, vshow(d));
+    Verdict e = run("nsec3-nxdomain-deep");
+    assert(e.state == "secure" && !e.exists, vshow(e));
+}
+
+test "insecure: an unsigned delegation, an NSEC3 opt-out span" {
+    Verdict a = run("insecure");
+    assert(a.state == "insecure" && str_contains(a.why, "plain.test. is not signed"), vshow(a));
+    assert(str_contains(verdict_line(a), "unsigned DNS is never trusted"), verdict_line(a));
+    Verdict b = run("optout");
+    assert(b.state == "insecure" && str_contains(b.why, "opt-out"), vshow(b));
+    Verdict c = run("unsupported-alg");
+    assert(c.state == "insecure" && str_contains(c.why, "old.test. is signed only with algorithms"), vshow(c));
+    Verdict d = run("nsec3-iterations");
+    assert(d.state == "insecure" && str_contains(d.why, "200 iterations"), vshow(d));
+}
+
+test "indeterminate: an alias, a weak RSA key, a SERVFAIL, no answer" {
+    Verdict a = run("cname");
+    assert(a.state == "indeterminate" && str_contains(a.why, "alias"), vshow(a));
+    Verdict wk = run("weak-rsa");
+    assert(wk.state == "indeterminate" && str_contains(wk.why, "shorter than 2048 bits"), vshow(wk));
+    Verdict b = run("servfail");
+    assert(b.state == "indeterminate" && str_contains(b.why, "SERVFAIL"), vshow(b));
+    Walk w = walk_feed(walk_start(nm("host.example.test"), iana_anchors(), fx_now()), msg_err("no answer from any resolver"));
+    assert(walk_done(w) && w.v.state == "indeterminate", vshow(w.v));
+}
+
+test "bogus: tampered, expired, not yet valid and stripped signatures" {
+    Verdict a = run("bogus-sig");
+    assert(a.state == "bogus" && str_contains(a.why, "does not verify"), vshow(a));
+    Verdict b = run("expired");
+    assert(b.state == "bogus" && str_contains(b.why, "expired"), vshow(b));
+    Verdict c = run("notyet");
+    assert(c.state == "bogus" && str_contains(c.why, "not valid yet"), vshow(c));
+    Verdict d = run("stripped");
+    assert(d.state == "bogus" && str_contains(d.why, "no signature covers it"), vshow(d));
+    Verdict e = run("bogus-ds-sig");
+    assert(e.state == "bogus" && str_contains(e.why, "DS RRset of example.test."), vshow(e));
+    assert(str_contains(verdict_line(e), "BOGUS"), verdict_line(e));
+    // RSA/SHA-256 (the root's KSK) and ECDSA P-256 (test.'s ZSK) tampered.
+    Verdict f = run("bogus-root-sig");
+    assert(f.state == "bogus" && str_contains(f.why, "root DNSKEY") && str_contains(f.why, "does not verify"), vshow(f));
+    Verdict g = run("bogus-test-ds-sig");
+    assert(g.state == "bogus" && str_contains(g.why, "DS RRset of test."), vshow(g));
+}
+
+test "bogus: a wrong DS, a wrong root key" {
+    Verdict a = run("wrong-ds");
+    assert(a.state == "bogus" && str_contains(a.why, "no DNSKEY matches its DS"), vshow(a));
+    Verdict b = run_with("secure", iana_anchors());
+    assert(b.state == "bogus" && str_contains(b.why, "trust anchor"), vshow(b));
+}
+
+test "bogus: denials that do not prove" {
+    Verdict a = run("bogus-nsec");
+    assert(a.state == "bogus", vshow(a));
+    Verdict b = run("nx-no-wildcard");
+    assert(b.state == "bogus" && str_contains(b.why, "wildcard"), vshow(b));
+    Verdict c = run("nsec3-nx-no-wildcard");
+    assert(c.state == "bogus" && str_contains(c.why, "wildcard"), vshow(c));
+}
+
+test "a response must answer the question asked" {
+    List(Str) es = scen_entries(fx_entries(), "secure|", 0, []);
+    List(Int) m = hex_bytes(find_msg(es, ".", 48, 0));
+    assert(parse_response(m, 0, [0], 48).ok, "the root DNSKEY answer parses");
+    assert(!parse_response(m, 1, [0], 48).ok, "another id");
+    assert(!parse_response(m, 0, [0], 43).ok, "another type");
+    assert(!parse_response(m, 0, nm("test"), 48).ok, "another name");
+    assert(!parse_response(m[0..m.len() - 20], 0, [0], 48).ok, "truncated");
+    List(Int) q = query_msg(4660, nm("Host.Example"), 44);
+    assert(hex_encode(q[0..4]) == "12340110", "id, RD and CD");
+    assert(hex_encode(q[q.len() - 11..q.len()]) == "00002904d00000800000" + "00", "EDNS0 OPT, 1232 bytes, DO");
+}
