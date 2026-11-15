@@ -6,11 +6,21 @@
 //       SSH_AUTH_SOCK (Symbolon's `symbolon ssh-agent`, or any agent
 //       that supports session-bind@openssh.com).
 //
-//   pylon pin [-p PORT] HOST FINGERPRINT
-//       Pin HOST's key, but only if it matches FINGERPRINT (SHA256:...),
-//       which the principal obtained out of band (SPEC 6.1.4).
+//   pylon pin [-p PORT] HOST FINGERPRINT|LINE...|-
+//   pylon pin [-p PORT] 'pylon-hostkey/1 HOST[:PORT] SHA256:...'
+//       Pin HOST's key, but only if it matches a fingerprint the principal
+//       obtained out of band (SPEC 6.1.4): a bare SHA256:..., lines of
+//       `ssh-keygen -lf` (as arguments, or pasted on standard input with
+//       -), or the QR payload that binds them to the host.
+//
+//   pylon sshfp HOST
+//       What DNSSEC-validated DNS says of HOST's SSHFP records (SPEC 6.1.2).
 
 import "crypto.resid";
+import "../core/dns.resid";
+import "../core/dnssec.resid";
+import "../core/resolver.resid";
+import "../core/oob.resid";
 import "../core/wire.resid";
 import "../core/hostkey.resid";
 import "../core/transport.resid";
@@ -66,6 +76,9 @@ Int usage() {
     eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
+    eprintln("                       FINGERPRINT: SHA256:..., ssh-keygen -lf lines, or - to paste them");
+    eprintln("       pylon pin [-p PORT] 'pylon-hostkey/1 HOST[:PORT] SHA256:...'   a scanned QR payload");
+    eprintln("       pylon sshfp HOST                        HOST's SSHFP records, DNSSEC-validated");
     eprintln("       pylon history [HOST]                    what happened to pins");
     eprintln("       pylon pins                              every pinned key");
     eprintln("       pylon ca [PATTERN 'ALG BASE64']         trust a host CA for PATTERN (host, *.domain, *)");
@@ -90,23 +103,64 @@ Conn dial(Str host, Int port) {
 
 @requires(network, filesystem, environment, declassify, clock(readonly))
 Int cmd_pin(Opts o, Int via) {
-    if (o.rest.len() != 2) { return usage(); }
-    Str host = o.rest[0];
-    Str want = o.rest[1];
-    if (!str_starts_with(want, "SHA256:")) { eprintln("pylon: the fingerprint must be SHA256:... as ssh-keygen -lf prints it"); return 2; }
+    if (o.rest.len() < 1) { return usage(); }
+    Bool payload_only = o.rest.len() == 1;
+    Str given = if (payload_only) { o.rest[0] } else { if (o.rest.len() == 2 && o.rest[1] == "-") { pasted(read_stdin(16384, []), 0, "") } else { str_join(o.rest[1..o.rest.len()], " ") } };
+    Oob x = oob_parse(given);
+    if (str_len(x.err) > 0) { eprintln("pylon: " + x.err); return 2; }
+    if (payload_only && str_len(x.host) == 0) { eprintln("pylon: give HOST and its fingerprint, or a " + payload_tag() + " payload"); return usage(); }
+    Str host = if (payload_only) { x.host } else { o.rest[0] };
+    if (str_len(x.host) > 0 && x.host != str_to_lower(host)) { eprintln("pylon: NOT pinned. That payload is for " + x.host + ", not " + host); return 1; }
+    // A payload without a port is for port 22.
+    Int xport = if (x.port > 0) { x.port } else { 22 };
+    if (str_len(x.host) > 0 && xport != o.port) { eprintln("pylon: NOT pinned. That payload is for port " + f"{xport}" + (if (xport != 22) { "; give -p " + f"{xport}" } else { "" })); return 1; }
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
     Handshake h = handshake(c, probing(), o.no_strict);
     _ = resid_tcp_close(c.fd);
     if (h.c.err != probe_done()) { eprintln("pylon: " + h.c.err); return 1; }
-    if (h.fingerprint != want) {
+    if (!x.fps.contains(h.fingerprint)) {
         eprintln("pylon: NOT pinned. " + host + " presents " + h.fingerprint);
-        eprintln("       which differs from the fingerprint you gave (" + want + ").");
+        eprintln("       which differs from " + (if (x.fps.len() == 1) { "the fingerprint you gave (" + x.fps[0] + ")." } else { "every fingerprint you gave (" + str_join(x.fps, ", ") + ")." }));
         return 1;
     }
     if (!pin(host_token(host, o.port), h.host.blob, environment.get("HOSTNAME"))) { eprintln("pylon: cannot write " + pylon_home() + "/known_hosts"); return 1; }
     println("pinned " + host_token(host, o.port) + " " + h.host.alg + " " + h.fingerprint);
     return 0;
+}
+
+// Pasted bytes as text: printable ASCII kept, every other byte a space.
+Str pasted(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    return pasted(b, i + 1, acc + if (b[i] > 32 && b[i] < 127) { str_from_code(b[i]) } else { " " });
+}
+
+@requires(network)
+List(Int) read_stdin(Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_read_some(n - acc.len());
+    if (more.len() == 0) { return acc; }
+    return read_stdin(n, acc.concat(more));
+}
+
+// pylon sshfp HOST: what DNSSEC-validated DNS says of HOST's SSHFP
+// records; 0 when the answer is secure, 1 otherwise.
+@requires(network, filesystem(readonly), environment, clock(readonly))
+Int cmd_sshfp(Opts o) {
+    if (o.rest.len() != 1) { return usage(); }
+    if (name_from_text(o.rest[0]).len() == 0) { eprintln("pylon: " + o.rest[0] + " is not a DNS name"); return 2; }
+    Verdict v = sshfp_lookup(o.rest[0], dnssec_anchors(), clock.now_sec());
+    println(verdict_line(v));
+    _ = print_lines(sshfp_lines(v), 0);
+    return if (v.state == "secure") { 0 } else { 1 };
+}
+
+// What DNS says of an unpinned host's SSHFP records, or no_dns() for an
+// address literal.
+@requires(network, filesystem(readonly), environment, clock(readonly))
+Verdict dns_for(Str host) {
+    if (name_from_text(host).len() == 0) { return no_dns(); }
+    return sshfp_lookup(host, dnssec_anchors(), clock.now_sec());
 }
 
 @requires(network, filesystem, environment, declassify, terminal, clock)
@@ -148,16 +202,25 @@ Authed login(Str user, Str host, Opts o, Int via) {
     if (agent == -1) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
     List(Ident) ids = agent_ids(agent);
     if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
+    // A host with no pin: what DNSSEC-validated SSHFP records say (SPEC 6.1.2).
+    Verdict dv = if (pinned.len() == 0) { dns_for(host) } else { no_dns() };
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
-    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false, .cas = cas_for(host), .name = host, .now = clock.now_sec()}, o.no_strict);
+    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false, .cas = cas_for(host), .name = host, .now = clock.now_sec(), .dns = dv}, o.no_strict);
+    Str token = host_token(host, o.port);
     if (!conn_ok(h.c)) {
         _ = resid_tcp_close(c.fd);
         Bool changed = str_contains(h.c.err, "HOST KEY HAS CHANGED");
-        Str token = host_token(host, o.port);
+        Bool sshfp_bad = str_contains(h.c.err, "DOES NOT MATCH THE HOST'S DNSSEC-SIGNED SSHFP");
         _ = if (changed) { history("refused", token, h.fingerprint, "a key other than the pinned one") } else { true };
+        _ = if (sshfp_bad) { history("refused", token, h.fingerprint, "a key its DNSSEC-signed SSHFP records do not name") } else { true };
         return Authed {.c = h.c, .ok = false, .why = if (changed) { h.c.err + pin_details(pins_for(token), 0, "") } else { h.c.err }};
     }
+    // Accepted through SSHFP: pin it, so that later changes follow 6.2.
+    List(Int) plain = plain_key_blob(h.c.host_blob);
+    Bool by_dns = pinned.len() == 0 && sshfp_match(dv, plain) == "match";
+    _ = if (by_dns) { pin(token, plain, "sshfp") && history("sshfp", token, fingerprint(plain), "DNSSEC-validated in " + name_text(dv.zone)) } else { true };
+    _ = if (by_dns) { eprintln_true("pylon: " + host + " was not pinned; its key " + fingerprint(plain) + " matches its DNSSEC-validated SSHFP record (zone " + name_text(dv.zone) + "), so Pylon pinned it.") } else { true };
     Authed a = authenticate(h.c, agent, user, ids);
     _ = resid_unix_close(agent);
     if (!a.ok) { _ = disconnect(a.c, "authentication failed"); return a; }
@@ -165,6 +228,8 @@ Authed login(Str user, Str host, Opts o, Int via) {
     _ = resid_tcp_deadline(a.c.fd, 0);
     return a;
 }
+
+Bool eprintln_true(Str s) { eprintln(s); return true; }
 
 // What was pinned, when and from which device (SPEC 6.2).
 Str pin_details(List(Pin) ps, Int i, Str acc) {
@@ -414,7 +479,7 @@ Int dispatch(Str verb, Opts o, Int via) {
 
 // The target's host as each command names it.
 Str target_host(Str verb, Opts o) {
-    Str spec = if (verb == "pin") { if (o.rest.len() > 0) { o.rest[0] } else { "" } }
+    Str spec = if (verb == "pin") { if (o.rest.len() == 1) { oob_parse(o.rest[0]).host } else { if (o.rest.len() > 0) { o.rest[0] } else { "" } } }
         else { if (verb == "put") { if (o.rest.len() > 1) { o.rest[1] } else { "" } } else { if (o.rest.len() > 0) { o.rest[0] } else { "" } } };
     List(Str) uh = str_split(spec, "@");
     Str hp = if (uh.len() == 2) { uh[1] } else { spec };
@@ -453,12 +518,13 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins";
+    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins" || verb == "sshfp";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
     if (verb == "ca") { return cmd_ca(o); }
     if (verb == "pins") { _ = print_lines(pin_lines(), 0); return 0; }
+    if (verb == "sshfp") { return cmd_sshfp(o); }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
 }

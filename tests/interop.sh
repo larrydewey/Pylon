@@ -17,7 +17,7 @@ WORK="$(mktemp -d)"
 PORT=$((20000 + RANDOM % 20000))
 PASS=0
 FAIL=0
-trap 'kill $(cat "$WORK"/sshd.pid "$WORK"/target.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $(cat "$WORK"/sshd.pid "$WORK"/target.pid "$WORK"/dns.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 
 cd "$WORK"
 for t in ed25519 ecdsa rsa; do
@@ -165,6 +165,70 @@ start_sshd "HostKey $WORK/host_cert_untrusted" "HostCertificate $WORK/host_cert_
 check "certificate: from an untrusted CA is refused" 1 "CA you do not trust" \
     env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
 start_sshd "HostKey $WORK/host_ed25519"
+
+# --- SSHFP with DNSSEC (SPEC 6.1.2), no pins ----------------------------------
+# tests/dnssec_zone.py serves a test root and a signed zone localhost. with
+# the host's SSHFP records; Pylon validates from that root's DS (the test
+# anchor) down. Each mode gets a fresh PYLON_HOME.
+dns_server() {   # mode
+    kill "$(cat dns.pid 2>/dev/null)" 2>/dev/null; rm -f dns.port
+    python3 "$(dirname "$HOSTILE")/dnssec_zone.py" serve "$WORK/dns.port" "$WORK/dns.anchor" "$WORK/dns.sshfp" "$1" & echo $! > dns.pid
+    for _ in $(seq 50); do [ -f dns.port ] && break; sleep 0.1; done
+    DNSH="$WORK/dns_home_$1"; rm -rf "$DNSH"
+}
+dns() { env PYLON_HOME="$DNSH" PYLON_DNS="127.0.0.1:$(cat dns.port)" PYLON_TEST_DNSSEC_ANCHOR="$(cat dns.anchor)" "$@"; }
+ssh-keygen -r localhost -f host_ed25519.pub > dns.sshfp
+dns_server secure
+check "sshfp: the records validate from the test root" 0 "SHA-256 record(s) for localhost. (secure" \
+    dns "$PYLON" sshfp localhost
+check "sshfp: an unpinned host is accepted through them, and pinned" 0 "matches its DNSSEC-validated SSHFP record" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" "echo via-sshfp"
+check "sshfp: the pin is recorded with its source" 0 "sshfp localhost:$PORT $(fp host_ed25519.pub) DNSSEC-validated in localhost." \
+    dns "$PYLON" history localhost:$PORT
+check "sshfp: the next connection uses the pin" 0 "pinned-now" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" "echo pinned-now"
+start_sshd "HostKey $WORK/host_other"
+check "sshfp: a pinned host's changed key is refused even with DNS" 1 "HOST KEY HAS CHANGED" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" true
+dns_server secure
+check "sshfp: a key the records do not name is refused" 1 "DOES NOT MATCH THE HOST'S DNSSEC-SIGNED SSHFP" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" true
+start_sshd "HostKey $WORK/host_ed25519"
+dns_server tc
+check "sshfp: truncated UDP answers are asked again over TCP" 0 "via-tcp" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" "echo via-tcp"
+dns_server bogus
+check "sshfp: bogus signatures are refused and shown" 1 "BOGUS (the SSHFP RRset of localhost.: its signature does not verify)" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" true
+dns_server insecure
+check "sshfp: an unsigned zone never pins" 1 "insecure (the delegation to localhost. is not signed" \
+    dns "$PYLON" -p $PORT "$USER_NAME@localhost" true
+check "sshfp: and nothing was pinned" 1 "" \
+    dns "$PYLON" history localhost:$PORT
+check "sshfp: no resolver answering is indeterminate" 1 "indeterminate (no usable answer" \
+    env PYLON_HOME="$DNSH" PYLON_DNS="127.0.0.1:9" PYLON_TEST_DNSSEC_ANCHOR="$(cat dns.anchor)" "$PYLON" -p $PORT "$USER_NAME@localhost" true
+kill "$(cat dns.pid)" 2>/dev/null; rm -f dns.pid
+
+# --- out-of-band pinning forms (SPEC 6.1.4) ----------------------------------
+OOBH="$WORK/oob_home"
+check "out-of-band: an ssh-keygen -lf line as one argument" 0 "pinned 127.0.0.1:$PORT" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT 127.0.0.1 "$(ssh-keygen -lf host_ed25519.pub)"
+check "out-of-band: several lines on standard input" 0 "pinned 127.0.0.1:$PORT" \
+    bash -c "cat host_rsa.pub host_ed25519.pub | ssh-keygen -lf - | env PYLON_HOME='$OOBH' '$PYLON' pin -p $PORT 127.0.0.1 -"
+check "out-of-band: lines that do not name the key" 1 "every fingerprint you gave" \
+    bash -c "cat host_rsa.pub host_other.pub | ssh-keygen -lf - | env PYLON_HOME='$OOBH' '$PYLON' pin -p $PORT 127.0.0.1 -"
+check "out-of-band: MD5 is refused" 2 "MD5 fingerprints are not accepted" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT 127.0.0.1 "$(ssh-keygen -E md5 -lf host_ed25519.pub)"
+check "out-of-band: the QR payload" 0 "pinned 127.0.0.1:$PORT" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT "pylon-hostkey/1 127.0.0.1:$PORT $(fp host_rsa.pub) $(fp host_ed25519.pub)"
+check "out-of-band: a payload for another host" 1 "That payload is for other.example" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT 127.0.0.1 "pylon-hostkey/1 other.example $(fp host_ed25519.pub)"
+check "out-of-band: a payload for another port" 1 "That payload is for port" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT "pylon-hostkey/1 127.0.0.1:1 $(fp host_ed25519.pub)"
+check "out-of-band: a payload without a port is for port 22" 1 "That payload is for port 22" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT "pylon-hostkey/1 127.0.0.1 $(fp host_ed25519.pub)"
+check "out-of-band: a payload without the host's key" 1 "NOT pinned" \
+    env PYLON_HOME="$OOBH" "$PYLON" pin -p $PORT "pylon-hostkey/1 127.0.0.1:$PORT $(fp host_other.pub)"
 
 # --- user key types ----------------------------------------------------------
 start_sshd "HostKey $WORK/host_ed25519"

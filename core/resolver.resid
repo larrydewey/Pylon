@@ -1,0 +1,157 @@
+// The network side of Pylon's validating resolver (SPEC 6.1.2): asks a
+// recursive resolver over UDP port 53 (TCP when the answer is truncated)
+// with DO and CD set, and drives the walk of core/dnssec.resid with its
+// answers. Nothing here is trusted: the resolver only carries records,
+// whose signatures the walk checks from the root trust anchor down.
+//
+// Resolvers: $PYLON_DNS ("IP[:PORT][,IP[:PORT]...]") or the nameserver
+// lines of /etc/resolv.conf (IPv4 only), at most three, each asked twice
+// with a 1.5 s wait before the next.
+
+import "crypto.resid";
+import "dns.resid";
+import "dnssec.resid";
+
+pub type Server = { List(Int) addr; Int port; Str host; };
+
+// "IP" or "IP:PORT" (IPv4); port 0 when malformed.
+pub Server server_of(Str s) {
+    List(Str) hp = str_split(str_trim(s), ":");
+    List(Int) a = if (hp.len() >= 1) { ip4(hp[0]) } else { [] };
+    Int port = if (hp.len() == 2 && str_is_int(hp[1])) { str_parse_int(hp[1]) } else { if (hp.len() == 1) { 53 } else { 0 } };
+    if (a.len() != 4 || port < 1 || port > 65535) { return Server {.addr = [], .port = 0, .host = ""}; }
+    return Server {.addr = a, .port = port, .host = hp[0]};
+}
+
+List(Int) ip4(Str s) {
+    List(Str) p = str_split(s, ".");
+    if (p.len() != 4) { return []; }
+    return ip4_at(p, 0, []);
+}
+List(Int) ip4_at(List(Str) p, Int i, List(Int) acc) {
+    if (i >= 4) { return acc; }
+    if (!str_is_int(p[i]) || str_len(p[i]) > 3 || str_parse_int(p[i]) < 0 || str_parse_int(p[i]) > 255) { return []; }
+    return ip4_at(p, i + 1, acc.concat([str_parse_int(p[i])]));
+}
+
+// The resolvers to ask.
+@requires(filesystem(readonly), environment)
+pub List(Server) resolvers() {
+    Str env = environment.get("PYLON_DNS");
+    if (str_len(env) > 0) { return servers_of(str_split(env, ","), 0, []); }
+    if (!filesystem.exists("/etc/resolv.conf")) { return []; }
+    return conf_acc(str_split(filesystem.read_all("/etc/resolv.conf"), "\n"), 0, []);
+}
+
+List(Server) servers_of(List(Str) xs, Int i, List(Server) acc) {
+    if (i >= xs.len() || acc.len() >= 3) { return acc; }
+    Server s = server_of(xs[i]);
+    return servers_of(xs, i + 1, if (s.port > 0) { acc.concat([s]) } else { acc });
+}
+
+List(Server) conf_acc(List(Str) ls, Int i, List(Server) acc) {
+    if (i >= ls.len() || acc.len() >= 3) { return acc; }
+    List(Str) f = str_split(str_replace(str_trim(ls[i]), "\t", " "), " ");
+    Bool ns = f.len() >= 2 && f[0] == "nameserver";
+    Server s = if (ns) { server_of(f[f.len() - 1]) } else { Server {.addr = [], .port = 0, .host = ""} };
+    return conf_acc(ls, i + 1, if (s.port > 0) { acc.concat([s]) } else { acc });
+}
+
+Int new_id() {
+    List(Int) r = random_bytes(2);
+    return r[0] * 256 + r[1];
+}
+
+// One question to the resolvers, in turn, until one answers.
+@requires(network, clock(readonly))
+pub Msg ask(List(Server) ss, List(Int) qname, Int qtype) {
+    if (ss.len() == 0) { return msg_err("no resolver (nameserver in /etc/resolv.conf, or PYLON_DNS)"); }
+    return ask_at(ss, qname, qtype, 0, 0, "");
+}
+
+@requires(network, clock(readonly))
+Msg ask_at(List(Server) ss, List(Int) qname, Int qtype, Int i, Int tries, Str last) {
+    if (i >= ss.len()) { return msg_err(if (str_len(last) > 0) { last } else { "no answer from any resolver" }); }
+    Msg m = ask_udp(ss[i], qname, qtype);
+    Msg m2 = if (m.ok && msg_tc(m)) { ask_tcp(ss[i], qname, qtype) } else { m };
+    if (m2.ok) { return m2; }
+    if (tries < 1) { return ask_at(ss, qname, qtype, i, tries + 1, m2.err); }
+    return ask_at(ss, qname, qtype, i + 1, 0, m2.err);
+}
+
+@requires(network, clock(readonly))
+Msg ask_udp(Server s, List(Int) qname, Int qtype) {
+    Int u = resid_udp_open();
+    if (u < 0) { return msg_err("cannot open a UDP socket"); }
+    Int id = new_id();
+    Bool sent = resid_udp_send_to(u, s.addr, s.port, query_msg(id, qname, qtype));
+    Msg m = if (sent) { await_udp(u, s, id, qname, qtype, clock.monotonic_ns() + 1500000000) } else { msg_err("cannot send to " + s.host) };
+    _ = resid_tcp_close(u);
+    return m;
+}
+
+// The first datagram from the server that answers this query; others
+// (a stray or spoofed packet) are dropped while time is left.
+@requires(network, clock(readonly))
+Msg await_udp(Int u, Server s, Int id, List(Int) qname, Int qtype, Int until) {
+    Int left = (until - clock.monotonic_ns()) / 1000000;
+    if (left <= 0) { return msg_err("no answer from " + s.host + " within 1.5 s"); }
+    _ = resid_tcp_poll([u], [1], left);
+    List(Int) d = resid_udp_recv_from(u, 65535);
+    if (d.len() < 6) { return await_udp(u, s, id, qname, qtype, until); }
+    Bool from = hex_encode(d[0..4]) == hex_encode(s.addr) && d[4] * 256 + d[5] == s.port;
+    Msg m = if (from) { parse_response(d[6..d.len()], id, qname, qtype) } else { msg_err("stray") };
+    if (!m.ok) { return await_udp(u, s, id, qname, qtype, until); }
+    return m;
+}
+
+@requires(network)
+Msg ask_tcp(Server s, List(Int) qname, Int qtype) {
+    Int fd = resid_tcp_connect(s.host, s.port);
+    if (fd < 0) { return msg_err("cannot reach " + s.host + " over TCP"); }
+    _ = resid_tcp_deadline(fd, 5000);
+    Int id = new_id();
+    List(Int) q = query_msg(id, qname, qtype);
+    Int ql = q.len();
+    List(Int) framed = [(ql >> 8) & 255, ql & 255].concat(q);
+    Bool sent = resid_tcp_send_bin(fd, framed);
+    List(Int) hd = if (sent) { read_n(fd, 2, []) } else { [] };
+    List(Int) body = if (hd.len() == 2) { read_n(fd, hd[0] * 256 + hd[1], []) } else { [] };
+    _ = resid_tcp_close(fd);
+    if (hd.len() != 2 || body.len() != hd[0] * 256 + hd[1]) { return msg_err("no answer from " + s.host + " over TCP"); }
+    return parse_response(body, id, qname, qtype);
+}
+
+@requires(network)
+List(Int) read_n(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_tcp_recv_some(fd, n - acc.len());
+    if (more.len() == 0) { return acc; }
+    return read_n(fd, n, acc.concat(more));
+}
+
+@requires(network, clock(readonly))
+Walk drive_walk(Walk w, List(Server) ss) {
+    if (walk_done(w)) { return w; }
+    return drive_walk(walk_feed(w, ask(ss, walk_name(w), walk_type(w))), ss);
+}
+
+// What DNSSEC-validated DNS says about `host`'s SSHFP records, from the
+// trust `anchors` at time `now`.
+@requires(network, clock(readonly), filesystem(readonly), environment)
+pub Verdict sshfp_lookup(Str host, List(Ds) anchors, Int now) {
+    List(Int) q = name_from_text(host);
+    if (q.len() == 0) { return verdict("indeterminate", [0], [0], "not a DNS name"); }
+    return drive_walk(walk_start(q, anchors, now), resolvers()).v;
+}
+
+// The trust anchors: IANA's root KSKs, or, for tests only, the DS in
+// $PYLON_TEST_DNSSEC_ANCHOR (announced on stderr whenever it is used).
+@requires(environment)
+pub List(Ds) dnssec_anchors() {
+    Str t = environment.get("PYLON_TEST_DNSSEC_ANCHOR");
+    if (str_len(t) == 0) { return iana_anchors(); }
+    eprintln("pylon: WARNING: using the test DNSSEC trust anchor from PYLON_TEST_DNSSEC_ANCHOR, not IANA's root keys");
+    Ds d = ds_text(t);
+    return if (d.tag >= 0) { [d] } else { [] };
+}
