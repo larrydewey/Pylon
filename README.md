@@ -48,7 +48,9 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Local shell | `pylon-local` (SPEC 13): a shell on the device that cannot reach Pylon's files, the agent, Pylon's processes or the network. Linux: an empty environment and new user, mount, pid and network namespaces with a root of its own (system directories read-only, its own home at `~/.local/share/pylon-local/home`); Android: an `isolatedProcess` service (its own UID, no permissions, no storage), not yet verified on a device. No SSH from it yet |
 | Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
 
-Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
+Tested against OpenSSH 9.6, against OpenSSH 10.2 in CI (`openssh10`
+workflow: built from source, the post-quantum hybrid negotiated with
+OpenSSH itself), and the handshake against Dropbear 2022.83:
 153 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
@@ -63,10 +65,9 @@ answers and published known answers in `tests/dnssec_test.resid`, and a
 mutation fuzzer in `tests/fuzz_proxy.py`. Live DNSSEC against the real
 root has not been exercised yet (the build sandbox has no DNS on port 53).
 
-Next (SPEC 17): an OpenSSH 10 interop run for the hybrid (OpenSSH 9.6
-here has no ML-KEM; it is checked against a reference server built on
-OpenSSL's primitives, `tests/pq_server.py`), then the Android app. Open
-compiler warnings: SPEC Appendix A, I6.
+Without an sshd that has ML-KEM (OpenSSH before 9.9), the hybrid is
+checked against a reference server built on OpenSSL's primitives
+(`tests/pq_server.py`). Open compiler warnings: SPEC Appendix A, I6.
 
 ## Build and use
 
