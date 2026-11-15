@@ -593,6 +593,32 @@ most 16 ports per client. A port another client of the same principal
 holds moves to the one asking (that client went away without a word, as
 with ATTACH); a client's ports close when it is dropped.
 
+Files (v1, `core/files.resid`): `pylon get/put --pylond FILE [--resume]`
+opens `FILE 16 | sid | op (1: 0 get, 1 put) | flags (1: bit 0 resume) |
+path`, confirmed as OPEN is, on an external stream. The path is the one
+the principal typed (printable ASCII in v1; a relative one is taken under
+`$HOME`, and Landlock confines pylond beneath `$HOME` and its runtime
+directory, reading beneath `/etc`). Files are cut into 64 KiB chunks;
+the side holding part of the file sends the SHA-256 of each whole chunk
+it has, and the transfer starts after the leading run of chunks both
+sides share:
+
+```
+get  C → S  chunk hashes of LOCAL (with --resume), FIN
+     S → C  0 | size (8) | start (8) | SHA-256 of the file (32) | bytes from start, FIN
+            or 1 | message, FIN
+put  S → C  0 | count (4) | count chunk hashes (with --resume; else 0)   or 1 | message, FIN
+     C → S  start (8) | size (8) | SHA-256 of the file (32) | bytes from start, FIN
+     S → C  0 (complete, hash matches), FIN   or 1 | message, FIN
+```
+
+The receiver cuts its file back to `start`, appends what arrives, and
+checks the whole file against the hash at the end, so a resumed file is
+the sender's file or an error. A local file is never replaced without
+`--force`, or continued without `--resume`; messages from pylond are
+shown escaped. (SHA-256 stands in for the BLAKE2s of 11, which Resid's
+library lacks.)
+
 Further frames (v1): `SHELL 7 | sid | rows (2) | cols (2)` starts the
 principal's login shell on a pseudo-terminal, `RESIZE 9 | sid | rows |
 cols`, `ATTACH 10 | sid | session (4) | rows | cols` joins a kept
@@ -614,7 +640,8 @@ Rekeying (9.5): the client starts a new handshake every 2 minutes;
 pylond switches keys when it answers and refuses data under keys older
 than 3 minutes. Streams carry on.
 
-Limits of v1: an IPv4 literal host, no padding to 64 bytes, no cookie
+Limits of v1: an IPv4 literal host, files of up to 64 MiB (held in
+memory whole) with printable-ASCII remote paths, no padding to 64 bytes, no cookie
 (`mac2`), no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).
 

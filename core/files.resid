@@ -1,0 +1,77 @@
+// Resumable file transfer over the Pylon protocol (SPEC 11 "Files",
+// 9.7): what both ends share. EXPERIMENTAL, as proto.resid.
+//
+// A transfer is one stream, opened by the client with
+//   FILE 16 | sid (4) | op (1: 0 get, 1 put) | flags (1: bit 0 resume) | path
+// The path is the one the principal typed (printable ASCII in v1; a
+// relative one is taken under the principal's home). The file is cut into
+// 64 KiB chunks; a side that holds part of it sends the SHA-256 of each
+// whole chunk it has, and the transfer starts after the longest run of
+// leading chunks the other side has too. The whole file's SHA-256 travels
+// with the bytes and is checked at the end, so a resumed file is the
+// sender's file or an error.
+//
+//   get  client -> pylond  hashes of LOCAL's chunks (with --resume), FIN
+//        pylond -> client  0 | size (8) | start (8) | sha256 (32) | bytes from start, FIN
+//                          or 1 | message, FIN
+//   put  pylond -> client  0 | count (4) | count x hash (with --resume; else count 0)
+//                          or 1 | message, FIN
+//        client -> pylond  start (8) | size (8) | sha256 (32) | bytes from start, FIN
+//        pylond -> client  0 (the file is complete and its hash matches), FIN
+//                          or 1 | message, FIN
+//
+// Files are held in memory whole, so v1 carries files of up to 64 MiB.
+
+import "crypto.resid";
+import "hash.resid";
+import "wire.resid";
+
+pub Int file_chunk() { return 65536; }
+pub Int file_max() { return 67108864; }
+
+// The SHA-256 of each whole chunk of data, concatenated.
+pub List(Int) chunk_hashes(List(Int) data, Int i, List(Int) acc) {
+    Int at = i * file_chunk();
+    if (at + file_chunk() > data.len()) { return acc; }
+    return chunk_hashes(data, i + 1, acc.concat(sha256_bytes(data[at..at + file_chunk()])));
+}
+
+// How many leading whole chunks of data the hashes (32 bytes each) match.
+pub Int matching(List(Int) data, List(Int) hashes, Int k) {
+    Int at = k * file_chunk();
+    if ((k + 1) * 32 > hashes.len() || at + file_chunk() > data.len()) { return k; }
+    if (!same_bytes(sha256_bytes(data[at..at + file_chunk()]), hashes[k * 32..(k + 1) * 32])) { return k; }
+    return matching(data, hashes, k + 1);
+}
+
+// A path the principal may name in v1: printable ASCII, 1 to 4096 bytes.
+pub Bool path_ok(List(Int) p) { return p.len() >= 1 && p.len() <= 4096 && printable(p, 0); }
+
+Bool printable(List(Int) p, Int i) {
+    if (i >= p.len()) { return true; }
+    return p[i] >= 32 && p[i] < 127 && printable(p, i + 1);
+}
+
+// An eight-byte big-endian number at i.
+pub Int be64_at(List(Int) b, Int i) { return (be32(b, i) << 32) | be32(b, i + 4); }
+
+// A refusal: 1 | message.
+pub List(Int) refusal(Str why) { return [1].concat(bytes_of(why)); }
+
+// pylond's answer to a get: the file at path from the first chunk the
+// client's hashes do not cover.
+@requires(filesystem(readonly))
+pub List(Int) get_reply(Str path, List(Int) hashes) {
+    if (!filesystem.exists(path)) { return refusal("no such file"); }
+    if (filesystem.is_dir(path)) { return refusal("is a directory"); }
+    List(Int) data = filesystem.read_bytes(path);
+    if (data.len() > file_max()) { return refusal("larger than 64 MiB (the Pylon protocol v1 limit)"); }
+    Int start = matching(data, hashes, 0) * file_chunk();
+    return [0].concat(u64_be(data.len())).concat(u64_be(start)).concat(sha256_bytes(data)).concat(data[start..data.len()]);
+}
+
+// The bytes a put sends: start, size, hash, and the file from start.
+pub List(Int) put_body(List(Int) data, List(Int) hashes) {
+    Int start = matching(data, hashes, 0) * file_chunk();
+    return u64_be(start).concat(u64_be(data.len())).concat(sha256_bytes(data)).concat(data[start..data.len()]);
+}

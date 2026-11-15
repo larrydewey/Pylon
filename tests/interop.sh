@@ -347,6 +347,34 @@ except socket.timeout:
     check "pylon protocol: -R, a new client takes the port over" 0 "pylon-proto-ok" \
         curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
     kill $PRR 2>/dev/null; wait $PRR 2>/dev/null
+    # Files over the Pylon protocol: resumable get and put (pylond's
+    # Landlock keeps it beneath \$HOME, so the remote side lives there).
+    HD="pylon-interop-$PORT"; mkdir -p "$HOME/$HD"; head -c 3000000 /dev/urandom > pf.bin
+    PFSUM="$(sha256sum pf.bin | cut -d' ' -f1)"
+    check "pylon protocol: put 3 MB (a path under \$HOME)" 0 "3000000 bytes" \
+        "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$HD/pf.bin"
+    check "pylon protocol: pylond wrote the same bytes" 0 "$PFSUM" sha256sum "$HOME/$HD/pf.bin"
+    check "pylon protocol: get it back intact" 0 "$PFSUM" \
+        bash -c "'$PYLON' get -p $PORT --pylond '$PYLOND' '$USER_NAME@127.0.0.1:$HD/pf.bin' pg.bin 2>/dev/null && sha256sum pg.bin"
+    check "pylon protocol: get refuses to replace a local file" 1 "or --resume to continue it" \
+        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/pf.bin" pg.bin
+    check "pylon protocol: an interrupted get" 1 "stopped" \
+        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
+    check "pylon protocol: get --resume continues where it stopped" 0 "resumed at 983040" \
+        "$PYLON" get -p $PORT --pylond "$PYLOND" --resume "$USER_NAME@127.0.0.1:$HD/pf.bin" pi.bin
+    check "pylon protocol: the resumed get is intact" 0 "$PFSUM" sha256sum pi.bin
+    check "pylon protocol: an interrupted put" 1 "stopped" \
+        env PYLON_TEST_STOP_AFTER=1000000 "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
+    check "pylon protocol: put --resume continues where it stopped" 0 "resumed at" \
+        "$PYLON" put -p $PORT --pylond "$PYLOND" --resume pf.bin "$USER_NAME@127.0.0.1:$HD/pp.bin"
+    check "pylon protocol: the resumed put is intact" 0 "$PFSUM" sha256sum "$HOME/$HD/pp.bin"
+    check "pylon protocol: a missing remote file" 1 "no such file" \
+        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/nope" nope.bin
+    check "pylon protocol: a remote name with escape bytes is refused" 2 "printable ASCII" \
+        "$PYLON" get -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1:$HD/$(printf '\033[31mred')" red2.bin
+    check "pylon protocol: a put outside \$HOME is refused (Landlock)" 1 "cannot write the file" \
+        "$PYLON" put -p $PORT --pylond "$PYLOND" pf.bin "$USER_NAME@127.0.0.1:$WORK/outside.bin"
+    rm -rf "$HOME/$HD"
     # Roaming: the client moves to a new UDP socket mid-transfer.
     PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
     for _ in $(seq 100); do grep -q "forwarding" pr.log && break; sleep 0.2; done

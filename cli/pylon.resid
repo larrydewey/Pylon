@@ -24,6 +24,7 @@ import "../core/jump.resid";
 import "../core/proto.resid";
 import "../core/link.resid";
 import "../core/pyclient.resid";
+import "../core/files.resid";
 
 type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; Str jump; Str pylond; List(Str) pflags; List(Str) fwds; List(Str) rest; Str err; };
 
@@ -38,7 +39,7 @@ Opts parse(Int i, Opts o) {
     }
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app" || a == "--resume") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if ((a == "-L" || a == "-D" || a == "-R") && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds.concat([str_slice(a, 1, 2) + " " + args.get(i + 1)]), .rest = [], .err = ""}); }
@@ -60,6 +61,7 @@ Int usage() {
     eprintln("                       [-R [localhost:]RPORT:HOST:HOSTPORT] ... USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
+    eprintln("       pylon get/put --pylond FILE [--resume] ...   over the Pylon protocol, resumable");
     eprintln("       pylon --pylond FILE [-N -L/-D/-R ...] USER@HOST   a terminal or forwards over the");
     eprintln("                       Pylon protocol (experimental; HOST as an IPv4 address)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
@@ -213,15 +215,19 @@ Remote parse_remote(Str s) {
 }
 
 // pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL
-@requires(network, filesystem, environment, declassify, clock(readonly))
+@requires(network, filesystem, environment, declassify, clock)
 Int cmd_get(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Remote r = parse_remote(o.rest[0]);
     Str local = o.rest[1];
     if (str_len(r.user) == 0) { eprintln("pylon: give the source as USER@HOST:PATH"); return 2; }
-    if (filesystem.exists(local) && !o.force) { eprintln("pylon: " + local + " exists; not replaced (use --force to replace it)"); return 1; }
+    Bool resume = has_flag(o.pflags, "resume");
+    if (resume && str_len(o.pylond) == 0) { eprintln("pylon: --resume needs --pylond (SFTP transfers start over)"); return 2; }
+    if (filesystem.exists(local) && !o.force && !resume) { eprintln("pylon: " + local + " exists; not replaced (use --force to replace it" + (if (str_len(o.pylond) > 0) { ", or --resume to continue it" } else { "" }) + ")"); return 1; }
+    if (filesystem.is_dir(local)) { eprintln("pylon: " + local + " is a directory"); return 1; }
     Authed a = login(r.user, r.host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    if (str_len(o.pylond) > 0) { return pylon_transfer(a.c, r, local, 0, resume && filesystem.exists(local), o); }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
     Copied c = get_file(s, r.path, local);
@@ -232,16 +238,19 @@ Int cmd_get(Opts o, Int via) {
 }
 
 // pylon put [-p PORT] LOCAL USER@HOST:REMOTE
-@requires(network, filesystem, environment, declassify, clock(readonly))
+@requires(network, filesystem, environment, declassify, clock)
 Int cmd_put(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Str local = o.rest[0];
     Remote r = parse_remote(o.rest[1]);
     if (str_len(r.user) == 0) { eprintln("pylon: give the destination as USER@HOST:PATH"); return 2; }
     if (!filesystem.exists(local) || filesystem.is_dir(local)) { eprintln("pylon: " + local + " is not a file"); return 1; }
+    Bool resume = has_flag(o.pflags, "resume");
+    if (resume && str_len(o.pylond) == 0) { eprintln("pylon: --resume needs --pylond (SFTP transfers start over)"); return 2; }
     List(Int) data = filesystem.read_bytes(local);
     Authed a = login(r.user, r.host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    if (str_len(o.pylond) > 0) { return pylon_transfer(a.c, r, local, 1, resume, o); }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
     Copied c = put_file(s, data, r.path);
@@ -249,6 +258,62 @@ Int cmd_put(Opts o, Int via) {
     _ = disconnect(c.s.ch.c, "done");
     eprintln("pylon: " + f"{c.bytes}" + " bytes to " + r.host + ":" + display_text(bytes_of(r.path)));
     return 0;
+}
+
+// get (op 0) or put (1) over the Pylon protocol: a resumable transfer
+// (core/files.resid). --resume continues a transfer that stopped: only
+// the chunks the other side lacks are sent, and the whole file's hash is
+// checked at the end.
+@requires(network, filesystem, environment, declassify, clock)
+Int pylon_transfer(Conn c, Remote r, Str local, Int op, Bool resume, Opts o) {
+    if (!path_ok(bytes_of(r.path))) { _ = disconnect(c, "done"); eprintln("pylon: the Pylon protocol (v1) takes remote paths of printable ASCII only"); return 2; }
+    List(Int) data = if (op == 1 || resume) { filesystem.read_bytes(local) } else { [] };
+    if (data.len() > file_max()) { _ = disconnect(c, "done"); eprintln("pylon: " + local + " is larger than 64 MiB (the Pylon protocol v1 limit)"); return 1; }
+    Up u = pylon_up(c, r.host, o.pylond, o.pflags);
+    if (u.code >= 0) { return u.code; }
+    eprintln("pylon: Pylon protocol session to " + r.host + ":" + f"{u.l.port}" + " (experimental); SSH closed");
+    Str st = environment.get("PYLON_TEST_STOP_AFTER");
+    Fx x = pylon_file(file_start(u.l, u.rk, op, resume, r.path, local, data, if (str_is_int(st)) { str_parse_int(st) } else { 0 }, clock.monotonic_ns()));
+    if (str_len(x.err) > 0) { eprintln("pylon: " + x.err); return 1; }
+    Str whence = if (x.start > 0) { " (resumed at " + f"{x.start}" + ")" } else { "" };
+    eprintln("pylon: " + f"{x.size}" + " bytes to " + (if (op == 0) { local } else { r.host + ":" + display_text(bytes_of(r.path)) }) + whence);
+    return 0;
+}
+
+// pylond delivered, started and bootstrapped over the verified SSH
+// connection (closed then), and the UDP handshake done: the link and its
+// rekeying state, or code >= 0 (the message printed) when that failed.
+type Up = { Link l; Rk rk; Int rebind; Int code; };
+
+@requires(network, filesystem, environment, declassify, clock)
+Up pylon_up(Conn c, Str host, Str path, List(Str) pflags) {
+    List(Secret(UInt(8))) e = [];
+    Link none = link_new(false, -1, [], 0, SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0}, 0);
+    Rk none_rk = rk_new(boot_finish(boot_client_new(), []), static_new(), 0);
+    List(Int) addr = ipv4(host);
+    if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 2}; }
+    // A directory holds one build per machine type: pylond-x86_64, pylond-aarch64.
+    Bool dir = filesystem.is_dir(path);
+    Arch ar = if (dir) { host_arch(c) } else { Arch {.c = c, .arch = "", .err = ""} };
+    if (str_len(ar.err) > 0) { eprintln("pylon: " + ar.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
+    Bool plain = ar.arch == "x86_64" || ar.arch == "aarch64";
+    if (dir && !plain) { eprintln("pylon: no pylond for this host's machine type (" + display_text(bytes_of(ar.arch)) + ")"); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 2}; }
+    Str file = if (dir) { path + "/pylond-" + ar.arch } else { path };
+    if (!filesystem.exists(file)) { eprintln("pylon: no pylond at " + file); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 2}; }
+    List(Int) bin = filesystem.read_bytes(file);
+    Str hash = hex_encode(sha256_bytes(bin));
+    Pushed p = push_pylond(ar.c, bin, hash);
+    if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
+    Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"));
+    if (str_len(st.err) > 0) { eprintln("pylon: " + st.err); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
+    _ = disconnect(st.c, "pylond started");
+    Int udp = resid_udp_open();
+    SessionKeys k = connect_udp(udp, addr, st.b.port, st.b, st.bc.c, 5);
+    if (!k.ok) { eprintln("pylon: no handshake with pylond on UDP port " + f"{st.b.port}"); return Up {.l = none, .rk = none_rk, .rebind = 0, .code = 1}; }
+    Str rb = environment.get("PYLON_TEST_REBIND_AFTER");
+    Str rks = environment.get("PYLON_TEST_REKEY_SECS");
+    Rk rk = rk_new(st.b, st.bc.c, if (str_is_int(rks) && str_parse_int(rks) > 0) { str_parse_int(rks) * 1000000000 } else { 120000000000 });
+    return Up {.l = link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns()), .rk = rk, .rebind = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 }, .code = -1};
 }
 
 // --pylond FILE: a terminal (no -N), or -N -L forwards, over the Pylon
@@ -259,37 +324,16 @@ Int cmd_put(Opts o, Int via) {
 Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfuscate, List(Str) pflags) {
     Bool sessions = has_flag(pflags, "sessions");
     Bool shell = shell0 && !sessions;
-    List(Int) addr = ipv4(host);
-    if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return 2; }
-    // A directory holds one build per machine type: pylond-x86_64, pylond-aarch64.
-    Bool dir = filesystem.is_dir(path);
-    Arch ar = if (dir) { host_arch(c) } else { Arch {.c = c, .arch = "", .err = ""} };
-    if (str_len(ar.err) > 0) { eprintln("pylon: " + ar.err); return 1; }
-    Bool plain = ar.arch == "x86_64" || ar.arch == "aarch64";
-    if (dir && !plain) { eprintln("pylon: no pylond for this host's machine type (" + display_text(bytes_of(ar.arch)) + ")"); return 2; }
-    Str file = if (dir) { path + "/pylond-" + ar.arch } else { path };
-    if (!filesystem.exists(file)) { eprintln("pylon: no pylond at " + file); return 2; }
-    List(Int) bin = filesystem.read_bytes(file);
-    Str hash = hex_encode(sha256_bytes(bin));
-    Pushed p = push_pylond(ar.c, bin, hash);
-    if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return 1; }
-    Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"));
-    if (str_len(st.err) > 0) { eprintln("pylon: " + st.err); return 1; }
-    _ = disconnect(st.c, "pylond started");
-    Int udp = resid_udp_open();
-    SessionKeys k = connect_udp(udp, addr, st.b.port, st.b, st.bc.c, 5);
-    if (!k.ok) { eprintln("pylon: no handshake with pylond on UDP port " + f"{st.b.port}"); return 1; }
+    Up u = pylon_up(c, host, path, pflags);
+    if (u.code >= 0) { return u.code; }
     List(Fwd) ls = listen_local(fs, 0, []);
     if (ls.len() != fs.len()) { eprintln("pylon: cannot listen on a local port"); return 1; }
-    Link lr = listen_remote(link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns()), ls, 0, 0);
-    if (str_len(lr.err) > 0) { eprintln("pylon: " + lr.err); return 1; }
-    Link l0 = lr;
-    eprintln("pylon: Pylon protocol session to " + host + ":" + f"{st.b.port}" + " (experimental); SSH closed");
+    Link l0 = listen_remote(u.l, ls, 0, 0);
+    if (str_len(l0.err) > 0) { eprintln("pylon: " + l0.err); return 1; }
+    eprintln("pylon: Pylon protocol session to " + host + ":" + f"{u.l.port}" + " (experimental); SSH closed");
     _ = announce(ls, 0);
-    Str rb = environment.get("PYLON_TEST_REBIND_AFTER");
-    Int rebind_after = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 };
-    Str rks = environment.get("PYLON_TEST_REKEY_SECS");
-    Rk rk = rk_new(st.b, st.bc.c, if (str_is_int(rks) && str_parse_int(rks) > 0) { str_parse_int(rks) * 1000000000 } else { 120000000000 });
+    Rk rk = u.rk;
+    Int rebind_after = u.rebind;
     if (sessions) {
         Listed ls0 = list_sessions(l0, 0, clock.monotonic_ns());
         if (!ls0.ok) { eprintln("pylon: pylond did not list its sessions"); return 1; }

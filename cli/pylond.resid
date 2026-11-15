@@ -45,6 +45,7 @@ import "../core/cipher.resid";
 import "../core/proto.resid";
 import "../core/link.resid";
 import "../core/term.resid";
+import "../core/files.resid";
 
 @requires(network)
 List(Int) read_stdin(Int n, List(Int) acc) {
@@ -90,27 +91,39 @@ type Peer = { Int id; Boot b; List(Int) mk; Bool linked; Link l; List(Int) stamp
 // was last attached.
 type Tty = { Int id; Int peer; Int sid; Int fd; Int pid; Term t; Int seen; };
 
+// A file transfer (core/files.resid): the client and stream, get (0) or
+// put (1), the file, the stage (0 starting, 1 moving bytes, 2 ending), the
+// bytes to send and how many are sent; for a put, the file as it was (for
+// --resume), where the new bytes start, the size and hash promised, how
+// many bytes were written, and the first error.
+type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(Int) out; Int sent; List(Int) old; Int start; Int size; List(Int) hash; Int wrote; Str err; };
+
 type Srv = { Static s; Int udp; Int port; Int ctl; List(Peer) peers; List(Tty) ttys; Int next_id; Int broker;
-    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; };
+    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; Str home; List(Xf) xfs; };
 
 Srv sv_peers(Srv v, List(Peer) ps) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = ps, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
 }
 
 Srv sv_ttys(Srv v, List(Tty) ts) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = ts, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
 }
 
 Srv sv_next(Srv v, Int next_id) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs};
+}
+
+Srv sv_xfs(Srv v, List(Xf) xs) {
+    return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = xs};
 }
 
 Srv sv_seen(Srv v, Int t) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t, .home = v.home, .xfs = v.xfs};
 }
 
 Peer pr_link(Peer p, Link l) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = l, .stamp = p.stamp, .born = p.born, .lsn = p.lsn}; }
@@ -228,7 +241,7 @@ Int link_peer(List(Peer) ps, List(Int) d, Int i) {
 // ============================================================================
 
 // Each client's events: terminals asked for, attaches, resizes, lists.
-@requires(network, declassify, process, clock(readonly))
+@requires(network, declassify, process, clock(readonly), filesystem)
 Srv on_events(Srv v, Int i, Int now) {
     if (i >= v.peers.len()) { return v; }
     Peer p = v.peers[i];
@@ -239,7 +252,114 @@ Srv on_events(Srv v, Int i, Int now) {
     Srv d = resizes(c, p.id, e.resizes, 0);
     Srv f = lists(d, i, e.lists, 0, now);
     Srv g = listens(f, i, e.listens, 0, now);
-    return on_events(g, i + 1, now);
+    Srv h = files(g, i, e.files, 0, now);
+    return on_events(h, i + 1, now);
+}
+
+// ============================================================================
+// Files (core/files.resid)
+// ============================================================================
+
+// FILE: a get or put of a path the principal named (a relative one under
+// their home). Landlock keeps every path pylond can touch beneath $HOME
+// and its runtime directory (reading beneath /etc).
+@requires(network, declassify, filesystem)
+Srv files(Srv v, Int pi, List(List(Int)) req, Int i, Int now) {
+    if (i >= req.len()) { return v; }
+    Peer p = v.peers[pi];
+    Int sid = req[i][0];
+    List(Int) pb = req[i][3..req[i].len()];
+    Bool ok = (req[i][1] == 0 || req[i][1] == 1) && path_ok(pb);
+    if (!ok) { return files(sv_peers(v, put_peer(v.peers, pi, pr_link(p, refuse(p.l, sid, now)))), pi, req, i + 1, now); }
+    Str path = under_home(v.home, ascii_text(pb));
+    Bool resume = (req[i][2] & 1) == 1;
+    Bool put = req[i][1] == 1;
+    Bool dir = put && filesystem.is_dir(path);
+    Bool keep = put && resume && filesystem.exists(path) && !dir;
+    List(Int) old = if (keep) { filesystem.read_bytes(path) } else { [] };
+    List(Int) hs = if (keep && old.len() <= file_max()) { chunk_hashes(old, 0, []) } else { [] };
+    List(Int) out = if (!put) { [] } else { if (dir) { refusal("is a directory") } else { [0].concat(u32_be(hs.len() / 32)).concat(hs) } };
+    Xf x = Xf {.peer = p.id, .sid = sid, .op = req[i][1], .path = path, .stage = if (dir) { 2 } else { 0 }, .out = out, .sent = 0, .old = old, .start = 0, .size = 0, .hash = [], .wrote = 0, .err = ""};
+    Srv v1 = sv_peers(v, put_peer(v.peers, pi, pr_link(p, confirm(p.l, sid, now))));
+    return files(sv_xfs(v1, v1.xfs.concat([x])), pi, req, i + 1, now);
+}
+
+Str under_home(Str home, Str path) {
+    if (str_starts_with(path, "/")) { return path; }
+    if (str_starts_with(path, "~/")) { return home + str_slice(path, 1, str_len(path)); }
+    return home + "/" + path;
+}
+
+Xf xf_out(Xf x, Int stage, List(Int) out, Int sent) {
+    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = stage, .out = out, .sent = sent, .old = x.old, .start = x.start, .size = x.size, .hash = x.hash, .wrote = x.wrote, .err = x.err};
+}
+
+Xf xf_put(Xf x, Int start, Int size, List(Int) hash, Int wrote, Str err) {
+    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = x.stage, .out = x.out, .sent = x.sent, .old = [], .start = start, .size = size, .hash = hash, .wrote = wrote, .err = err};
+}
+
+// Every transfer one step: requests read, bytes written or sent, ends
+// sent. A transfer whose client or stream is gone is forgotten (a put
+// leaves what it wrote: --resume continues it).
+@requires(network, declassify, filesystem)
+Srv xfers(Srv v, Int i, Int now) {
+    if (i >= v.xfs.len()) { return v; }
+    Xf x = v.xfs[i];
+    Int pi = peer_at(v.peers, x.peer, 0);
+    if (pi < 0 || !open_sid(v.peers[pi].l, x.sid) || x.stage == 3) { return xfers(sv_xfs(v, v.xfs[0..i].concat(v.xfs[i + 1..v.xfs.len()])), i, now); }
+    XL a = if (x.op == 0) { get_step(v.peers[pi].l, x, now) } else { put_step(v.peers[pi].l, x, now) };
+    // What is due to the client, within the stream's window.
+    Int n = min(min(room(a.l, x.sid), 65536), a.x.out.len() - a.x.sent);
+    Link l1 = if (n > 0) { push_bytes(a.l, x.sid, a.x.out[a.x.sent..a.x.sent + n], now) } else { a.l };
+    Bool end = a.x.stage == 2 && a.x.sent + n >= a.x.out.len();
+    Link l2 = if (end) { push_eof(l1, x.sid, -1, now) } else { l1 };
+    Xf x2 = xf_out(a.x, if (end) { 3 } else { a.x.stage }, a.x.out, a.x.sent + n);
+    Srv v1 = sv_peers(v, put_peer(v.peers, pi, pr_link(v.peers[pi], l2)));
+    return xfers(sv_xfs(v1, v1.xfs[0..i].concat([x2]).concat(v1.xfs[i + 1..v1.xfs.len()])), i + 1, now);
+}
+
+type XL = { Link l; Xf x; };
+
+// get: once the client's hashes have all come (its FIN), the answer.
+@requires(network, filesystem(readonly))
+XL get_step(Link l, Xf x, Int now) {
+    if (x.stage != 0 || !peer_ended(l, x.sid)) { return XL {.l = l, .x = x}; }
+    List(Int) hs = inbox(l, x.sid);
+    List(Int) out = if (hs.len() % 32 == 0 && hs.len() <= 65536) { get_reply(x.path, hs) } else { refusal("malformed request") };
+    return XL {.l = take_inbox(l, x.sid, hs.len()), .x = xf_out(x, 2, out, 0)};
+}
+
+// put: the client's header (start, size, hash), then its bytes appended
+// to the file, then the check of the whole file against the hash.
+@requires(network, filesystem)
+XL put_step(Link l, Xf x, Int now) {
+    List(Int) in = inbox(l, x.sid);
+    Bool ended = peer_ended(l, x.sid);
+    if (x.stage == 2) { return XL {.l = take_inbox(l, x.sid, in.len()), .x = x}; }
+    if (x.stage == 0 && in.len() < 48) {
+        return if (ended) { XL {.l = l, .x = xf_out(x, 2, x.out.concat(refusal("malformed request")), x.sent)} } else { XL {.l = l, .x = x} };
+    }
+    if (x.stage == 0) {
+        Int start = be64_at(in, 0);
+        Int size = be64_at(in, 8);
+        Bool fits = start % file_chunk() == 0 && start <= x.old.len() && start <= size && size <= file_max();
+        // The file cut back to the chunks both sides share (or emptied).
+        Bool ready = fits && (if (x.old.len() == start && start > 0) { true } else { filesystem.write_bytes(x.path, x.old[0..start]) });
+        Str err = if (!fits) { "malformed request" } else { if (!ready) { "cannot write the file" } else { "" } };
+        XL taken = XL {.l = take_inbox(l, x.sid, 48), .x = xf_out(xf_put(x, start, size, in[16..48], 0, err), 1, x.out, x.sent)};
+        return put_step(taken.l, taken.x, now);
+    }
+    // Stage 1: bytes to the file (none past the size promised).
+    Bool over = x.start + x.wrote + in.len() > x.size;
+    Bool wrote = in.len() == 0 || str_len(x.err) > 0 || over || filesystem.append_bytes(x.path, in);
+    Str err = if (str_len(x.err) > 0) { x.err } else { if (over) { "more bytes than promised" } else { if (!wrote) { "cannot write the file" } else { "" } } };
+    Xf x1 = xf_put(x, x.start, x.size, x.hash, x.wrote + in.len(), err);
+    Link l1 = take_inbox(l, x.sid, in.len());
+    if (!ended || inbox(l1, x.sid).len() > 0) { return XL {.l = l1, .x = x1}; }
+    List(Int) got = if (str_len(err) == 0) { filesystem.read_bytes(x.path) } else { [] };
+    Bool good = str_len(err) == 0 && got.len() == x.size && same_bytes(sha256_bytes(got), x.hash);
+    Str why = if (str_len(err) > 0) { err } else { "the file does not match what was sent" };
+    return XL {.l = l1, .x = xf_out(x1, 2, x1.out.concat(if (good) { [0] } else { refusal(why) }), x1.sent)};
 }
 
 // ============================================================================
@@ -473,7 +593,7 @@ Bool any_linked(List(Peer) ps, Int i, Int now) {
     return (ps[i].linked && now - ps[i].l.last_rx < 30000000000) || any_linked(ps, i + 1, now);
 }
 
-@requires(network, declassify, clock(readonly), process)
+@requires(network, declassify, clock(readonly), process, filesystem)
 Int serve_loop(Srv v0) {
     Int now = clock.monotonic_ns();
     Srv v = if (any_linked(v0.peers, 0, now)) { sv_seen(v0, now) } else { v0 };
@@ -495,7 +615,7 @@ Int serve_loop(Srv v0) {
     Srv e = tty_io(d, ready, 2 + all_s.len(), 0, now);
     // Listening sockets are found again by fd: LISTEN may have moved one.
     Srv f = accepts(e, ls, ready, 2 + all_s.len() + tfds.len(), 0, now);
-    return serve_loop(f);
+    return serve_loop(xfers(f, 0, now));
 }
 
 List(List(Int)) pad_fds(List(List(Int)) s, Int n) {
@@ -532,7 +652,7 @@ Args parse(Int i, Args a) {
     return Args {.run = a.run, .idle = a.idle, .keep = a.keep, .ephemeral = a.ephemeral, .unconfined = a.unconfined, .ok = false};
 }
 
-@requires(args, network, environment, declassify, clock(readonly), process)
+@requires(args, network, environment, declassify, clock(readonly), process, filesystem)
 Int main() {
     if (args.count() < 2 || args.get(1) != "serve") { eprintln("usage: pylond serve --run DIR [--idle SECONDS] [--keep SECONDS] [--ephemeral]"); return 2; }
     Args a = parse(2, Args {.run = "", .idle = 600, .keep = 604800, .ephemeral = false, .unconfined = false, .ok = true});
@@ -564,7 +684,7 @@ Int main() {
     if (conf == 0 && !a.unconfined) { _ = resid_unix_close(ctl); eprintln("pylond: this kernel cannot confine pylond (no Landlock), so it will not serve; Pylon stays on SSH for this host (or allow an unconfined pylond for it)"); return 3; }
     Int now = clock.monotonic_ns();
     Srv v0 = Srv {.s = static_new(), .udp = udp, .port = resid_udp_port(udp), .ctl = ctl, .peers = [], .ttys = [], .next_id = 1, .broker = broker,
-        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now};
+        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now, .home = environment.get("HOME"), .xfs = []};
     BootS served = boot_serve(hello, v0.s, v0.port);
     if (!served.boot.ok) { _ = resid_unix_close(ctl); eprintln("pylond: malformed bootstrap"); return 1; }
     _ = print_bytes(served.reply);

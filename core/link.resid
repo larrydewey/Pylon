@@ -365,6 +365,12 @@ pub Link take_inbox(Link l, Int sid, Int n) {
     return finish(with_streams(l, put(l.streams, i, st_recv(s, s.recv, s.inbox[k..s.inbox.len()]))), i);
 }
 
+// Bytes sent on a stream and not yet acknowledged (0 when unknown).
+pub Int unsent(Link l, Int sid) {
+    Int i = find(l.streams, sid, 0);
+    return if (i < 0) { 0 } else { l.streams[i].unacked.len() };
+}
+
 // Whether a stream is still open (its id is known).
 pub Bool open_sid(Link l, Int sid) { return find(l.streams, sid, 0) >= 0; }
 
