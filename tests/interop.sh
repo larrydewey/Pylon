@@ -181,6 +181,26 @@ ssh-add -q -D; ssh-add -q user_ed25519
 check "4 MiB of output"                        0 "4194304" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'head -c 4194304 /dev/zero' | wc -c"
 
+# --- post-quantum hybrid against OpenSSH itself (9.9 and later) ----------------
+# OpenSSH 9.6 has no ML-KEM (the reference server below covers it then); the
+# CI job "openssh10" runs this suite against OpenSSH 10 built from source.
+if ssh -Q kex 2>/dev/null | grep -qx mlkem768x25519-sha256; then
+    start_sshd "HostKey $WORK/host_ed25519" "KexAlgorithms mlkem768x25519-sha256"
+    : > sshd.log   # sshd -E appends: only this connection's lines from here
+    check "openssh: mlkem768x25519-sha256 only, login works" 0 "openssh-pq-ok" \
+        "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo openssh-pq-ok"
+    check "openssh: the server negotiated mlkem768x25519-sha256" 0 "" \
+        grep -q "kex: algorithm: mlkem768x25519-sha256" sshd.log
+    start_sshd "HostKey $WORK/host_ed25519"
+    check "openssh: with the server's defaults, the hybrid is chosen" 0 "openssh-default-ok" \
+        bash -c ": > sshd.log; '$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'echo openssh-default-ok' && grep -q 'kex: algorithm: mlkem768x25519-sha256' sshd.log"
+    check "openssh: 4 MiB under the hybrid's keys"     0 "4194304" \
+        bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'head -c 4194304 /dev/zero' | wc -c"
+    start_sshd "HostKey $WORK/host_ed25519"
+else
+    echo "skip openssh: this sshd ($("$SSHD" -V 2>&1 | head -1)) has no mlkem768x25519-sha256"
+fi
+
 # --- interactive shell on a pty -----------------------------------------------
 check "interactive shell: type, resize, paste, exit status" 0 "interactive ok" \
     python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"

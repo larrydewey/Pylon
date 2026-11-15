@@ -1,0 +1,101 @@
+# Runs the interop suite (tests/interop.sh) against OpenSSH 10, built here
+# from the official openssh-portable source at a pinned tag, so the
+# post-quantum hybrid (mlkem768x25519-sha256, OpenSSH 9.9 and later) is
+# exercised against OpenSSH itself and not only against the reference
+# server. OpenSSH goes into the runner's temporary directory; nothing is
+# installed system-wide beyond build dependencies from Ubuntu's archive,
+# and the runner is discarded afterwards.
+name: openssh10
+
+on:
+  push:
+    branches: [master]
+    paths: ["core/**", "cli/**", "tests/**", ".github/workflows/openssh10.yml"]
+  pull_request:
+    paths: ["core/**", "cli/**", "tests/**", ".github/workflows/openssh10.yml"]
+  schedule:
+    - cron: "17 4 * * 1"   # weekly: catches drift in the Resid compiler
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openssh10-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENSSH_TAG: V_10_2_P1
+
+jobs:
+  interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pylon
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/Resid
+          path: resid
+      - uses: actions/checkout@v4
+        with:
+          repository: openssh/openssh-portable
+          ref: ${{ env.OPENSSH_TAG }}
+          path: openssh-src
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q lld autoconf libssl-dev zlib1g-dev python3-cryptography
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/resid/build/boot/stage2.bin" "$@"\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/bin/residc"
+          chmod +x "$RUNNER_TEMP/bin/residc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "RESID_HOME=$GITHUB_WORKSPACE/resid/build/boot" >> "$GITHUB_ENV"
+
+      - name: OpenSSH ${{ env.OPENSSH_TAG }}
+        working-directory: openssh-src
+        run: |
+          P="$RUNNER_TEMP/openssh"
+          autoreconf -q
+          ./configure -q --prefix="$P" --without-pam --with-privsep-user=nobody --with-privsep-path="$P/var/empty"
+          make -s -j"$(nproc)"
+          make -s install-nokeys
+          # sshd checks its privilege-separation directory: root-owned, not writable.
+          sudo chown -R root:root "$P"
+          sudo chmod 755 "$P/var/empty"
+          "$P/sbin/sshd" -V 2>&1 | head -1
+          "$P/bin/ssh" -Q kex | grep -x mlkem768x25519-sha256
+          echo "OPENSSH=$P" >> "$GITHUB_ENV"
+
+      - name: Build Pylon
+        working-directory: pylon
+        env:
+          RESID_MEM_LIMIT: "8000"
+        run: |
+          ulimit -s unlimited
+          umask 077; mkdir -p "$RUNNER_TEMP/keys"; residc keygen "$RUNNER_TEMP/keys" > /dev/null; umask 022
+          export RESID_SIGNING_KEY="$RUNNER_TEMP/keys/resid-ed25519.key"
+          mkdir -p build
+          residc cli/pylon.resid -o build/pylon
+          residc cli/pylon_term.resid -o build/pylon-term
+          residc cli/pylond.resid -o build/pylond
+          rm -rf "$RUNNER_TEMP/keys"
+
+      - name: Interop against OpenSSH 10
+        working-directory: pylon
+        run: |
+          # As root, as the suite is developed (Landlock/seccomp checks of
+          # pylond, the privilege-separated sshd); OpenSSH 10 first on PATH.
+          sudo env "PATH=$OPENSSH/bin:$OPENSSH/sbin:$PATH" bash tests/interop.sh build/pylon 2>&1 | tee "$RUNNER_TEMP/interop.log"
+          test "${PIPESTATUS[0]}" = 0
+          grep -q "^ok   openssh: mlkem768x25519-sha256 only, login works" "$RUNNER_TEMP/interop.log"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: interop-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/interop.log
+          retention-days: 7
