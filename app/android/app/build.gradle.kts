@@ -43,8 +43,6 @@ android {
         buildConfigField("String", "SYMBOLON_CERTS", "\"" + symbolonCerts + "\"")
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // The core exists for this one (tools/android-core.sh).
-        ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     // Release builds are signed with the release key when the environment

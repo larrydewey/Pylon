@@ -112,7 +112,8 @@ jobs:
           flutter pub get
           flutter analyze
           flutter test
-          flutter build apk --release -PsymbolonCerts="${{ vars.SYMBOLON_CERT_SHA256 }}"
+          # arm64 only: the core is built for it (tools/android-core.sh).
+          flutter build apk --release --target-platform android-arm64 -PsymbolonCerts="${{ vars.SYMBOLON_CERT_SHA256 }}"
           # The release asset is pylon-vX.Y.Z.apk, the name Obtainium follows.
           name="pylon-${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}"
           [ "$SIGNED" = release ] || name="$name-debug-signed"
