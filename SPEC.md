@@ -427,6 +427,124 @@ release is accepted by clients only when, in addition, it is:
   codes only increase). A revoked release (listed in the log) is
   replaced on the next connection.
 
+#### 8.2.1 As implemented
+
+`core/merkle.resid`, `core/release.resid`, `core/release_gate.resid`,
+`core/release_roots.resid`, `tools/release/release.resid`. The release
+quorum is k of n separate Ed25519 keys (one per maintainer device); a
+Symbolon threshold key can later take the place of the set without a
+format change (a threshold of 1 over its one public key).
+
+**Formats.** Text, one item per line, every line ending in `\n`, hex in
+lowercase, hashes SHA-256. A *signed text* is a body followed by `sig`
+lines; each signature is Ed25519 over the body's bytes, and the body's
+first line names its kind, so a signature of one kind is never valid as
+another. `KEYID` is the first 8 bytes of SHA-256 of the public key.
+
+```
+pylond.release (the manifest)        signed tree head (the log's head)
+  pylond-release v1                    pylond-log v1
+  version 0.2.0                        size N
+  counter 7                            root ROOT
+  pylond aarch64 FILE-HASH CODE-HASH   sig KEYID SIG   (log keys)
+  pylond x86_64 FILE-HASH CODE-HASH
+  sig KEYID SIG   (release keys)
+
+pylond.proof (one release in the log) roots (what a client pins)
+  pylond-proof v1                      pylond-roots v1
+  size N                               release-threshold K
+  root ROOT                            release-key PUBLIC-KEY   (n lines)
+  sig KEYID SIG   (the head's)         log-threshold K
+  index I                              log-key PUBLIC-KEY
+  path HASH       (leaf to root)
+  consistency M HASH ...   (every 1 <= M < N)
+```
+
+`counter` is the monotonic release number (a canonical decimal >= 1, one
+more per release); `version` is for people. `FILE-HASH` is the hash of the
+file pushed to hosts; `CODE-HASH` the hash of its code image, the file
+without Resid's provenance trailer (`COSE_Sign1 || u32 length ||
+"RESIDPROV2"`), which records the output path, the toolchain's library
+path and the builder's key and so differs between honest builders. The
+builds are listed `aarch64` before `x86_64`, each at most once.
+
+**The log.** An RFC 9162 Merkle tree (leaf hash `SHA-256(0x00 || entry)`,
+node hash `SHA-256(0x01 || left || right)`) whose entries are the
+`pylond.release` files byte for byte, signatures included. The log
+directory holds `entries/NNNNNN.release` and `head` (the signed tree
+head); the log refuses an entry whose counter is not above every earlier
+one. The tree head is signed by k of the pinned log keys, which the
+release maintainers do not hold. Inclusion and consistency proofs are
+verified with RFC 9162's algorithms (2.1.3.2, 2.1.4.2).
+
+**Where it lives.** Everything a client needs is bundled with the app,
+so it verifies offline: `assets/pylond/` holds `pylond-x86_64`,
+`pylond-aarch64`, `pylond.release` and `pylond.proof`, and a desktop
+install puts the same files beside `pylond`. The log is published in the
+repository (a `pylond-log` directory on a branch of its own, append-only,
+every head consistent with the last), and each GitHub release carries the
+release's four files; when the log grows, the maintainers re-issue
+`pylond.proof` for supported releases. A newer proof, fetched from
+there, is given to `pylon pylond-check DIR PROOF`, which verifies it and
+moves the newest head the client has seen forward. Fetching it
+automatically is not implemented.
+
+**Client.** Before `pylond` is pushed (8.3), and before anything is sent
+to the host, `pylon` checks, in this order, refusing with the reason:
+
+1. the manifest is well formed and signed by at least k distinct release
+   keys pinned in `core/release_roots.resid` (unknown keys and repeated
+   signatures do not count);
+2. the build for the host's machine type (`uname -m`; for a single file,
+   any listed build) has the file's SHA-256;
+3. the proof's tree head is signed by k of the pinned log keys, and the
+   inclusion proof places the exact `pylond.release` at its index;
+4. the head is consistent with the newest head seen, kept in
+   `$PYLON_HOME/pylond-trust/ROOTS-ID/head` as a proof file: equal sizes
+   need equal roots; a larger head is proved by its own `consistency`
+   line from the kept size; a smaller head by the kept proof's
+   `consistency` line from its size (which is why a proof carries one for
+   every smaller size); the larger of the two is kept;
+5. the counter is not below the highest accepted
+   (`$PYLON_HOME/pylond-trust/ROOTS-ID/release`), and an equal counter
+   names the same manifest.
+
+The state is written before the push; a release that cannot be recorded
+is refused. `ROOTS-ID` (8 bytes of SHA-256 of the roots) keeps state for
+other roots apart from the pinned ones'.
+
+**Developer options**, never used by the app's release builds, each
+announced on every use: `--pylond-roots ROOTS` trusts another roots file
+(a release signed with one's own keys; the test suite's), and
+`--pylond-unverified` skips the check (in the app, a build made with
+`--dart-define=PYLON_UNVERIFIED_PYLOND=true`). Until the first release
+ceremony `core/release_roots.resid` pins no keys, so only these work.
+
+**Making a release** (`pylon-release`, built from `tools/release`):
+each maintainer runs `keygen NAME` on their own device once (the `.key`
+file is owner-only and never leaves it; no key, test keys included, is in
+the repository), and the public keys go into `roots` and then
+`core/release_roots.resid`. Per release: build both `pylond`s from the
+tag; `manifest VERSION COUNTER DIR OUT`; every maintainer rebuilds,
+compares `code-hash` with the manifest, and runs `sign`; `log-append LOG
+RELEASE`; the log keys `sign LOG/head`; `proof LOG RELEASE OUT`;
+`verify ROOTS DIR` as a client would. `tools/android-core.sh` with
+`PYLOND_RELEASE_DIR` packs a release only after the app's own build of
+the same source reproduces its code images.
+
+**Reproducibility.** Two `residc` builds of `cli/pylond.resid` for
+`x86_64`, in the same and in different checkout directories, have
+byte-identical code images; the whole files are identical when built to
+the same output path with the same signing key, and otherwise differ
+only in the provenance trailer, hence `CODE-HASH`. `tools/android-core.sh`
+builds with root-relative paths. The `aarch64` build was not checked here
+(it needs compiler-rt builtins).
+
+**Not yet:** gossip of tree heads through Symbolon; revocation entries;
+witnesses co-signing the head; independent builders' attestations in
+the log (a maintainer compares code images before signing); the
+automatic refresh of proofs.
+
 ### 8.3 Procedure
 
 Over the verified, authenticated SSH connection, with a fixed command
@@ -899,7 +1017,7 @@ adversary, what Draft 1 allowed, and the change.
 | H4 | A4 | Local forwards on Android bind the loopback shared by every app. | In-app consumption without sockets; per-connection UID check; warning; close in background (11). |
 | H5 | A4 | Third-party keyboards see passwords typed into the terminal; the clipboard leaks to other apps and devices. | Input-method flags, in-app keyboard for password prompts, sensitive and expiring clipboard (15). |
 | H6 | A1 | Second-device first-use approval could be satisfied by two devices on the same Wi-Fi. | The second check must use an independent network path (6.1.4). |
-| H7 | A5 | A coerced or colluding release quorum could still ship a malicious `pylond`, possibly to one victim only. | Reproducible builds, a public transparency log with inclusion proofs, rollback protection (8.2). |
+| H7 | A5 | A coerced or colluding release quorum could still ship a malicious `pylond`, possibly to one victim only. | Reproducible builds, a public transparency log with inclusion proofs, rollback protection (8.2). *Implemented (8.2.1):* k-of-n signed manifests, an RFC 9162 log with signed tree heads, inclusion and consistency proofs checked offline against the newest head seen, a monotonic release counter, code images reproducible; no keys pinned before the first release ceremony; head gossip and revocation open. |
 | H8 | -- | Consent on every connection leads to blind approval; the host name on the sheet came from Pylon. | Short approval window per (host, key, user), never for sensitive hosts or attach; names from Symbolon's own host database (7.2). |
 | H9 | -- | The Pylon protocol had no proof obligation. | Tamarin/ProVerif models of bootstrap, handshake and attach before phase 2; external review before default-on (16). |
 | H10 | -- | Pylon required Symbolon; people who will not run it would keep using weaker clients. | Tiers B-D behind an explicit, acknowledged warning; only key custody changes (7.6). |
@@ -961,6 +1079,9 @@ Implementation findings in the phase-0 code, fixed with this revision:
   so a forwarding session stalled for 30 seconds and then failed.
   Event loops now handle exactly one packet per readable socket
   (`next_once`); request/reply steps keep waiting (`next_msg`).
+- **I8** With a directory of `pylond` builds (`--pylond DIR`, the app's
+  form), the host's `uname -m` was read with its newline shown as `?`,
+  so no host matched a build. The newline is now dropped first.
 - **I5** The parsers had no fuzz targets. `tests/fuzz_proxy.py` mutates a
   real sshd's byte stream (bit flips, deletions, insertions, in the
   cleartext handshake and in encrypted traffic) and requires every run to

@@ -8,7 +8,7 @@
 //   log-key HEX                (the transparency log's keys)
 //
 // Public keys only; the private keys never enter this repository
-// (tools/release/README). Empty until the first release ceremony: until
+// (SPEC 8.2.1). Empty until the first release ceremony: until
 // then no pylond verifies against this build, and pylon refuses to push
 // one unless told to trust other roots (--pylond-roots FILE) or none
 // (--pylond-unverified), both developer options that say so.

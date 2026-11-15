@@ -38,19 +38,24 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; server-initiated rekey |
 | Keystroke timing | obfuscated by default: 20 ms ticks, one-size chaff (PING or IGNORE), checked on the wire; `--no-obfuscate-keystrokes` opts out |
 | Port forwarding | `-N` with `-L [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT` (SOCKS5, host names validated), `-R [localhost:]RPORT:HOST:HOSTPORT` (server binds loopback; only requested ports, each to its own destination); loopback binds only |
-| Files | `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3); a local file is never replaced without `--force`; server messages shown escaped; over the Pylon protocol (`--pylond FILE`) resumable with `--resume` (per-chunk hashes, the whole file's hash checked) |
+| Files | `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3); a local file is never replaced without `--force`; server messages shown escaped; over the Pylon protocol (`--pylond DIR`) resumable with `--resume` (per-chunk hashes, the whole file's hash checked) |
 | Jump hosts | `-J USER@JUMP[:PORT]` on any command: the jump host is verified under its own pins, the target under its own, end to end through a direct-tcpip channel; no agent forwarding |
-| Pylon protocol (experimental) | `--pylond FILE USER@HOST` (a terminal) or `--pylond FILE -N -L/-D/-R ...`: pushes `pylond` over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel, closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; packets padded to 64 bytes; silent to unauthenticated datagrams, and under load a cookie (`mac2`) before any asymmetric work (SPEC 9.7) |
+| Pylon protocol (experimental) | `--pylond DIR USER@HOST` (a terminal) or `--pylond DIR -N -L/-D/-R ...`: pushes the host's `pylond` build from DIR over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel, closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; packets padded to 64 bytes; silent to unauthenticated datagrams, and under load a cookie (`mac2`) before any asymmetric work (SPEC 9.7) |
+| `pylond` releases | pushed only as a release signed by k of n pinned Ed25519 release keys, in an RFC 9162 transparency log (inclusion proof under a tree head signed by the log key, consistent with the newest head seen), with a release counter that never goes back; verified offline from the files shipped beside `pylond`, before anything reaches the host; `pylon pylond-check DIR [PROOF]`; `tools/release` makes keys, manifests, signatures, the log and proofs; code images reproducible (SPEC 8.2.1). No release keys are pinned yet: until the first release ceremony only `--pylond-roots ROOTS` or `--pylond-unverified` (developer options, announced) push a `pylond` |
 | Host trust | pinned keys (`pylon pin HOST FINGERPRINT`; re-pinning replaces the old key) or host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked); a changed key names the old pin; `pylon history [HOST]` |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-119 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+133 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
-post-quantum and hostile-server cases in `tests/interop.sh`,
-known-answer tests for the key derivation in `tests/kex_test.resid`, and
-a mutation fuzzer in `tests/fuzz_proxy.py`.
+`pylond` release (tampered builds and manifests, k-1 signatures,
+unlogged releases, rollback, forked logs), post-quantum and
+hostile-server cases in `tests/interop.sh`, known-answer tests for the
+key derivation in `tests/kex_test.resid`, the transparency log against
+the Certificate Transparency reference vectors in
+`tests/release_test.resid`, and a mutation fuzzer in
+`tests/fuzz_proxy.py`.
 
 Next (SPEC 17): an OpenSSH 10 interop run for the hybrid (OpenSSH 9.6
 here has no ML-KEM; it is checked against a reference server built on
@@ -64,6 +69,7 @@ Requires the Resid toolchain (`residc`, see the Resid README).
 ```sh
 residc cli/pylon.resid -o build/pylon
 residc cli/pylond.resid -o build/pylond   # optional: the Pylon protocol server
+residc tools/release/release.resid -o build/pylon-release   # making pylond releases (SPEC 8.2.1)
 
 # Pin a host: get its fingerprint out of band (its console:
 # ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub), then
@@ -77,17 +83,22 @@ build/pylon alice@example.org uptime
 Options: `-p PORT`, `--allow-no-strict` (per-connection exception for
 servers without the Terrapin fix), `--no-obfuscate-keystrokes`, `-N -L
 [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT`, `-R
-[localhost:]RPORT:HOST:HOSTPORT` (each repeatable), `-J USER@JUMP[:PORT]`, `--pylond FILE` (experimental, a terminal or `-N` with `-L`/`-D`/`-R`). With no COMMAND, `pylon
+[localhost:]RPORT:HOST:HOSTPORT` (each repeatable), `-J USER@JUMP[:PORT]`, `--pylond DIR` (experimental, a terminal or `-N` with `-L`/`-D`/`-R`;
+DIR holds `pylond-x86_64`/`pylond-aarch64` and their signed release,
+`pylond.release` and `pylond.proof`), `--pylond-roots ROOTS` and
+`--pylond-unverified` (developer options for a local `pylond`). With no COMMAND, `pylon
 USER@HOST` opens an interactive shell. Pinned keys live in
 `$PYLON_HOME/known_hosts` (default `~/.config/pylon/known_hosts`).
 
 ## Tests
 
 ```sh
-tests/interop.sh build/pylon      # needs sshd, ssh-keygen, ssh-agent, python3
+tests/interop.sh build/pylon      # needs sshd, ssh-keygen, ssh-agent, python3;
+                                  # uses build/pylond and build/pylon-release when present
 residc test tests/kex_test.resid  # key derivation known answers
 residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, replay, padding, cookies
 residc test tests/term_test.resid  # the terminal emulator core
+residc test tests/release_test.resid # pylond releases: Merkle log, proofs, quorum, rollback
 
 # Fuzzing through a mutating proxy in front of a running sshd (port 2222),
 # with the host pinned under the proxy's port:
@@ -99,7 +110,8 @@ FUZZ_PORT=2299 FUZZ_EXPECT=ok tests/fuzz_proxy.py 200 2222 -- build/pylon -p {po
 - `core/` the SSH client core: wire types, packet ciphers, key exchange,
   host keys, transport, agent client, user authentication, sessions,
   pinned hosts.
-- `cli/` the `pylon` command.
+- `cli/` the `pylon` command and `pylond`.
+- `tools/release/` `pylon-release`, for signed, logged `pylond` releases.
 - `tests/` interoperability tests and a hostile server.
 
 ## License
