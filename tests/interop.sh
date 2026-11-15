@@ -215,6 +215,45 @@ check "jump: nothing listening behind the jump" 1 "pylon:" \
     "$PYLON" -J "$USER_NAME@127.0.0.1:$PORT" -p 1 "$USER_NAME@127.0.0.1" true
 kill "$(cat "$WORK/target.pid")" 2>/dev/null
 
+# --- the Pylon protocol (EXPERIMENTAL): pylond, UDP, roaming --------------------
+PYLOND="$(dirname "$PYLON")/pylond"
+if [ -x "$PYLOND" ]; then
+    mkdir -p www2 && echo pylon-proto-ok > www2/small.txt && head -c 3000000 /dev/urandom > www2/big.bin
+    W2=$((PORT + 9)); L2=$((PORT + 10)); L3=$((PORT + 11))
+    ( cd www2 && exec python3 -m http.server $W2 --bind 127.0.0.1 ) > /dev/null 2>&1 & WEB2=$!
+    "$PYLON" -p $PORT -N -L $L2:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pp.log & PP=$!
+    for _ in $(seq 100); do grep -q "forwarding" pp.log && break; sleep 0.2; done
+    PPORT=$(sed -n 's/.*session to 127.0.0.1:\([0-9]*\).*/\1/p' pp.log)
+    check "pylon protocol: SSH closed after the bootstrap" 0 "SSH closed" cat pp.log
+    check "pylon protocol: a file through -L"      0 "pylon-proto-ok" \
+        curl -s -m 10 "http://127.0.0.1:$L2/small.txt"
+    check "pylon protocol: 3 MB intact (reliable streams)" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "curl -s -m 60 http://127.0.0.1:$L2/big.bin | sha256sum"
+    check "pylond: stored by hash, 0500 in a 0700 directory" 0 "500 700" \
+        bash -c "stat -c %a \$HOME/.cache/pylon/pylond-* | head -1 | tr '\\n' ' '; stat -c %a \$HOME/.cache/pylon"
+    check "pylond: silent to an unauthenticated datagram" 0 "no reply" \
+        python3 -c "
+import socket, os
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5)
+s.sendto(bytes([1, 0, 0, 0]) + os.urandom(1264), ('127.0.0.1', $PPORT))
+s.sendto(os.urandom(64), ('127.0.0.1', $PPORT))
+try:
+    s.recvfrom(4096); print('replied')
+except socket.timeout:
+    print('no reply')"
+    kill $PP 2>/dev/null; wait $PP 2>/dev/null
+    # Roaming: the client moves to a new UDP socket mid-transfer.
+    PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
+    for _ in $(seq 100); do grep -q "forwarding" pr.log && break; sleep 0.2; done
+    check "pylon protocol: roaming mid-transfer, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "curl -s -m 60 http://127.0.0.1:$L3/big.bin | sha256sum"
+    check "pylon protocol: the client did change sockets" 0 "moved to a new UDP socket" cat pr.log
+    kill $PR $WEB2 2>/dev/null; wait $PR $WEB2 2>/dev/null
+    pkill -f "pylond-.* serve" 2>/dev/null
+else
+    echo "skip pylon protocol (no $PYLOND)"
+fi
+
 # --- an agent with no acceptable key -----------------------------------------
 ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger
 check "unknown user key fails cleanly"         1 "accepted none" \

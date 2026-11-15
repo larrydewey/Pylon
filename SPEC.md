@@ -508,6 +508,66 @@ Each stream has its own reliability: state sync for the terminal,
 ordered retransmission with selective acknowledgement for forwards and
 files.
 
+### 9.7 Version 1 as implemented (experimental)
+
+`core/proto.resid`, `core/link.resid`, `cli/pylond.resid`. The sections
+above are the target; v1 implements this subset, and is off unless
+`--pylond FILE` is given. **The v1 handshake is not a verified Noise
+pattern; 16 requires a formal model and an external review before it is
+enabled by default.**
+
+Bootstrap (stdin/stdout of `pylond serve` over the verified SSH exec
+channel, after the hash check of 8.3):
+
+```
+C → S  "PYLON1" | c_static (32) | c_kem_ek (1184)                       1222 bytes
+S → C  "PYLON1" | port (2) | s_static (32) | kem_ct (1088) | sid (16)   1144 bytes
+psk = HKDF-SHA256(salt "pylon/1 bootstrap", ikm K_kem, info c_static | s_static | sid)
+```
+
+`pylond` writes nothing to the SSH channel after its reply, so the client
+closes SSH and `pylond` outlives it. The UDP socket is bound to the
+server address from `SSH_CONNECTION`, never the wildcard. (Not yet:
+`H` in the salt; v1 relies on the SSH channel for authenticity of both
+messages.)
+
+Handshake, `h0 = SHA-256("pylon/1 IKpsk-hybrid")`, Noise-style chaining:
+
+```
+init  1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(timestamp) (28) | mac1 (16)      1268 bytes
+      ck ← HKDF(ck, DH(e_c, S)); ck ← HKDF(ck, DH(c, S)); (ck, k) ← HKDF2(ck, psk)
+resp  2 | idx_s (4) | idx_c (4) | e_s (32) | ct_e (1088) | AEAD() (16) | mac1 (16)   1164 bytes
+      ck ← HKDF(ck, DH(e_s, e_c)); ck ← HKDF(ck, DH(e_s, c)); ck ← HKDF(ck, K_kem_e);
+      (ck, k) ← HKDF2(ck, psk)
+keys  (initiator→responder, responder→initiator) = HKDF2(ck, "")
+mac1  HMAC-SHA256(SHA-256("pylon/1 mac1" | S | psk), packet without mac1)[0..16]
+```
+
+A fresh ML-KEM-768 key per handshake gives each session key post-quantum
+forward secrecy. `pylond` answers only an init with a valid mac1 and a
+timestamp newer than the last accepted one; anything else gets no reply.
+
+Data: `4 | receiver_idx (4) | counter (8, LE) | ChaCha20-Poly1305(frame)`,
+2048-slot replay window, roaming to the source of the latest
+authenticated packet. Frames, one per datagram:
+
+```
+OPEN 1 | sid (4) | port (2) | host length (1) | host      client → pylond only
+DATA 2 | sid (4) | offset (8) | bytes
+ACK  3 | sid (4) | offset (8)
+FIN  4 | sid (4) | offset (8)
+RST  5 | sid (4)
+PING 6
+```
+
+Go-back-N per stream, 256 KiB window, 300 ms retransmission timeout.
+
+Limits of v1: `-L` forwards only (no terminal: `pylond` has no
+pseudo-terminal yet), an IPv4 literal host, no rekeying (9.5), no padding
+to 64 bytes, no cookie (`mac2`), no re-attach (10), no Landlock or
+seccomp (8.4); `pylond` exits after `--idle` seconds (default 600)
+without an authenticated packet.
+
 ## 10. Sessions, screen sync and re-attach
 
 ### 10.1 Screen synchronization

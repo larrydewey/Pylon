@@ -1,0 +1,99 @@
+// The Pylon protocol core (core/proto.resid) end to end in one process:
+// bootstrap, handshake, data packets, replay window, mac1.
+
+import "crypto.resid";
+import "word.resid";
+import "../core/wire.resid";
+import "../core/cipher.resid";
+import "../core/proto.resid";
+
+@requires(declassify)
+List(Int) shown(List(Secret(UInt(8))) b) { return ints_of(declassify(secret_join(b), "test compares derived keys")); }
+
+// A bootstrap between a client and a pylond, both in this process.
+type Both = { BootC bc; Static s; Boot cb; Boot sb; };
+
+@requires(declassify)
+Both bootstrapped() {
+    BootC bc = boot_client_new();
+    Static s = static_new();
+    BootS served = boot_serve(boot_hello(bc), s, 40123);
+    Boot cb = boot_finish(bc, served.reply);
+    return Both {.bc = bc, .s = s, .cb = cb, .sb = served.boot};
+}
+
+@requires(declassify)
+test "bootstrap: both sides derive the same psk" {
+    Both b = bootstrapped();
+    expect(b.cb.ok && b.sb.ok).toEqual(true);
+    expect(b.cb.port).toEqual(40123);
+    expect(hex_encode(shown(b.cb.psk))).toEqual(hex_encode(shown(b.sb.psk)));
+    expect(hex_encode(b.cb.sid)).toEqual(hex_encode(b.sb.sid));
+}
+
+@requires(declassify)
+test "bootstrap: a malformed hello or reply is refused" {
+    Both b = bootstrapped();
+    Static s = static_new();
+    expect(boot_serve([1, 2, 3], s, 1).boot.ok).toEqual(false);
+    expect(boot_finish(b.bc, [1, 2, 3]).ok).toEqual(false);
+}
+
+@requires(declassify)
+test "handshake: mirrored keys, data both ways, tamper and replay refused" {
+    Both b = bootstrapped();
+    Pending p = hs_init(b.cb, b.bc.c, 1000000000);
+    expect(p.pkt.len()).toEqual(init_len());
+    List(Int) mk = mac1_key(b.sb.s_pub, b.sb.psk);
+    expect(mac1_ok(mk, p.pkt)).toEqual(true);
+    Answered a = hs_respond(b.sb, b.s, p.pkt);
+    expect(a.keys.ok).toEqual(true);
+    expect(mac1_ok(mk, a.resp)).toEqual(true);
+    SessionKeys kc = hs_finish(b.cb, b.bc.c, p, a.resp);
+    expect(kc.ok).toEqual(true);
+    expect(hex_encode(shown(kc.tx))).toEqual(hex_encode(shown(a.keys.rx)));
+    expect(hex_encode(shown(kc.rx))).toEqual(hex_encode(shown(a.keys.tx)));
+    List(Int) up = data_seal(kc, 7, bytes_of("to the server"));
+    DataIn o1 = data_open(a.keys, up);
+    expect(o1.ok && o1.ctr == 7).toEqual(true);
+    expect(hex_encode(o1.payload)).toEqual(hex_encode(bytes_of("to the server")));
+    List(Int) down = data_seal(a.keys, 0, bytes_of("to the client"));
+    expect(hex_encode(data_open(kc, down).payload)).toEqual(hex_encode(bytes_of("to the client")));
+    List(Int) bad = up[0..20].concat([up[20] ^ 1]).concat(up[21..up.len()]);
+    expect(data_open(a.keys, bad).ok).toEqual(false);
+    expect(data_open(kc, up).ok).toEqual(false);
+}
+
+@requires(declassify)
+test "handshake: a client without the bootstrap secret fails mac1 and the handshake" {
+    Both b = bootstrapped();
+    Both other = bootstrapped();
+    Pending p = hs_init(other.cb, other.bc.c, 1000000000);
+    expect(mac1_ok(mac1_key(b.sb.s_pub, b.sb.psk), p.pkt)).toEqual(false);
+    expect(hs_respond(b.sb, b.s, p.pkt).keys.ok).toEqual(false);
+}
+
+@requires(declassify)
+test "handshake: a corrupted response is refused" {
+    Both b = bootstrapped();
+    Pending p = hs_init(b.cb, b.bc.c, 1000000000);
+    Answered a = hs_respond(b.sb, b.s, p.pkt);
+    List(Int) r = a.resp[0..60].concat([a.resp[60] ^ 1]).concat(a.resp[61..a.resp.len()]);
+    expect(hs_finish(b.cb, b.bc.c, p, r).ok).toEqual(false);
+}
+
+test "replay window: new, repeated, old and far-behind counters" {
+    Window w0 = window_new();
+    Seen s1 = window_take(w0, 5);
+    Seen s2 = window_take(s1.w, 5);
+    Seen s3 = window_take(s2.w, 3);
+    Seen s4 = window_take(s3.w, 5000);
+    Seen s5 = window_take(s4.w, 2952);
+    Seen s6 = window_take(s5.w, 2953);
+    expect(s1.fresh).toEqual(true);
+    expect(s2.fresh).toEqual(false);
+    expect(s3.fresh).toEqual(true);
+    expect(s4.fresh).toEqual(true);
+    expect(s5.fresh).toEqual(false);
+    expect(s6.fresh).toEqual(true);
+}

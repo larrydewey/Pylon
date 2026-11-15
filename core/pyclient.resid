@@ -1,0 +1,138 @@
+// The client end of the Pylon protocol (SPEC 8, 9): deliver pylond over
+// the verified SSH connection, bootstrap through it, then run forwards
+// over the UDP session. EXPERIMENTAL, as proto.resid.
+
+import "crypto.resid";
+import "hash.resid";
+import "../core/wire.resid";
+import "../core/cipher.resid";
+import "../core/transport.resid";
+import "../core/session.resid";
+import "../core/proto.resid";
+import "../core/link.resid";
+import "../core/forward.resid";
+
+// The command that stores pylond: a 0700 cache directory, a temporary
+// file checked against the hash, then renamed into place (SPEC 8.3). The
+// hash is hex, so nothing from outside reaches the shell.
+pub Str push_command(Str hash) {
+    return "umask 077; d=\"$HOME/.cache/pylon\"; mkdir -p \"$d\" && chmod 700 \"$d\" && f=\"$d/pylond-" + hash + "\" && cat > \"$f.tmp\" && "
+        + "test \"$(sha256sum \"$f.tmp\" | cut -c1-64)\" = " + hash + " && chmod 500 \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\" && echo PYLOND-OK";
+}
+
+// The command that starts it: the hash checked again, then exec.
+pub Str run_command(Str hash, Int idle) {
+    return "f=\"$HOME/.cache/pylon/pylond-" + hash + "\"; test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --idle " + f"{idle}";
+}
+
+pub type Pushed = { Conn c; Str err; };
+
+@requires(network, declassify)
+pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
+    Chan ch = open_session(c0);
+    if (!chan_ok(ch)) { return Pushed {.c = ch.c, .err = ch.err}; }
+    Chan ex = exec(capturing(ch), push_command(hash));
+    Chan sent = send_eof(send_data(ex, bin));
+    Chan done = pump(sent);
+    if (!chan_ok(done)) { return Pushed {.c = done.c, .err = done.err}; }
+    Bool ok = str_contains(ascii_text(done.inbox), "PYLOND-OK");
+    return Pushed {.c = done.c, .err = if (ok) { "" } else { "the host did not store pylond with the expected hash" }};
+}
+
+pub type Started = { Conn c; Boot b; BootC bc; Str err; };
+
+@requires(network, declassify)
+pub Started start_pylond(Conn c0, Str hash, Int idle) {
+    BootC bc = boot_client_new();
+    Chan ch = open_session(c0);
+    if (!chan_ok(ch)) { return Started {.c = ch.c, .b = boot_finish(bc, []), .bc = bc, .err = ch.err}; }
+    Chan ex = exec(capturing(ch), run_command(hash, idle));
+    Chan sent = send_data(ex, boot_hello(bc));
+    Chan got = await_bytes(sent, boot_reply_len());
+    if (!chan_ok(got) || got.inbox.len() < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }
+    Boot b = boot_finish(bc, got.inbox[0..boot_reply_len()]);
+    return Started {.c = got.c, .b = b, .bc = bc, .err = if (b.ok) { "" } else { "pylond sent a malformed bootstrap reply" }};
+}
+
+// The handshake over UDP to addr:port, a few tries one second apart.
+@requires(network, declassify, clock)
+pub SessionKeys connect_udp(Int udp, List(Int) addr, Int port, Boot b, Static c, Int tries) {
+    if (tries <= 0) { List(Secret(UInt(8))) e = []; return SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0}; }
+    Pending p = hs_init(b, c, clock.now_ns());
+    _ = resid_udp_send_to(udp, addr, port, p.pkt);
+    List(Int) ready = resid_tcp_poll([udp], [1], 1000);
+    List(Int) d = resid_udp_recv_from(udp, 2048);
+    SessionKeys k = if (d.len() == 6 + resp_len()) { hs_finish(b, c, p, d[6..d.len()]) } else { connect_udp(udp, addr, port, b, c, 0) };
+    if (k.ok) { return k; }
+    return connect_udp(udp, addr, port, b, c, tries - 1);
+}
+
+// Four decimal bytes, or [] when s is not an IPv4 literal.
+pub List(Int) ipv4(Str s) {
+    List(Str) p = str_split(s, ".");
+    if (p.len() != 4) { return []; }
+    return ipv4_at(p, 0, []);
+}
+
+List(Int) ipv4_at(List(Str) p, Int i, List(Int) acc) {
+    if (i >= 4) { return acc; }
+    if (!str_is_int(p[i]) || str_parse_int(p[i]) < 0 || str_parse_int(p[i]) > 255) { return []; }
+    return ipv4_at(p, i + 1, acc.concat([str_parse_int(p[i])]));
+}
+
+// The forwarding loop over the link. `rebind_after` > 0 (a test hook,
+// PYLON_TEST_REBIND_AFTER) moves the client to a new UDP socket after that
+// many packets, as a change of network would.
+@requires(network, declassify, clock)
+pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after) {
+    if (str_len(l.err) > 0) { return l; }
+    Int now = clock.monotonic_ns();
+    List(Int) lfd = listen_fds(fs, 0, []);
+    List(Int) sfds = stream_fds(l.streams, 0, []);
+    List(Int) fds = [l.udp].concat(lfd).concat(sfds);
+    List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
+    Drained g = drain(l, now, 64, []);
+    Link a = accept_into(g.l, fs, ready, 1, 0, now);
+    Link b = retransmit(read_streams(a, sfds, ready, 1 + fs.len(), 0, now), 0, now);
+    Link c = keepalive(b, now);
+    Bool move = rebind_after > 0 && c.tx_ctr >= rebind_after;
+    Link d = if (move) { rebind(c) } else { c };
+    return pylon_forwards(d, fs, if (move) { 0 } else { rebind_after });
+}
+
+// A new local UDP socket (a new source address and port); the server
+// follows on the next authenticated packet.
+@requires(network)
+pub Link rebind(Link l) {
+    Int u = resid_udp_open();
+    if (u < 0) { return l; }
+    _ = resid_tcp_close(l.udp);
+    eprintln("pylon: moved to a new UDP socket (test hook)");
+    return Link {.server = l.server, .udp = u, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err};
+}
+
+List(Int) listen_fds(List(Fwd) fs, Int i, List(Int) acc) {
+    if (i >= fs.len()) { return acc; }
+    return listen_fds(fs, i + 1, acc.concat([fs[i].lfd]));
+}
+
+List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
+
+@requires(network, declassify)
+Link accept_into(Link l, List(Fwd) fs, List(Int) ready, Int at, Int i, Int now) {
+    if (i >= fs.len()) { return l; }
+    Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
+    Int fd = if (r) { resid_tcp_accept_now(fs[i].lfd) } else { -1 };
+    Link n = if (fd >= 0) { open_stream(l, fd, fs[i].host, fs[i].hport, now) } else { l };
+    return accept_into(n, fs, ready, at, i + 1, now);
+}
+
+// Local listeners for -L over the Pylon protocol.
+@requires(network)
+pub List(Fwd) listen_local(List(Fwd) fs, Int i, List(Fwd) acc) {
+    if (i >= fs.len()) { return acc; }
+    Int l = resid_tcp_listen(fs[i].lport);
+    if (l < 0) { return []; }
+    return listen_local(fs, i + 1, acc.concat([Fwd {.kind = 0, .lport = fs[i].lport, .host = fs[i].host, .hport = fs[i].hport, .lfd = l}]));
+}

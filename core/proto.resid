@@ -1,0 +1,288 @@
+// The Pylon protocol, version 1 (SPEC 9): bootstrap inside SSH, the UDP
+// handshake, and data packets. EXPERIMENTAL: the handshake is a
+// Noise-IK-style composition with a hybrid post-quantum step, not a
+// verified Noise pattern; SPEC 16 requires its formal model and an
+// external review before it is enabled by default.
+//
+// Bootstrap (over the verified SSH channel to `pylond serve`):
+//   C -> S  "PYLON1" | c_static (32) | c_kem_ek (1184)
+//   S -> C  "PYLON1" | port (2) | s_static (32) | kem_ct (1088) | sid (16)
+//   psk = HKDF-SHA256(salt "pylon/1 bootstrap", ikm K_kem,
+//                     info c_static | s_static | sid)
+// The ML-KEM secret makes the psk post-quantum even when the SSH key
+// exchange was classical; the SSH channel authenticates who sent what.
+//
+// Handshake (UDP; HKDF(ck, x) = HMAC-SHA256 chaining as in Noise):
+//   init   1 | idx_c (4) | e_c (32) | ek_e (1184) | AEAD(ts) (28) | mac1 (16)
+//          h <- H(h | e_c | ek_e); ck <- HKDF(ck, DH(e_c, S)); ck <- HKDF(ck,
+//          DH(c, S)); (ck, k) <- HKDF2(ck, psk); ts sealed under k, aad h
+//   resp   2 | idx_s (4) | idx_c (4) | e_s (32) | ct_e (1088) | AEAD() (16) | mac1 (16)
+//          h <- H(h | e_s | ct_e); ck <- HKDF(ck, DH(e_s, e_c)); ck <-
+//          HKDF(ck, DH(e_s, c)); ck <- HKDF(ck, K_kem_e); (ck, k) <- HKDF2(ck,
+//          psk); empty sealed under k, aad h
+//   keys   (i->r, r->i) = HKDF2(ck, "")
+// A fresh ML-KEM key in every handshake gives each session key
+// post-quantum forward secrecy. mac1 = HMAC-SHA256(SHA-256("pylon/1 mac1" |
+// S | psk), packet)[0..16]: a packet without it is dropped before any
+// other work (SPEC G11).
+//
+// Data   4 | idx_receiver (4) | counter (8, LE) | ChaCha20-Poly1305(payload)
+
+import "crypto.resid";
+import "word.resid";
+import "random.resid";
+import "hash.resid";
+import "x25519g.resid";
+import "sha256g.resid";
+import "chachag.resid";
+import "keccakg.resid";
+import "mlkem.resid";
+import "wire.resid";
+import "cipher.resid";
+
+pub type Static = { List(Secret(UInt(8))) priv; List(Int) pub; };
+
+@requires(declassify)
+pub Static static_new() {
+    List(Secret(UInt(8))) p = random_secret(32);
+    return Static {.priv = p, .pub = x25519g_public(p)};
+}
+
+List(Int) magic() { return bytes_of("PYLON1"); }
+
+// ============================================================================
+// Bootstrap
+// ============================================================================
+
+pub type BootC = { Static c; MlkemKeys kem; };
+
+@requires(declassify)
+pub BootC boot_client_new() { return BootC {.c = static_new(), .kem = mlkem768_keygen()}; }
+
+pub List(Int) boot_hello(BootC b) { return magic().concat(b.c.pub).concat(b.kem.ek); }
+
+pub Int boot_hello_len() { return 6 + 32 + 1184; }
+pub Int boot_reply_len() { return 6 + 2 + 32 + 1088 + 16; }
+
+// What both sides hold after the bootstrap.
+pub type Boot = { Bool ok; Int port; List(Int) c_pub; List(Int) s_pub; List(Int) sid; List(Secret(UInt(8))) psk; };
+
+Boot boot_bad() { List(Secret(UInt(8))) e = []; return Boot {.ok = false, .port = 0, .c_pub = [], .s_pub = [], .sid = [], .psk = e}; }
+
+List(Secret(UInt(8))) psk_of(List(Secret(UInt(8))) kkem, List(Int) c_pub, List(Int) s_pub, List(Int) sid) {
+    List(Secret(UInt(8))) prk = hkdf256g_extract(lift(bytes_of("pylon/1 bootstrap")), kkem);
+    return hkdf256g_expand(prk, lift(c_pub.concat(s_pub).concat(sid)), 32);
+}
+
+// pylond's side: the client's hello, its own static key, the UDP port it
+// bound. The reply and the bootstrap state.
+pub type BootS = { List(Int) reply; Boot boot; };
+
+@requires(declassify)
+pub BootS boot_serve(List(Int) hello, Static s, Int port) {
+    if (hello.len() != boot_hello_len() || !same_bytes(hello[0..6], magic())) { return BootS {.reply = [], .boot = boot_bad()}; }
+    List(Int) c_pub = hello[6..38];
+    MlkemEncaps en = mlkem768_encaps(hello[38..boot_hello_len()]);
+    if (en.ct.len() != 1088) { return BootS {.reply = [], .boot = boot_bad()}; }
+    List(Int) sid = random_bytes(16);
+    List(Int) reply = magic().concat([(port >> 8) & 255, port & 255]).concat(s.pub).concat(en.ct).concat(sid);
+    Boot b = Boot {.ok = true, .port = port, .c_pub = c_pub, .s_pub = s.pub, .sid = sid, .psk = psk_of(en.k, c_pub, s.pub, sid)};
+    return BootS {.reply = reply, .boot = b};
+}
+
+@requires(declassify)
+pub Boot boot_finish(BootC b, List(Int) reply) {
+    if (reply.len() != boot_reply_len() || !same_bytes(reply[0..6], magic())) { return boot_bad(); }
+    Int port = reply[6] * 256 + reply[7];
+    List(Int) s_pub = reply[8..40];
+    List(Int) ct = reply[40..1128];
+    List(Int) sid = reply[1128..1144];
+    List(Secret(UInt(8))) k = mlkem768_decaps(b.kem.dk, ct);
+    if (k.len() != 32 || port < 1) { return boot_bad(); }
+    return Boot {.ok = true, .port = port, .c_pub = b.c.pub, .s_pub = s_pub, .sid = sid, .psk = psk_of(k, b.c.pub, s_pub, sid)};
+}
+
+// ============================================================================
+// Handshake
+// ============================================================================
+
+List(Int) hpub(List(Int) b) { return sha256_bytes(b); }
+
+// Noise HKDF on the chaining key: (ck', k).
+pub type Two = { List(Secret(UInt(8))) a; List(Secret(UInt(8))) b; };
+
+Two hkdf2(List(Secret(UInt(8))) ck, List(Secret(UInt(8))) ikm) {
+    List(Secret(UInt(8))) t = hmac256g(ck, ikm);
+    List(Secret(UInt(8))) o1 = hmac256g(t, lift([1]));
+    List(Secret(UInt(8))) o2 = hmac256g(t, o1.concat(lift([2])));
+    return Two {.a = o1, .b = o2};
+}
+
+List(Secret(UInt(8))) mix(List(Secret(UInt(8))) ck, List(Secret(UInt(8))) ikm) { return hkdf2(ck, ikm).a; }
+
+List(Int) h0() { return hpub(bytes_of("pylon/1 IKpsk-hybrid")); }
+
+@requires(declassify)
+pub List(Int) mac1_key(List(Int) s_pub, List(Secret(UInt(8))) psk) {
+    return ints_of(declassify(secret_join(sha256g(lift(bytes_of("pylon/1 mac1").concat(s_pub)).concat(psk))), "mac1 key: a hash of the bootstrap secret, used only to drop unauthenticated packets"));
+}
+
+pub List(Int) mac1_of(List(Int) key, List(Int) body) { return hmac_bytes(Sha256, key, body)[0..16]; }
+
+pub Bool mac1_ok(List(Int) key, List(Int) pkt) {
+    if (pkt.len() < 17) { return false; }
+    List(Int) want = mac1_of(key, pkt[0..pkt.len() - 16]);
+    return ct_equal(want, pkt[pkt.len() - 16..pkt.len()]);
+}
+
+// Session keys and indices once a handshake completes.
+pub type SessionKeys = { Bool ok; List(Secret(UInt(8))) tx; List(Secret(UInt(8))) rx; Int my_idx; Int their_idx; };
+
+SessionKeys keys_bad() { List(Secret(UInt(8))) e = []; return SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0}; }
+
+// The initiator between its init and the response.
+pub type Pending = { List(Int) pkt; List(Secret(UInt(8))) ck; List(Int) h; Static e; MlkemKeys kem; Int idx; };
+
+List(Int) le32(Int v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255]; }
+Int rd32(List(Int) b, Int i) { return b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24); }
+
+List(Int) zero_nonce() { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; }
+
+@requires(declassify)
+List(Int) seal_pub(List(Secret(UInt(8))) k, List(Int) nonce, List(Int) pt, List(Int) aad) { return pub_sealed(chacha20poly1305g_seal(k, nonce, lift(pt), aad)); }
+
+// A TAI64N-style timestamp: seconds and nanoseconds, big-endian.
+pub List(Int) stamp(Int ns) { return u64_be(ns / 1000000000).concat(u32_be(ns % 1000000000)); }
+
+@requires(declassify)
+pub Pending hs_init(Boot b, Static c, Int now_ns) {
+    Static e = static_new();
+    MlkemKeys kem = mlkem768_keygen();
+    Int idx = be32(random_bytes(4), 0) & 2147483647;
+    List(Int) h1 = hpub(h0().concat(b.s_pub));
+    List(Int) h2 = hpub(h1.concat(e.pub).concat(kem.ek));
+    List(Secret(UInt(8))) ck0 = lift(h0());
+    List(Secret(UInt(8))) ck1 = mix(ck0, x25519g_shared(e.priv, b.s_pub));
+    List(Secret(UInt(8))) ck2 = mix(ck1, x25519g_shared(c.priv, b.s_pub));
+    Two t = hkdf2(ck2, b.psk);
+    List(Int) enc = seal_pub(t.b, zero_nonce(), stamp(now_ns), h2);
+    List(Int) h3 = hpub(h2.concat(enc));
+    List(Int) body = [1, 0, 0, 0].concat(le32(idx)).concat(e.pub).concat(kem.ek).concat(enc);
+    List(Int) pkt = body.concat(mac1_of(mac1_key(b.s_pub, b.psk), body));
+    return Pending {.pkt = pkt, .ck = t.a, .h = h3, .e = e, .kem = kem, .idx = idx};
+}
+
+pub Int init_len() { return 4 + 4 + 32 + 1184 + 28 + 16; }
+pub Int resp_len() { return 4 + 4 + 4 + 32 + 1088 + 16 + 16; }
+
+// The responder's view of an init (mac1 already checked by the caller).
+pub type Answered = { List(Int) resp; SessionKeys keys; List(Int) stamp; };
+
+@requires(declassify)
+pub Answered hs_respond(Boot b, Static s, List(Int) pkt) {
+    List(Secret(UInt(8))) none = [];
+    Answered bad = Answered {.resp = [], .keys = keys_bad(), .stamp = []};
+    if (pkt.len() != init_len() || pkt[0] != 1) { return bad; }
+    Int idx_c = rd32(pkt, 4);
+    List(Int) e_c = pkt[8..40];
+    List(Int) ek_e = pkt[40..1224];
+    List(Int) enc = pkt[1224..1252];
+    List(Int) h1 = hpub(h0().concat(s.pub));
+    List(Int) h2 = hpub(h1.concat(e_c).concat(ek_e));
+    List(Secret(UInt(8))) d1 = x25519g_shared(s.priv, e_c);
+    List(Secret(UInt(8))) d2 = x25519g_shared(s.priv, b.c_pub);
+    if (d1.len() != 32 || d2.len() != 32) { return bad; }
+    List(Secret(UInt(8))) ck1 = mix(lift(h0()), d1);
+    List(Secret(UInt(8))) ck2 = mix(ck1, d2);
+    Two t = hkdf2(ck2, b.psk);
+    Option(List(Secret(UInt(8)))) ts = chacha20poly1305g_decrypt(t.b, zero_nonce(), enc, h2);
+    List(Secret(UInt(8))) tsv = ts else { none };
+    if (tsv.len() != 12) { return bad; }
+    List(Int) h3 = hpub(h2.concat(enc));
+    // Response: ephemeral X25519 and an ML-KEM encapsulation to ek_e.
+    Static e = static_new();
+    MlkemEncaps en = mlkem768_encaps(ek_e);
+    if (en.ct.len() != 1088) { return bad; }
+    Int idx_s = be32(random_bytes(4), 0) & 2147483647;
+    List(Int) h4 = hpub(h3.concat(e.pub).concat(en.ct));
+    List(Secret(UInt(8))) d3 = x25519g_shared(e.priv, e_c);
+    List(Secret(UInt(8))) d4 = x25519g_shared(e.priv, b.c_pub);
+    if (d3.len() != 32 || d4.len() != 32) { return bad; }
+    List(Secret(UInt(8))) ck3 = mix(mix(mix(t.a, d3), d4), en.k);
+    Two t2 = hkdf2(ck3, b.psk);
+    List(Int) conf = seal_pub(t2.b, zero_nonce(), [], h4);
+    List(Int) body = [2, 0, 0, 0].concat(le32(idx_s)).concat(le32(idx_c)).concat(e.pub).concat(en.ct).concat(conf);
+    List(Int) resp = body.concat(mac1_of(mac1_key(b.s_pub, b.psk), body));
+    Two tk = hkdf2(t2.a, none);
+    return Answered {.resp = resp, .keys = SessionKeys {.ok = true, .tx = tk.b, .rx = tk.a, .my_idx = idx_s, .their_idx = idx_c}, .stamp = pub_plain(tsv)};
+}
+
+@requires(declassify)
+pub SessionKeys hs_finish(Boot b, Static c, Pending p, List(Int) pkt) {
+    List(Secret(UInt(8))) none = [];
+    if (pkt.len() != resp_len() || pkt[0] != 2 || rd32(pkt, 8) != p.idx) { return keys_bad(); }
+    Int idx_s = rd32(pkt, 4);
+    List(Int) e_s = pkt[12..44];
+    List(Int) ct = pkt[44..1132];
+    List(Int) conf = pkt[1132..1148];
+    List(Int) h4 = hpub(p.h.concat(e_s).concat(ct));
+    List(Secret(UInt(8))) d3 = x25519g_shared(p.e.priv, e_s);
+    List(Secret(UInt(8))) d4 = x25519g_shared(c.priv, e_s);
+    List(Secret(UInt(8))) kk = mlkem768_decaps(p.kem.dk, ct);
+    if (d3.len() != 32 || d4.len() != 32 || kk.len() != 32) { return keys_bad(); }
+    List(Secret(UInt(8))) ck3 = mix(mix(mix(p.ck, d3), d4), kk);
+    Two t2 = hkdf2(ck3, b.psk);
+    Option(List(Secret(UInt(8)))) ok = chacha20poly1305g_decrypt(t2.b, zero_nonce(), conf, h4);
+    Bool verified = match ok { None => false, Some(x) => true };
+    if (!verified) { return keys_bad(); }
+    Two tk = hkdf2(t2.a, none);
+    return SessionKeys {.ok = true, .tx = tk.a, .rx = tk.b, .my_idx = p.idx, .their_idx = idx_s};
+}
+
+// ============================================================================
+// Data packets
+// ============================================================================
+
+List(Int) nonce_of(Int ctr) { return [0, 0, 0, 0].concat(le64(ctr)); }
+List(Int) le64(Int v) { return le32(v & 4294967295).concat(le32((v >> 32) & 2147483647)); }
+Int rd64(List(Int) b, Int i) { return rd32(b, i) | (rd32(b, i + 4) << 32); }
+
+@requires(declassify)
+pub List(Int) data_seal(SessionKeys k, Int ctr, List(Int) payload) {
+    return [4, 0, 0, 0].concat(le32(k.their_idx)).concat(le64(ctr)).concat(seal_pub(k.tx, nonce_of(ctr), payload, []));
+}
+
+// The receiver index of a data packet, or -1.
+pub Int data_idx(List(Int) pkt) { return if (pkt.len() >= 32 && pkt[0] == 4) { rd32(pkt, 4) } else { -1 }; }
+
+pub type DataIn = { Bool ok; Int ctr; List(Int) payload; };
+
+@requires(declassify)
+pub DataIn data_open(SessionKeys k, List(Int) pkt) {
+    List(Secret(UInt(8))) none = [];
+    if (pkt.len() < 32 || pkt[0] != 4 || rd32(pkt, 4) != k.my_idx) { return DataIn {.ok = false, .ctr = 0, .payload = []}; }
+    Int ctr = rd64(pkt, 8);
+    Option(List(Secret(UInt(8)))) pt = chacha20poly1305g_decrypt(k.rx, nonce_of(ctr), pkt[16..pkt.len()], []);
+    return match pt {
+        None => DataIn {.ok = false, .ctr = 0, .payload = []},
+        Some(x) => DataIn {.ok = true, .ctr = ctr, .payload = pub_plain(x)},
+    };
+}
+
+// A replay window over the last 2048 counters: slot ctr % 2048 holds the
+// counter last accepted there, so a repeat (or one 2048 or more behind the
+// highest) is refused.
+pub type Window = { Int top; List(Int) slots; };
+
+pub Window window_new() { return Window {.top = -1, .slots = fill(2048, [])}; }
+List(Int) fill(Int n, List(Int) acc) { if (n <= 0) { return acc; } return fill(n - 1, acc.concat([-1])); }
+
+// Whether ctr is new; the window with it recorded.
+pub type Seen = { Bool fresh; Window w; };
+
+pub Seen window_take(Window w, Int ctr) {
+    Bool fresh = ctr >= 0 && ctr > w.top - 2048 && w.slots[ctr % 2048] != ctr;
+    if (!fresh) { return Seen {.fresh = false, .w = w}; }
+    Int top = if (ctr > w.top) { ctr } else { w.top };
+    return Seen {.fresh = true, .w = Window {.top = top, .slots = w.slots.with(ctr % 2048, ctr)}};
+}

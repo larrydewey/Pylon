@@ -1,0 +1,264 @@
+// A Pylon protocol link (SPEC 9, 11): reliable streams over the UDP
+// session that core/proto.resid sets up, for both ends. EXPERIMENTAL, as
+// proto.resid. Version 1 carries port forwards; terminal sessions need a
+// pseudo-terminal in pylond (next) and rekeying is not implemented yet.
+//
+// One frame per datagram, inside an authenticated data packet:
+//   OPEN 1 | sid (4) | port (2) | host length (1) | host   client -> pylond
+//   DATA 2 | sid (4) | offset (8) | bytes
+//   ACK  3 | sid (4) | offset (8)    every byte below offset arrived
+//   FIN  4 | sid (4) | offset (8)    the stream ends at offset (FIN takes
+//                                    that offset, acknowledged as offset + 1)
+//   RST  5 | sid (4)
+//   PING 6
+// Reliability is go-back-N: a sender keeps its unacknowledged bytes and,
+// after 300 ms without progress, sends them again from the first one; a
+// receiver takes only the next byte it expects. The window is 256 KiB.
+//
+// Roaming: pylond answers to the address of the latest packet that
+// authenticated, so a client that moves (Wi-Fi to cellular, a NAT that
+// rebinds) continues without a new handshake.
+
+import "crypto.resid";
+import "wire.resid";
+import "cipher.resid";
+import "proto.resid";
+
+Int window_bytes() { return 262144; }
+Int chunk_bytes() { return 1100; }
+Int rto_ns() { return 300000000; }
+
+// A stream: id, local TCP socket, the first unacknowledged offset and
+// those bytes, the next offset to send, the next offset expected,
+// whether the local side ended (and at what offset), whether the peer's
+// FIN arrived, and when progress was last made.
+pub type St = { Int id; Int fd; Int acked; List(Int) unacked; Int next; Int recv; Bool eof; Int fin_at; Bool fin_in; Int progress; };
+
+pub type Link = {
+    Bool server; Int udp; List(Int) addr; Int port; SessionKeys k; Int tx_ctr; Window win;
+    List(St) streams; Int next_sid; Int last_rx; Int last_tx; Str err;
+};
+
+pub Link link_new(Bool server, Int udp, List(Int) addr, Int port, SessionKeys k, Int now) {
+    return Link {.server = server, .udp = udp, .addr = addr, .port = port, .k = k, .tx_ctr = 0, .win = window_new(),
+        .streams = [], .next_sid = if (server) { 2 } else { 1 }, .last_rx = now, .last_tx = now, .err = ""};
+}
+
+Link with_streams(Link l, List(St) ss) {
+    return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
+        .streams = ss, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err};
+}
+
+pub Link link_err(Link l, Str e) {
+    return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = e};
+}
+
+// ============================================================================
+// Sending
+// ============================================================================
+
+@requires(network, declassify)
+pub Link send_frame(Link l, List(Int) frame, Int now) {
+    List(Int) pkt = data_seal(l.k, l.tx_ctr, frame);
+    _ = resid_udp_send_to(l.udp, l.addr, l.port, pkt);
+    return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr + 1, .win = l.win,
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = now, .err = l.err};
+}
+
+List(Int) f_open(Int sid, Str host, Int port) { return [1].concat(u32_be(sid)).concat([(port >> 8) & 255, port & 255, str_len(host)]).concat(bytes_of(host)); }
+List(Int) f_data(Int sid, Int off, List(Int) b) { return [2].concat(u32_be(sid)).concat(u64_be(off)).concat(b); }
+List(Int) f_ack(Int sid, Int off) { return [3].concat(u32_be(sid)).concat(u64_be(off)); }
+List(Int) f_fin(Int sid, Int off) { return [4].concat(u32_be(sid)).concat(u64_be(off)); }
+List(Int) f_rst(Int sid) { return [5].concat(u32_be(sid)); }
+
+Int be64(List(Int) b, Int i) { return (be32(b, i) << 32) | be32(b, i + 4); }
+
+Int find(List(St) ss, Int id, Int i) {
+    if (i >= ss.len()) { return -1; }
+    if (ss[i].id == id) { return i; }
+    return find(ss, id, i + 1);
+}
+
+List(St) put(List(St) ss, Int i, St v) { return ss[0..i].concat([v]).concat(ss[i + 1..ss.len()]); }
+List(St) drop(List(St) ss, Int i) { return ss[0..i].concat(ss[i + 1..ss.len()]); }
+
+pub St st_new(Int id, Int fd, Int now) { return St {.id = id, .fd = fd, .acked = 0, .unacked = [], .next = 0, .recv = 0, .eof = false, .fin_at = -1, .fin_in = false, .progress = now}; }
+
+// A new outgoing stream (the client's -L): OPEN, then the stream.
+@requires(network, declassify)
+pub Link open_stream(Link l, Int fd, Str host, Int port, Int now) {
+    Int sid = l.next_sid;
+    Link l2 = send_frame(l, f_open(sid, host, port), now);
+    Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, fd, now)]));
+    return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err};
+}
+
+// Send what the window allows from position `from` of the unacked bytes.
+@requires(network, declassify)
+Link send_from(Link l, St s, Int from, Int budget, Int now) {
+    if (budget <= 0 || from >= s.unacked.len()) { return l; }
+    Int n = if (s.unacked.len() - from < chunk_bytes()) { s.unacked.len() - from } else { chunk_bytes() };
+    Link l2 = send_frame(l, f_data(s.id, s.acked + from, s.unacked[from..from + n]), now);
+    return send_from(l2, s, from + n, budget - 1, now);
+}
+
+// Local bytes from a stream's socket into the window.
+@requires(network, declassify)
+Link read_local(Link l, Int i, Int now) {
+    St s = l.streams[i];
+    Int room = window_bytes() - s.unacked.len();
+    if (room <= 0 || s.eof) { return l; }
+    List(Int) d = resid_tcp_recv_some(s.fd, if (room < 16384) { room } else { 16384 });
+    if (d.len() == 0) {
+        Int at = s.acked + s.unacked.len();
+        St e = St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = true, .fin_at = at, .fin_in = s.fin_in, .progress = now};
+        return send_frame(with_streams(l, put(l.streams, i, e)), f_fin(s.id, at), now);
+    }
+    Int start = s.unacked.len();
+    St s2 = St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked.concat(d), .next = s.acked + start + d.len(), .recv = s.recv, .eof = false, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = if (start == 0) { now } else { s.progress }};
+    return send_from(with_streams(l, put(l.streams, i, s2)), s2, start, 64, now);
+}
+
+// Go-back-N: after rto without progress, everything unacknowledged again.
+@requires(network, declassify)
+pub Link retransmit(Link l, Int i, Int now) {
+    if (i >= l.streams.len()) { return l; }
+    St s = l.streams[i];
+    Bool waiting = s.unacked.len() > 0 || (s.fin_at >= 0 && s.acked <= s.fin_at);
+    if (!waiting || now - s.progress < rto_ns()) { return retransmit(l, i + 1, now); }
+    St s2 = St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = now};
+    Link l1 = send_from(with_streams(l, put(l.streams, i, s2)), s2, 0, 64, now);
+    Link l2 = if (s.fin_at >= 0 && s.unacked.len() == 0) { send_frame(l1, f_fin(s.id, s.fin_at), now) } else { l1 };
+    return retransmit(l2, i + 1, now);
+}
+
+// ============================================================================
+// Receiving
+// ============================================================================
+
+// One authenticated datagram's frame. `connect` is false on the client:
+// only pylond accepts OPEN.
+@requires(network, declassify)
+pub Link on_frame(Link l, List(Int) f, Int now) {
+    if (f.len() == 0) { return l; }
+    Int t = f[0];
+    if (t == 6) { return l; }
+    if (f.len() < 5) { return l; }
+    Int sid = be32(f, 1);
+    Int i = find(l.streams, sid, 0);
+    if (t == 1) { return if (l.server && i < 0) { on_open(l, sid, f, now) } else { l }; }
+    if (i < 0) { return if (t == 2 || t == 4) { send_frame(l, f_rst(sid), now) } else { l }; }
+    St s = l.streams[i];
+    if (t == 5) { _ = resid_tcp_close(s.fd); return with_streams(l, drop(l.streams, i)); }
+    if (f.len() < 13) { return l; }
+    Int off = be64(f, 5);
+    if (t == 2) {
+        List(Int) b = f[13..f.len()];
+        Bool next = off == s.recv && !s.fin_in;
+        _ = if (next) { resid_tcp_send_bin(s.fd, b) } else { true };
+        Int recv = if (next) { s.recv + b.len() } else { s.recv };
+        St s2 = St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress};
+        return send_frame(with_streams(l, put(l.streams, i, s2)), f_ack(sid, recv), now);
+    }
+    if (t == 3) {
+        Int got = if (off > s.acked + s.unacked.len()) { s.acked + s.unacked.len() } else { off };
+        Int done = got - s.acked;
+        Bool fin_acked = s.fin_at >= 0 && off == s.fin_at + 1;
+        if (done <= 0 && !fin_acked) { return l; }
+        Int d = if (done > 0) { done } else { 0 };
+        St s2 = St {.id = s.id, .fd = s.fd, .acked = s.acked + d, .unacked = s.unacked[d..s.unacked.len()], .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = if (fin_acked) { -2 } else { s.fin_at }, .fin_in = s.fin_in, .progress = now};
+        return finish(with_streams(l, put(l.streams, i, s2)), i);
+    }
+    if (t == 4) {
+        Bool here = off == s.recv;
+        _ = if (here && !s.fin_in) { resid_tcp_shutdown(s.fd) } else { true };
+        St s2 = St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in || here, .progress = s.progress};
+        Link l2 = if (here || s.fin_in) { send_frame(with_streams(l, put(l.streams, i, s2)), f_ack(sid, off + 1), now) } else { l };
+        return finish(l2, i);
+    }
+    return l;
+}
+
+// A stream both of whose sides have ended (our FIN acknowledged: fin_at
+// -2) is closed and forgotten.
+@requires(network)
+Link finish(Link l, Int i) {
+    if (i >= l.streams.len()) { return l; }
+    St s = l.streams[i];
+    if (s.fin_at == -2 && s.fin_in) { _ = resid_tcp_close(s.fd); return with_streams(l, drop(l.streams, i)); }
+    return l;
+}
+
+// pylond: OPEN connects to host:port as the server sees it.
+@requires(network, declassify)
+Link on_open(Link l, Int sid, List(Int) f, Int now) {
+    if (f.len() < 8) { return l; }
+    Int port = f[5] * 256 + f[6];
+    Int hl = f[7];
+    if (f.len() != 8 + hl || hl == 0) { return send_frame(l, f_rst(sid), now); }
+    Str host = ascii_text(f[8..8 + hl]);
+    Int fd = resid_tcp_connect(host, port);
+    if (fd < 0) { return send_frame(l, f_rst(sid), now); }
+    _ = resid_tcp_deadline(fd, 0);
+    return with_streams(l, l.streams.concat([st_new(sid, fd, now)]));
+}
+
+// ============================================================================
+// The loop
+// ============================================================================
+
+// Local sockets with room in their window.
+pub List(Int) stream_fds(List(St) ss, Int i, List(Int) acc) {
+    if (i >= ss.len()) { return acc; }
+    Bool want = !ss[i].eof && ss[i].unacked.len() < window_bytes();
+    return stream_fds(ss, i + 1, if (want) { acc.concat([ss[i].fd]) } else { acc });
+}
+
+Int st_of_fd(List(St) ss, Int fd, Int i) {
+    if (i >= ss.len()) { return -1; }
+    if (ss[i].fd == fd) { return i; }
+    return st_of_fd(ss, fd, i + 1);
+}
+
+@requires(network, declassify)
+pub Link read_streams(Link l, List(Int) fds, List(Int) ready, Int at, Int i, Int now) {
+    if (i >= fds.len()) { return l; }
+    Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
+    Int k = st_of_fd(l.streams, fds[i], 0);
+    Link n = if (r && k >= 0) { read_local(l, k, now) } else { l };
+    return read_streams(n, fds, ready, at, i + 1, now);
+}
+
+// Every waiting datagram: authenticated data for this link is taken (and,
+// on pylond, its source becomes the peer address); everything else is
+// returned for the caller (pylond answers handshakes) or dropped.
+pub type Drained = { Link l; List(List(Int)) other; };
+
+@requires(network, declassify)
+pub Drained drain(Link l, Int now, Int budget, List(List(Int)) other) {
+    if (budget <= 0) { return Drained {.l = l, .other = other}; }
+    List(Int) d = resid_udp_recv_from(l.udp, 2048);
+    if (d.len() < 6) { return Drained {.l = l, .other = other}; }
+    List(Int) pkt = d[6..d.len()];
+    if (data_idx(pkt) != l.k.my_idx || !l.k.ok) { return drain(l, now, budget - 1, other.concat([d])); }
+    DataIn o = data_open(l.k, pkt);
+    if (!o.ok) { return drain(l, now, budget - 1, other); }
+    Seen sn = window_take(l.win, o.ctr);
+    if (!sn.fresh) { return drain(l, now, budget - 1, other); }
+    // Roaming: pylond follows the client to the address it now sends from.
+    List(Int) addr = if (l.server) { d[0..4] } else { l.addr };
+    Int port = if (l.server) { d[4] * 256 + d[5] } else { l.port };
+    Link l2 = Link {.server = l.server, .udp = l.udp, .addr = addr, .port = port, .k = l.k, .tx_ctr = l.tx_ctr, .win = sn.w,
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = l.last_tx, .err = l.err};
+    return drain(on_frame(l2, o.payload, now), now, budget - 1, other);
+}
+
+// A keepalive after 10 s of sending nothing (keeps NAT bindings and the
+// server's view of our address current).
+@requires(network, declassify)
+pub Link keepalive(Link l, Int now) {
+    if (now - l.last_tx < 10000000000) { return l; }
+    return send_frame(l, [6], now);
+}

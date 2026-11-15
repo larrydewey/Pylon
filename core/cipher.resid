@@ -42,7 +42,7 @@ List(Int) ints_acc(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
 
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
-List(Int) pub_sealed(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "sealed packet bytes are sent on the wire")); }
+pub List(Int) pub_sealed(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "sealed packet bytes are sent on the wire")); }
 
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
@@ -50,7 +50,7 @@ List(Int) pub_length(List(Secret(UInt(8))) s) { return ints_of(declassify(secret
 
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
-List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "packet payload after its tag verified")); }
+pub List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "packet payload after its tag verified")); }
 
 // kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM. The GCM IV
 // is not secret (RFC 5647 7.1).

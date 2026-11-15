@@ -1,0 +1,106 @@
+// pylond: the Pylon protocol's server end (SPEC 8, 9). EXPERIMENTAL.
+//
+//   pylond serve [--idle SECONDS]
+//
+// Started by `pylon` over a verified SSH channel, as the principal. It
+// reads the bootstrap hello on standard input, binds UDP on the address
+// the SSH connection arrived on (SSH_CONNECTION; never the wildcard
+// address), writes the bootstrap reply on standard output, and from then
+// on never writes to the SSH channel again, so it outlives the SSH
+// connection. It answers only handshakes that carry a valid mac1 (keyed
+// by the bootstrap secret) and a timestamp newer than the last one; every
+// other datagram is dropped without a reply. It exits after --idle
+// seconds without an authenticated packet (default 600).
+//
+// Not yet (SPEC 8.4, 10): Landlock and seccomp confinement, pseudo-
+// terminal sessions, rekeying, re-attach.
+
+import "crypto.resid";
+import "../core/wire.resid";
+import "../core/cipher.resid";
+import "../core/proto.resid";
+import "../core/link.resid";
+
+@requires(network)
+List(Int) read_stdin(Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_read_some(n - acc.len());
+    if (more.len() == 0) { return acc; }
+    return read_stdin(n, acc.concat(more));
+}
+
+// The server's address on the SSH connection, from SSH_CONNECTION
+// ("client_ip client_port server_ip server_port"); "" when absent.
+@requires(environment)
+Str server_addr() {
+    List(Str) p = str_split(str_trim(environment.get("SSH_CONNECTION")), " ");
+    return if (p.len() == 4) { p[2] } else { "" };
+}
+
+type Srv = { Boot b; Static s; List(Int) mk; Bool linked; Link l; List(Int) last_stamp; Int idle_ns; Int started; };
+
+// Is stamp a newer than b (big-endian, same length)?
+Bool newer(List(Int) a, List(Int) b, Int i) {
+    if (b.len() == 0) { return true; }
+    if (i >= a.len()) { return false; }
+    if (a[i] != b[i]) { return a[i] > b[i]; }
+    return newer(a, b, i + 1);
+}
+
+// Handshake initiations among the datagrams `others` (or read now).
+@requires(network, declassify, clock(readonly))
+Srv handshakes(Srv v, List(List(Int)) others, Int i, Int now) {
+    if (i >= others.len()) { return v; }
+    List(Int) d = others[i];
+    List(Int) pkt = d[6..d.len()];
+    Bool candidate = pkt.len() == init_len() && pkt[0] == 1 && mac1_ok(v.mk, pkt);
+    if (!candidate) { return handshakes(v, others, i + 1, now); }
+    Answered a = hs_respond(v.b, v.s, pkt);
+    if (!a.keys.ok || !newer(a.stamp, v.last_stamp, 0)) { return handshakes(v, others, i + 1, now); }
+    Int port = d[4] * 256 + d[5];
+    _ = resid_udp_send_to(v.l.udp, d[0..4], port, a.resp);
+    // A new handshake replaces the keys; the streams carry on.
+    Link fresh = link_new(true, v.l.udp, d[0..4], port, a.keys, now);
+    Link l2 = Link {.server = true, .udp = fresh.udp, .addr = fresh.addr, .port = fresh.port, .k = fresh.k, .tx_ctr = 0, .win = fresh.win,
+        .streams = v.l.streams, .next_sid = v.l.next_sid, .last_rx = now, .last_tx = now, .err = ""};
+    return handshakes(Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = true, .l = l2, .last_stamp = a.stamp, .idle_ns = v.idle_ns, .started = v.started}, others, i + 1, now);
+}
+
+@requires(network, declassify, clock(readonly))
+Int serve_loop(Srv v) {
+    Int now = clock.monotonic_ns();
+    Int since = if (v.linked) { v.l.last_rx } else { v.started };
+    if (now - since > v.idle_ns) { return 0; }
+    List(Int) sfds = stream_fds(v.l.streams, 0, []);
+    List(Int) fds = [v.l.udp].concat(sfds);
+    List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
+    Drained g = drain(v.l, now, 64, []);
+    Srv v1 = Srv {.b = v.b, .s = v.s, .mk = v.mk, .linked = v.linked, .l = g.l, .last_stamp = v.last_stamp, .idle_ns = v.idle_ns, .started = v.started};
+    Srv v2 = handshakes(v1, g.other, 0, now);
+    Link l3 = if (v2.linked) { retransmit(read_streams(v2.l, sfds, ready, 1, 0, now), 0, now) } else { v2.l };
+    return serve_loop(Srv {.b = v2.b, .s = v2.s, .mk = v2.mk, .linked = v2.linked, .l = l3, .last_stamp = v2.last_stamp, .idle_ns = v2.idle_ns, .started = v2.started});
+}
+
+List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
+
+@requires(args, network, environment, declassify, clock(readonly))
+Int main() {
+    if (args.count() < 2 || args.get(1) != "serve") { eprintln("usage: pylond serve [--idle SECONDS]"); return 2; }
+    Int idle = if (args.count() == 4 && args.get(2) == "--idle" && str_is_int(args.get(3))) { str_parse_int(args.get(3)) } else { 600 };
+    Str addr = server_addr();
+    if (str_len(addr) == 0) { eprintln("pylond: not started over SSH (no SSH_CONNECTION)"); return 2; }
+    Int udp = resid_udp_bind_at(addr, 0);
+    if (udp < 0) { eprintln("pylond: cannot bind UDP on " + addr); return 1; }
+    List(Int) hello = read_stdin(boot_hello_len(), []);
+    Static s = static_new();
+    BootS served = boot_serve(hello, s, resid_udp_port(udp));
+    if (!served.boot.ok) { eprintln("pylond: malformed bootstrap"); return 1; }
+    _ = print_bytes(served.reply);
+    // From here on nothing is written to the SSH channel.
+    List(Secret(UInt(8))) none = [];
+    SessionKeys k0 = SessionKeys {.ok = false, .tx = none, .rx = none, .my_idx = -1, .their_idx = 0};
+    Int now = clock.monotonic_ns();
+    Srv v = Srv {.b = served.boot, .s = s, .mk = mac1_key(served.boot.s_pub, served.boot.psk), .linked = false,
+        .l = link_new(true, udp, [0, 0, 0, 0], 0, k0, now), .last_stamp = [], .idle_ns = idle * 1000000000, .started = now};
+    return serve_loop(v);
+}
