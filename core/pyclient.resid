@@ -149,7 +149,7 @@ pub List(Fwd) listen_local(List(Fwd) fs, Int i, List(Fwd) acc) {
 // the same sealed size as a one-key frame, as over SSH (SPEC 5, 9.4); the
 // terminal's size is checked every pass and sent when it changed. Returns
 // the shell's exit code (255 when the stream was reset).
-pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; Rk rk; };
+pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; Rk rk; App app; };
 
 @requires(network, declassify, terminal, clock(readonly))
 pub Int pylon_shell(Sh h, List(Fwd) fs) {
@@ -157,7 +157,7 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     Int now = clock.monotonic_ns();
     // The peer's bytes to the screen, then its end.
     List(Int) show = inbox(h.l, h.sid);
-    _ = if (show.len() > 0) { print_bytes(show) } else { true };
+    _ = if (show.len() > 0) { print_bytes(if (h.app.on) { app_frame(1, show) } else { show }) } else { true };
     Ev e = events(h.l);
     Int code = exit_of(e.exits, h.sid, 0);
     if (code != -2) { return if (code >= 0) { code } else { 255 }; }
@@ -174,8 +174,10 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     Drained g = Drained {.l = rr.l, .other = []};
     Bool key = !h.in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
     Int rm = room(g.l, h.sid);
-    List(Int) got = if (key && rm > 0) { resid_read_some(if (rm < 4096) { rm } else { 4096 }) } else { [] };
-    Bool now_eof = h.in_eof || (key && rm > 0 && got.len() == 0);
+    List(Int) raw_in = if (key && rm > 0) { resid_read_some(if (rm < 4096) { rm } else { 4096 }) } else { [] };
+    AppIn ai = if (h.app.on) { app_parse(h.app.buf.concat(raw_in), [], 0, 0) } else { AppIn {.keys = raw_in, .rows = 0, .cols = 0, .rest = []} };
+    List(Int) got = ai.keys;
+    Bool now_eof = h.in_eof || (key && rm > 0 && raw_in.len() == 0);
     // Keys: at once, or on the next tick.
     Link l1 = if (!h.k.on && got.len() > 0) { push_bytes(g.l, h.sid, got, t) } else { g.l };
     Bool idle = h.k.pending.len() == 0 && t >= h.k.until;
@@ -192,14 +194,14 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     // Forwards beside the terminal.
     Int at = 1 + kb.len();
     Link l4 = retransmit(read_streams(accept_into(l3, fs, ready, at, 0, t), sfds, ready, at + fs.len(), 0, t), 0, t);
-    Int nc = resid_term_cols();
-    Int nr = resid_term_rows();
+    Int nc = if (h.app.on) { if (ai.cols > 0) { ai.cols } else { h.cols } } else { resid_term_cols() };
+    Int nr = if (h.app.on) { if (ai.rows > 0) { ai.rows } else { h.rows } } else { resid_term_rows() };
     Bool changed = nc > 0 && nr > 0 && (nc != h.cols || nr != h.rows);
     Link l5 = keepalive(if (changed) { resize(l4, h.sid, nr, nc, t) } else { l4 }, t);
     Bool move = h.rebind > 0 && l5.tx_ctr >= h.rebind;
     Link l6 = if (move) { rebind(l5) } else { l5 };
     return pylon_shell(Sh {.l = l6, .sid = h.sid, .rows = if (changed) { nr } else { h.rows }, .cols = if (changed) { nc } else { h.cols },
-        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }, .rk = rr.rk}, fs);
+        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }, .rk = rr.rk, .app = App {.on = h.app.on, .buf = ai.rest}}, fs);
 }
 
 // The exit code reported for sid: -2 when none, -1 when the stream was reset.

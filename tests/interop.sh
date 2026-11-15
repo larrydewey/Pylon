@@ -173,6 +173,10 @@ check "4 MiB of output"                        0 "4194304" \
 # --- interactive shell on a pty -----------------------------------------------
 check "interactive shell: type, resize, paste, exit status" 0 "interactive ok" \
     python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
+check "app mode: a session over framed pipes" 0 "app ok" \
+    python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
+check "app mode: the emulator process (confined)" 0 "term process ok" \
+    python3 "$(dirname "$HOSTILE")/term_proc.py" "$(dirname "$PYLON")/pylon-term"
 check "interactive without a terminal is refused" 2 "needs a terminal" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' < /dev/null"
 
@@ -316,6 +320,8 @@ except socket.timeout:
         bash -c "pgrep -fc 'pylond-.* serve'"
     check "pylond: confined (seccomp filter, no new privileges)" 0 "NoNewPrivs:	1 Seccomp:	2" \
         bash -c "for p in \$(pgrep -f 'pylond-[0-9a-f]* serve'); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
+    check "pylon protocol: app mode over the Pylon protocol" 0 "app ok" \
+        python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
         "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1" true
     pkill -f "pylond-.* serve" 2>/dev/null

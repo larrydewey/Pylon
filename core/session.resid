@@ -114,6 +114,11 @@ pub Chan window_change(Chan ch, Int cols, Int rows) {
 
 // A channel whose data is kept for the program, and the same channel with
 // the first n kept bytes taken.
+// The same channel with its captured bytes taken.
+pub Chan inbox_taken(Chan ch) {
+    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = ch.raw, .capture = ch.capture, .inbox = [], .err = ch.err};
+}
+
 pub Chan capturing(Chan ch) {
     return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = ch.closed, .raw = false, .capture = true, .inbox = ch.inbox, .err = ch.err};
 }
@@ -276,8 +281,34 @@ pub Int wait_ms(Keys k, Int now) {
 // a packet already buffered is handled without waiting; the terminal's
 // size is checked at least every half second and sent when it changed.
 // Ends when the server closes the channel.
+// App mode (`pylon --app`): no terminal. Standard input carries frames,
+// type (1) | length (4) | payload: 1 keys, 2 a size (rows (2) | cols (2));
+// the host's output leaves as frames of type 1 on standard output.
+pub type App = { Bool on; List(Int) buf; };
+
+pub App app_off() { return App {.on = false, .buf = []}; }
+
+pub List(Int) app_frame(Int ty, List(Int) p) { return [ty].concat(u32_be(p.len())).concat(p); }
+
+// Keys and the latest size from the whole frames in buf.
+pub type AppIn = { List(Int) keys; Int rows; Int cols; List(Int) rest; };
+
+pub AppIn app_parse(List(Int) b, List(Int) keys, Int rows, Int cols) {
+    if (b.len() < 5) { return AppIn {.keys = keys, .rows = rows, .cols = cols, .rest = b}; }
+    Int n = be32(b, 1);
+    if (n > 1048576) { return AppIn {.keys = keys, .rows = rows, .cols = cols, .rest = []}; }
+    if (b.len() < 5 + n) { return AppIn {.keys = keys, .rows = rows, .cols = cols, .rest = b}; }
+    List(Int) p = b[5..5 + n];
+    Bool size = b[0] == 2 && n == 4;
+    return app_parse(b[5 + n..b.len()], if (b[0] == 1) { keys.concat(p) } else { keys },
+        if (size) { p[0] * 256 + p[1] } else { rows }, if (size) { p[2] * 256 + p[3] } else { cols });
+}
+
 @requires(network, declassify, terminal, clock(readonly))
-pub Chan interact(Chan ch, Int cols, Int rows, Bool in_eof, Keys k) {
+pub Chan interact(Chan ch0, Int cols, Int rows, Bool in_eof, Keys k, App app) {
+    // App mode: what the host sent goes out framed.
+    _ = if (app.on && ch0.inbox.len() > 0) { print_bytes(app_frame(1, ch0.inbox)) } else { true };
+    Chan ch = if (app.on) { inbox_taken(ch0) } else { ch0 };
     if (!chan_ok(ch) || ch.closed) { return ch; }
     Int now = clock.monotonic_ns();
     Bool buffered = ch.c.buf.len() > 0;
@@ -287,8 +318,10 @@ pub Chan interact(Chan ch, Int cols, Int rows, Bool in_eof, Keys k) {
     Bool net = buffered || (ready.len() > 0 && (ready[0] & 1) != 0);
     Bool key = !in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
     Chan a = if (net) { step(ch) } else { ch };
-    List(Int) got = if (key && chan_ok(a) && !a.closed) { resid_read_some(4096) } else { [] };
-    Bool now_eof = in_eof || (key && got.len() == 0);
+    List(Int) raw_in = if (key && chan_ok(a) && !a.closed) { resid_read_some(4096) } else { [] };
+    AppIn ai = if (app.on) { app_parse(app.buf.concat(raw_in), [], 0, 0) } else { AppIn {.keys = raw_in, .rows = 0, .cols = 0, .rest = []} };
+    List(Int) got = ai.keys;
+    Bool now_eof = in_eof || (key && raw_in.len() == 0);
     Int t = clock.monotonic_ns();
     // Without obfuscation keys go out at once; with it they wait for the
     // tick, and typing (re)starts the clock and extends the chaff period.
@@ -306,8 +339,8 @@ pub Chan interact(Chan ch, Int cols, Int rows, Bool in_eof, Keys k) {
     // End of input: whatever is queued, then EOF.
     Chan b = if (now_eof && !in_eof) { send_eof(send_data(b1, k2.pending)) } else { b1 };
     Keys k3 = if (now_eof && !in_eof) { keys_new(false) } else { k2 };
-    Int nc = resid_term_cols();
-    Int nr = resid_term_rows();
+    Int nc = if (app.on) { if (ai.cols > 0) { ai.cols } else { cols } } else { resid_term_cols() };
+    Int nr = if (app.on) { if (ai.rows > 0) { ai.rows } else { rows } } else { resid_term_rows() };
     Chan d = if (nc != cols || nr != rows) { window_change(b, nc, nr) } else { b };
-    return interact(d, nc, nr, now_eof, k3);
+    return interact(d, nc, nr, now_eof, k3, App {.on = app.on, .buf = ai.rest});
 }

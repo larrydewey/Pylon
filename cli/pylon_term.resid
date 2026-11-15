@@ -1,0 +1,120 @@
+// pylon-term: the terminal emulator as a process of its own (SPEC 12).
+//
+// The app starts one per terminal and gives it the host's output; it
+// answers with screens to draw. The emulator is the largest parser of
+// bytes a hostile host controls, so it runs apart from the process that
+// holds connections and keys, and confines itself before it reads a
+// single byte: no filesystem at all, and only the system calls of reading
+// its input and writing its output (resid_sandbox_confine). A bug in it
+// yields a process that can draw one terminal and nothing else.
+//
+// Frames both ways: type (1) | length (4, big-endian) | payload.
+//
+//   app -> term
+//     1  bytes the host sent
+//     2  resize: rows (2) | cols (2)
+//     3  scrollback: from (4) | count (2)       (lines from the top of it)
+//   term -> app
+//     1  screen: rows (2) | cols (2) | cursor x (2) | cursor y (2) |
+//        modes (4) | rows x cols cells (code point (4) | attributes (4))
+//     2  reply bytes for the host (fixed-format answers only)
+//     3  title (printable ASCII)
+//     4  clipboard write request (the OSC 52 payload, base64): the app
+//        asks the principal per host before writing anything
+//     5  bell
+//     6  scrollback: total (4) | from (4) | count (2) | count x (cols (2) | cells)
+//
+// A screen is sent after each read that changed something; the app draws
+// the latest. The emulator never sees keys: the app encodes them.
+
+import "crypto.resid";
+import "../core/wire.resid";
+import "../core/term.resid";
+
+type St = { Term t; List(Int) buf; Str title; };
+
+List(Int) frame(Int ty, List(Int) p) { return [ty].concat(u32_be(p.len())).concat(p); }
+
+List(Int) u16b(Int v) { return [(v >> 8) & 255, v & 255]; }
+
+List(Int) cells_out(List(List(Int)) rows, Int i, List(Int) acc) {
+    if (i >= rows.len()) { return acc; }
+    return cells_out(rows, i + 1, row_cells(rows[i], 0, acc));
+}
+
+List(Int) row_cells(List(Int) r, Int i, List(Int) acc) {
+    if (i >= r.len()) { return acc; }
+    return row_cells(r, i + 1, acc.concat(u32_be(cell_ch(r[i]))).concat(u32_be(cell_attr(r[i]))));
+}
+
+List(Int) screen(Term t) {
+    List(Int) head = u16b(t.rows).concat(u16b(t.cols)).concat(u16b(t.c.x)).concat(u16b(t.c.y)).concat(u32_be(t.modes));
+    return frame(1, head.concat(cells_out(t.scr, 0, [])));
+}
+
+List(Int) history(Term t, Int from0, Int count0) {
+    Int from = clamp(from0, 0, t.sb.len());
+    Int count = clamp(count0, 0, min(t.sb.len() - from, 500));
+    return frame(6, u32_be(t.sb.len()).concat(u32_be(from)).concat(u16b(count)).concat(hist_rows(t.sb, from, from + count, [])));
+}
+
+List(Int) hist_rows(List(List(Int)) sb, Int i, Int end, List(Int) acc) {
+    if (i >= end) { return acc; }
+    return hist_rows(sb, i + 1, end, row_cells(sb[i], 0, acc.concat(u16b(sb[i].len()))));
+}
+
+// Every whole frame in buf: applied, with what the app must be told.
+type Done = { St s; List(Int) out; Bool dirty; };
+
+Done frames(St s, List(Int) out, Bool dirty) {
+    List(Int) b = s.buf;
+    if (b.len() < 5) { return Done {.s = s, .out = out, .dirty = dirty}; }
+    Int n = be32(b, 1);
+    if (n > 1048576) { return Done {.s = St {.t = s.t, .buf = [], .title = s.title}, .out = out, .dirty = dirty}; }
+    if (b.len() < 5 + n) { return Done {.s = s, .out = out, .dirty = dirty}; }
+    Int ty = b[0];
+    List(Int) p = b[5..5 + n];
+    List(Int) rest = b[5 + n..b.len()];
+    if (ty == 1) {
+        Term t1 = term_feed(s.t, p);
+        List(Int) o = (if (t1.replies.len() > 0) { frame(2, t1.replies) } else { [] })
+            .concat(clips(t1.clip, 0, []))
+            .concat(if (t1.bell > 0) { frame(5, []) } else { [] })
+            .concat(if (t1.title != s.title) { frame(3, bytes_of(t1.title)) } else { [] });
+        return frames(St {.t = taken(t1), .buf = rest, .title = t1.title}, out.concat(o), true);
+    }
+    if (ty == 2 && n == 4) {
+        return frames(St {.t = term_resize(s.t, p[0] * 256 + p[1], p[2] * 256 + p[3]), .buf = rest, .title = s.title}, out, true);
+    }
+    if (ty == 3 && n == 6) {
+        return frames(St {.t = s.t, .buf = rest, .title = s.title}, out.concat(history(s.t, be32(p, 0), p[4] * 256 + p[5])), dirty);
+    }
+    return frames(St {.t = s.t, .buf = rest, .title = s.title}, out, dirty);
+}
+
+List(Int) clips(List(List(Int)) cs, Int i, List(Int) acc) {
+    if (i >= cs.len()) { return acc; }
+    return clips(cs, i + 1, acc.concat(frame(4, cs[i])));
+}
+
+Int serve(St s) {
+    List(Int) got = resid_read_some(65536);
+    if (got.len() == 0) { return 0; }
+    Done d = frames(St {.t = s.t, .buf = s.buf.concat(got), .title = s.title}, [], false);
+    List(Int) out = if (d.dirty) { d.out.concat(screen(d.s.t)) } else { d.out };
+    _ = if (out.len() > 0) { print_bytes(out) } else { true };
+    return serve(d.s);
+}
+
+@requires(args)
+Int main() {
+    Int rows = if (args.count() >= 3 && str_is_int(args.get(1))) { str_parse_int(args.get(1)) } else { 24 };
+    Int cols = if (args.count() >= 3 && str_is_int(args.get(2))) { str_parse_int(args.get(2)) } else { 80 };
+    List(Str) none = [];
+    Int c = resid_sandbox_confine(none, none);
+    if (c < 0) { eprintln("pylon-term: confinement failed"); return 1; }
+    if (c == 0 && !(args.count() >= 4 && args.get(3) == "--allow-unconfined")) { eprintln("pylon-term: this kernel cannot confine the emulator (no Landlock)"); return 3; }
+    Term t = term_new(rows, cols);
+    _ = print_bytes(screen(t));
+    return serve(St {.t = t, .buf = [], .title = ""});
+}

@@ -38,7 +38,7 @@ Opts parse(Int i, Opts o) {
     }
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if ((a == "-L" || a == "-D" || a == "-R") && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds.concat([str_slice(a, 1, 2) + " " + args.get(i + 1)]), .rest = [], .err = ""}); }
@@ -114,7 +114,8 @@ Int cmd_run(Opts o, Int via) {
     if (fs.len() != o.fwds.len()) { return 2; }
     Bool interactive = o.rest.len() == 1 && !o.no_cmd;
     if (o.no_cmd && o.fwds.len() == 0) { eprintln("pylon: -N needs at least one -L, -D or -R"); return 2; }
-    if (interactive && !has_flag(o.pflags, "sessions") && !resid_term_is_tty(0)) { eprintln("pylon: an interactive shell needs a terminal; give a COMMAND to run instead"); return 2; }
+    Bool app = has_flag(o.pflags, "app");
+    if (interactive && !app && !has_flag(o.pflags, "sessions") && !resid_term_is_tty(0)) { eprintln("pylon: an interactive shell needs a terminal; give a COMMAND to run instead"); return 2; }
     List(Str) uh = str_split(o.rest[0], "@");
     if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(uh[1]) == 0) { eprintln("pylon: give the user as USER@HOST"); return 2; }
     Str user = uh[0];
@@ -127,7 +128,7 @@ Int cmd_run(Opts o, Int via) {
     if (o.no_cmd) { return run_forwards(a.c, fs); }
     Chan ch = open_session(a.c);
     if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
-    Chan done = if (interactive) { run_shell(ch, environment.get("TERM"), !o.no_obfuscate) } else { pump(exec(ch, command)) };
+    Chan done = if (interactive) { run_shell(ch, if (app) { "xterm-256color" } else { environment.get("TERM") }, !o.no_obfuscate, app) } else { pump(exec(ch, command)) };
     if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
     _ = disconnect(done.c, "done");
     return if (done.status >= 0 && done.status < 256) { done.status } else { 255 };
@@ -286,15 +287,16 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
         if (sessions) { _ = print_sessions(ls0.items, 0); return 0; }
     }
     if (shell) {
-        Int cols = resid_term_cols();
-        Int rows = resid_term_rows();
+        Bool app = has_flag(pflags, "app");
+        Int cols = if (app) { 80 } else { resid_term_cols() };
+        Int rows = if (app) { 24 } else { resid_term_rows() };
         Listed found = if (has_flag(pflags, "attach")) { list_sessions(l0, 0, clock.monotonic_ns()) } else { Listed {.l = l0, .ok = false, .items = []} };
         Int pick = detached(found.items, 0);
         _ = if (pick >= 0) { eprintln("pylon: attaching to session " + f"{pick}") } else { true };
         Link l1 = if (pick >= 0) { attach(found.l, pick, rows, cols, clock.monotonic_ns()) } else { open_shell(found.l, rows, cols, clock.monotonic_ns()) };
-        _ = resid_term_raw();
-        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk}, ls);
-        _ = resid_term_restore();
+        _ = if (app) { false } else { resid_term_raw() };
+        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk, .app = App {.on = app, .buf = []}}, ls);
+        _ = if (app) { false } else { resid_term_restore() };
         return code;
     }
     Link done = pylon_forwards(l0, ls, rebind_after, rk);
@@ -341,15 +343,15 @@ Bool announce(List(Fwd) fs, Int i) {
 // life: restored on every way out (the runtime also restores it at exit
 // and on an abort).
 @requires(network, declassify, terminal, clock(readonly))
-Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
+Chan run_shell(Chan ch, Str term0, Bool obfuscate, Bool app) {
     Str term = if (str_len(term0) > 0 && str_len(term0) < 64) { term0 } else { "xterm-256color" };
-    Int cols = resid_term_cols();
-    Int rows = resid_term_rows();
+    Int cols = if (app) { 80 } else { resid_term_cols() };
+    Int rows = if (app) { 24 } else { resid_term_rows() };
     Chan s = shell(ch, term, cols, rows);
     if (!chan_ok(s)) { return s; }
-    _ = resid_term_raw();
-    Chan done = interact(s, cols, rows, false, keys_new(obfuscate));
-    _ = resid_term_restore();
+    _ = if (app) { false } else { resid_term_raw() };
+    Chan done = interact(if (app) { capturing(s) } else { s }, cols, rows, false, keys_new(obfuscate), App {.on = app, .buf = []});
+    _ = if (app) { false } else { resid_term_restore() };
     return done;
 }
 
