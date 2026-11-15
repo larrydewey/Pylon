@@ -20,8 +20,9 @@ import "../core/session.resid";
 import "../core/known.resid";
 import "../core/forward.resid";
 import "../core/sftp.resid";
+import "../core/jump.resid";
 
-type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; List(Str) fwds; List(Str) rest; Str err; };
+type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; Str jump; List(Str) fwds; List(Str) rest; Str err; };
 
 @requires(args)
 Opts parse(Int i, Opts o) {
@@ -29,22 +30,23 @@ Opts parse(Int i, Opts o) {
     Str a = args.get(i);
     if (a == "-p" && i + 1 < args.count()) {
         Str v = args.get(i + 1);
-        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = "bad port " + v}; }
-        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""});
+        if (!str_is_int(v) || str_parse_int(v) < 1 || str_parse_int(v) > 65535) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = "bad port " + v}; }
+        return parse(i + 2, Opts {.port = str_parse_int(v), .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = ""});
     }
-    if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "-L" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds.concat([args.get(i + 1)]), .rest = [], .err = ""}); }
-    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = [], .err = "unknown option " + a}; }
+    if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "-N") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = true, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "-L" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds.concat([args.get(i + 1)]), .rest = [], .err = ""}); }
+    if (a == "--no-obfuscate-keystrokes") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = true, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--allow-no-strict") { return parse(i + 1, Opts {.port = o.port, .no_strict = true, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (str_starts_with(a, "-")) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = [], .err = "unknown option " + a}; }
     return rest_from(i, o);
 }
 
 @requires(args)
 Opts rest_from(Int i, Opts o) {
     if (i >= args.count()) { return o; }
-    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .fwds = o.fwds, .rest = o.rest.concat([args.get(i)]), .err = o.err});
+    return rest_from(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .fwds = o.fwds, .rest = o.rest.concat([args.get(i)]), .err = o.err});
 }
 
 Int usage() {
@@ -52,8 +54,16 @@ Int usage() {
     eprintln("       pylon [-p PORT] -N -L [127.0.0.1:]PORT:HOST:HOSTPORT [-L ...] USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
+    eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT");
     return 2;
+}
+
+// The inner end of a jump pipe, as a connection to the target.
+@requires(network, declassify)
+Conn piped(Int fd) {
+    _ = resid_tcp_deadline(fd, 30000);
+    return conn_new(fd);
 }
 
 @requires(network, declassify)
@@ -66,12 +76,12 @@ Conn dial(Str host, Int port) {
 }
 
 @requires(network, filesystem, environment, declassify)
-Int cmd_pin(Opts o) {
+Int cmd_pin(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Str host = o.rest[0];
     Str want = o.rest[1];
     if (!str_starts_with(want, "SHA256:")) { eprintln("pylon: the fingerprint must be SHA256:... as ssh-keygen -lf prints it"); return 2; }
-    Conn c = dial(host, o.port);
+    Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
     Handshake h = handshake(c, Trust {.pinned = [], .probe = true}, o.no_strict);
     _ = resid_tcp_close(c.fd);
@@ -87,7 +97,7 @@ Int cmd_pin(Opts o) {
 }
 
 @requires(network, filesystem, environment, declassify, terminal, clock(readonly))
-Int cmd_run(Opts o) {
+Int cmd_run(Opts o, Int via) {
     if (o.rest.len() < 1) { return usage(); }
     if (o.fwds.len() > 0 && (!o.no_cmd || o.rest.len() != 1)) { eprintln("pylon: -L runs a forwarding-only session: give -N and no COMMAND"); return 2; }
     List(Fwd) fs = parse_fwds(o.fwds, 0, []);
@@ -100,7 +110,7 @@ Int cmd_run(Opts o) {
     Str user = uh[0];
     Str host = uh[1];
     Str command = if (interactive) { "" } else { str_join(o.rest[1..o.rest.len()], " ") };
-    Authed a = login(user, host, o);
+    Authed a = login(user, host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
     if (o.no_cmd) { return run_forwards(a.c, fs); }
     Chan ch = open_session(a.c);
@@ -115,14 +125,14 @@ Int cmd_run(Opts o) {
 // agent: the steps every command shares. Not ok, with the reason, on any
 // failure (the connection is closed then).
 @requires(network, filesystem, environment, declassify)
-Authed login(Str user, Str host, Opts o) {
+Authed login(Str user, Str host, Opts o, Int via) {
     List(List(Int)) pinned = pinned_for(host_token(host, o.port));
     Int agent = agent_connect();
     Conn none = conn_new(-1);
     if (agent < 0) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
     List(Ident) ids = agent_ids(agent);
     if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
-    Conn c = dial(host, o.port);
+    Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
     Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
     if (!conn_ok(h.c)) { _ = resid_tcp_close(c.fd); return Authed {.c = h.c, .ok = false, .why = h.c.err}; }
@@ -149,13 +159,13 @@ Remote parse_remote(Str s) {
 
 // pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL
 @requires(network, filesystem, environment, declassify)
-Int cmd_get(Opts o) {
+Int cmd_get(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Remote r = parse_remote(o.rest[0]);
     Str local = o.rest[1];
     if (str_len(r.user) == 0) { eprintln("pylon: give the source as USER@HOST:PATH"); return 2; }
     if (filesystem.exists(local) && !o.force) { eprintln("pylon: " + local + " exists; not replaced (use --force to replace it)"); return 1; }
-    Authed a = login(r.user, r.host, o);
+    Authed a = login(r.user, r.host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
@@ -168,14 +178,14 @@ Int cmd_get(Opts o) {
 
 // pylon put [-p PORT] LOCAL USER@HOST:REMOTE
 @requires(network, filesystem, environment, declassify)
-Int cmd_put(Opts o) {
+Int cmd_put(Opts o, Int via) {
     if (o.rest.len() != 2) { return usage(); }
     Str local = o.rest[0];
     Remote r = parse_remote(o.rest[1]);
     if (str_len(r.user) == 0) { eprintln("pylon: give the destination as USER@HOST:PATH"); return 2; }
     if (!filesystem.exists(local) || filesystem.is_dir(local)) { eprintln("pylon: " + local + " is not a file"); return 1; }
     List(Int) data = filesystem.read_bytes(local);
-    Authed a = login(r.user, r.host, o);
+    Authed a = login(r.user, r.host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
@@ -225,14 +235,58 @@ Chan run_shell(Chan ch, Str term0, Bool obfuscate) {
     return done;
 }
 
+@requires(network, filesystem, environment, declassify, terminal, clock(readonly))
+Int dispatch(Str verb, Opts o, Int via) {
+    if (verb == "pin") { return cmd_pin(o, via); }
+    if (verb == "get") { return cmd_get(o, via); }
+    if (verb == "put") { return cmd_put(o, via); }
+    return cmd_run(o, via);
+}
+
+// The target's host as each command names it.
+Str target_host(Str verb, Opts o) {
+    Str spec = if (verb == "pin") { if (o.rest.len() > 0) { o.rest[0] } else { "" } }
+        else { if (verb == "put") { if (o.rest.len() > 1) { o.rest[1] } else { "" } } else { if (o.rest.len() > 0) { o.rest[0] } else { "" } } };
+    List(Str) uh = str_split(spec, "@");
+    Str hp = if (uh.len() == 2) { uh[1] } else { spec };
+    return str_split(hp, ":")[0];
+}
+
+// -J USER@JUMP[:PORT]: log in to the jump host, open a pipe, relay it to
+// the target through a direct-tcpip channel on a second thread, and run
+// the command over the pipe. The region ends when the command's session
+// closes its end of the pipe.
+@requires(network, filesystem, environment, declassify, terminal, clock(readonly))
+Int via_jump(Str verb, Opts o) {
+    List(Str) uh = str_split(o.jump, "@");
+    List(Str) hp = if (uh.len() == 2) { str_split(uh[1], ":") } else { [] };
+    Bool okp = hp.len() == 1 || (hp.len() == 2 && str_is_int(hp[1]) && str_parse_int(hp[1]) > 0 && str_parse_int(hp[1]) < 65536);
+    if (uh.len() != 2 || str_len(uh[0]) == 0 || hp.len() == 0 || str_len(hp[0]) == 0 || !okp) { eprintln("pylon: give the jump host as USER@HOST[:PORT]"); return 2; }
+    Int jport = if (hp.len() == 2) { str_parse_int(hp[1]) } else { 22 };
+    Str target = target_host(verb, o);
+    if (str_len(target) == 0) { return usage(); }
+    Opts jo = Opts {.port = jport, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = false, .force = false, .jump = "", .fwds = [], .rest = [], .err = ""};
+    Authed ja = login(uh[0], hp[0], jo, -1);
+    if (!ja.ok) { eprintln("pylon: jump host " + hp[0] + ": " + ja.why); return 1; }
+    Pipe p = pipe_pair();
+    if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return 1; }
+    Conn jc = ja.c;
+    Int pa = p.a;
+    Int tport = o.port;
+    Result(Int, RegionError) r = spawn (network, declassify) { return relay(jc, pa, target, tport); };
+    Int rc = dispatch(verb, o, p.b);
+    _ = resid_tcp_shutdown(p.b);
+    _ = resid_tcp_close(p.b);
+    Int rr = match r { Ok(v) => v, Err(e) => 1 };
+    return if (rc != 0) { rc } else { rr };
+}
+
 @requires(args, network, filesystem, environment, declassify, terminal, clock(readonly))
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
     Bool sub = verb == "pin" || verb == "get" || verb == "put";
-    Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .fwds = [], .rest = [], .err = ""});
+    Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
-    if (verb == "pin") { return cmd_pin(o); }
-    if (verb == "get") { return cmd_get(o); }
-    if (verb == "put") { return cmd_put(o); }
-    return cmd_run(o);
+    if (str_len(o.jump) > 0) { return via_jump(verb, o); }
+    return dispatch(verb, o, -1);
 }

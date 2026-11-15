@@ -1,0 +1,69 @@
+// ProxyJump (SPEC 5: "ProxyJump: the client connects through it; nothing
+// is forwarded"): `pylon -J USER@JUMP[:PORT] USER@TARGET ...`.
+//
+// Pylon logs in to the jump host (verified under the jump host's own
+// pins), opens a direct-tcpip channel from it to the target, and runs the
+// whole target session (key exchange, host verification under the
+// target's pins, login, channels) through that channel. The jump host
+// relays ciphertext: it cannot read the session, impersonate the target,
+// or use the principal's keys, since the agent is bound to each session
+// separately and no agent is forwarded.
+//
+// The inner session reads and writes a socket, so the channel is joined
+// to it by an in-process pipe: two loopback TCP sockets Pylon connects to
+// each other. The connecting side sends a 32-byte random token that the
+// accepting side checks before anything is relayed, and the listener is
+// closed after its one connection, so a local process that races to
+// connect can only make the attempt fail, never borrow the channel.
+
+import "crypto.resid";
+import "wire.resid";
+import "transport.resid";
+import "forward.resid";
+
+pub type Pipe = { Int a; Int b; Str err; };
+
+Pipe pipe_err(Str e) { return Pipe {.a = -1, .b = -1, .err = e}; }
+
+@requires(network)
+pub Pipe pipe_pair() {
+    Int l = resid_tcp_listen(0);
+    if (l < 0) { return pipe_err("cannot open a loopback listener for the jump pipe"); }
+    Int port = resid_tcp_bound_port(l);
+    Int b = resid_tcp_connect("127.0.0.1", port);
+    Int a = if (b >= 0) { resid_tcp_accept(l) } else { -1 };
+    _ = resid_tcp_close(l);
+    if (a < 0 || b < 0) { return pipe_err("cannot connect the jump pipe"); }
+    List(Int) token = random_bytes(32);
+    _ = resid_tcp_deadline(a, 5000);
+    Bool sent = resid_tcp_send_bin(b, token);
+    List(Int) got = read_n(a, 32, []);
+    _ = resid_tcp_deadline(a, 0);
+    if (!sent || got.len() != 32 || !same_bytes(got, token)) {
+        _ = resid_tcp_close(a);
+        _ = resid_tcp_close(b);
+        return pipe_err("the jump pipe was taken by another local process");
+    }
+    return Pipe {.a = a, .b = b, .err = ""};
+}
+
+@requires(network)
+List(Int) read_n(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_tcp_recv_some(fd, n - acc.len());
+    if (more.len() == 0) { return acc; }
+    return read_n(fd, n, acc.concat(more));
+}
+
+// Relay the pipe end `fd` through a direct-tcpip channel to host:port on
+// the jump connection `jc`, until either side closes. 0, or 1 with the
+// reason on stderr.
+@requires(network, declassify)
+pub Int relay(Conn jc, Int fd, Str host, Int port) {
+    Mux m = mux_new(jc, []);
+    Mux m2 = open_direct(m, Fwd {.lport = 0, .host = host, .hport = port, .lfd = -1}, fd);
+    Mux done = serve(m2, 1);
+    _ = disconnect(done.c, "jump finished");
+    if (str_len(done.err) > 0) { eprintln("pylon: jump host: " + done.err); return 1; }
+    return 0;
+}

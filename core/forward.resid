@@ -119,7 +119,7 @@ Mux accept_all(Mux m, List(Int) ready, Int at, Int i) {
 }
 
 @requires(network, declassify)
-Mux open_direct(Mux m, Fwd f, Int fd) {
+pub Mux open_direct(Mux m, Fwd f, Int fd) {
     Int id = m.next_id;
     List(Int) p = [msg_channel_open()].concat(sstr("direct-tcpip")).concat(u32_be(id)).concat(u32_be(fwd_window())).concat(u32_be(fwd_max_packet()))
         .concat(sstr(f.host)).concat(u32_be(f.hport)).concat(sstr("127.0.0.1")).concat(u32_be(0));

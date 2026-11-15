@@ -17,7 +17,7 @@ WORK="$(mktemp -d)"
 PORT=$((20000 + RANDOM % 20000))
 PASS=0
 FAIL=0
-trap 'kill $(cat "$WORK"/sshd.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $(cat "$WORK"/sshd.pid "$WORK"/target.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 
 cd "$WORK"
 for t in ed25519 ecdsa rsa; do
@@ -173,6 +173,28 @@ check "sftp: a missing remote file"            1 "cannot open" \
     "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/nope" nope.bin
 check "sftp: escape bytes in a name are shown escaped" 1 'x1b.31mred on the server' \
     "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/$(printf '\033[31mred')" red.bin
+
+# --- ProxyJump ------------------------------------------------------------------
+# A second sshd is the target, with its own host key; the first is the jump.
+JT=$((PORT + 5))
+sed -e "s/^Port .*/Port $JT/" -e "s#^PidFile .*#PidFile $WORK/target.pid#" -e "/^HostKey/d" sshd_config > target_config
+echo "HostKey $WORK/host_ecdsa" >> target_config
+"$SSHD" -f target_config -E "$WORK/target.log"; sleep 0.5
+check "jump: an unpinned target is refused"     1 "does not trust a key on first use" \
+    "$PYLON" -J "$USER_NAME@127.0.0.1:$PORT" -p $JT "$USER_NAME@127.0.0.1" true
+check "jump: pin the target through the jump"   0 "pinned" \
+    "$PYLON" pin -J "$USER_NAME@127.0.0.1:$PORT" -p $JT 127.0.0.1 "$(fp host_ecdsa.pub)"
+check "jump: run a command on the target"       0 "via-jump" \
+    "$PYLON" -J "$USER_NAME@127.0.0.1:$PORT" -p $JT "$USER_NAME@127.0.0.1" "echo via-jump"
+check "jump: the target saw the jump host"      0 "" \
+    grep -q "Connection from 127.0.0.1" "$WORK/target.log"
+check "jump: the jump host relayed (direct-tcpip)" 0 "" \
+    grep -q "direct-tcpip" sshd.log
+check "jump: SFTP through the jump"             0 "3145728 bytes" \
+    "$PYLON" get -J "$USER_NAME@127.0.0.1:$PORT" -p $JT "$USER_NAME@127.0.0.1:$RDIR/up.bin" viajump.bin
+check "jump: nothing listening behind the jump" 1 "pylon:" \
+    "$PYLON" -J "$USER_NAME@127.0.0.1:$PORT" -p 1 "$USER_NAME@127.0.0.1" true
+kill "$(cat "$WORK/target.pid")" 2>/dev/null
 
 # --- an agent with no acceptable key -----------------------------------------
 ssh-add -q -D; ssh-keygen -q -t ed25519 -N '' -f stranger; ssh-add -q stranger

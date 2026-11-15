@@ -748,14 +748,24 @@ Implementation findings in the phase-0 code, fixed with this revision:
   selection of its arms: the derivation, checked on its own, verifies
   as resting on the exchange's draw. A masked xor is still, correctly,
   not trusted, since it can cancel.
-- **I6** *Open.* E0270 still warns at Pylon's top-level calls (29
-  sites). The cause is the check's precision, not the keys: a keying
-  requirement records one level of field path, so `seal`'s need for
-  `Dir.key` becomes, at `send_packet`, a need for all of `Conn.tx`, and
-  where a `Conn` is rebuilt from its fields, for every field of the
-  record (the socket number, the receive buffer). Either Resid's check
-  follows multi-level paths, or Pylon threads cipher state outside the
-  connection record; both are planned.
+- **I6** *Open.* E0270 still warns at about 30 sites in Pylon's
+  transport. The cause is the check's precision, not the keys, and it was
+  diagnosed down to three places in Resid's `compiler/ekey.resid`:
+  (a) reading a field of a value that is "one of" several alternatives
+  gives up when one alternative is a parameter passed through unchanged
+  (`return c;` beside `return C { ... }`), and falls back to every field
+  of the record; (b) a merge of more than four alternatives (`ek_meet`)
+  drops record fields entirely; (c) applying a summary that passes one
+  parameter through (`ek_subst`) concatenates it onto an empty base,
+  which also drops fields. A requirement on `Conn.tx` (where the cipher
+  key lives) therefore spreads to the socket number and the receive
+  buffer, which hold nothing unpredictable. Fixing all three brings
+  Pylon from 31 sites to 14, but the combination of (a) and (b) makes the
+  check exceed the compiler's 4 GB budget when Resid compiles itself,
+  and no pair improves on today's count, so none is landed yet. Pylon's
+  `recv_packet` was rewritten with one success and one failure return,
+  which avoids (b) there. Next: bound (a)+(b) by record size or memoize
+  field reads, or thread cipher state outside the connection record.
 - **I7** An event loop could wait on a second packet that never came:
   after a transport-level message (OpenSSH's host-keys announcement),
   the reader looked for the next connection message before returning,
