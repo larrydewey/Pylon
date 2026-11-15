@@ -48,6 +48,12 @@ Conn with_io(Conn c, Dir tx, Dir rx, List(Int) buf, Bool eof) {
         .strict = c.strict, .sig_algs = c.sig_algs, .hostbound = c.hostbound, .ping = c.ping};
 }
 
+// The connection as it is, rebuilt field by field. Transport functions
+// return this rather than their argument itself, so Resid's key-entropy
+// check (E0270) keeps each field's origin apart instead of treating the
+// whole record as one value (SPEC I6).
+pub Conn same(Conn c) { return with_io(c, c.tx, c.rx, c.buf, c.eof); }
+
 pub Conn conn_new(Int fd) {
     return Conn {.fd = fd, .tx = dir_none(), .rx = dir_none(), .buf = [], .eof = false, .err = "",
         .v_s = "", .sid = [], .host_blob = [], .host_sig = [], .host_alg = "",
@@ -63,7 +69,7 @@ pub Bool conn_ok(Conn c) { return str_len(c.err) == 0; }
 // Read until the buffer holds at least n bytes or the peer is done.
 @requires(network, declassify)
 Conn fill(Conn c, Int n) {
-    if (c.buf.len() >= n || c.eof) { return c; }
+    if (c.buf.len() >= n || c.eof) { return same(c); }
     List(Int) more = resid_tcp_recv_some(c.fd, 65536);
     if (more.len() == 0) { return with_io(c, c.tx, c.rx, c.buf, true); }
     return fill(with_io(c, c.tx, c.rx, c.buf.concat(more), false), n);
@@ -71,9 +77,9 @@ Conn fill(Conn c, Int n) {
 
 @requires(network, declassify)
 pub Conn send_raw(Conn c, List(Int) b) {
-    if (!conn_ok(c)) { return c; }
+    if (!conn_ok(c)) { return same(c); }
     if (!resid_tcp_send_bin(c.fd, b)) { return conn_err(c, "the connection closed while sending"); }
-    return c;
+    return same(c);
 }
 
 // ============================================================================
@@ -90,7 +96,7 @@ pub Conn version_exchange(Conn c0) {
 
 @requires(network, declassify)
 Conn read_version(Conn c, Int lines) {
-    if (!conn_ok(c)) { return c; }
+    if (!conn_ok(c)) { return same(c); }
     if (lines > 1024) { return conn_err(c, "the server sent no version line"); }
     Int nl = index_of_nl(c.buf, 0);
     if (nl < 0) {
@@ -121,7 +127,7 @@ Int index_of_nl(List(Int) b, Int i) {
 
 @requires(network, declassify)
 pub Conn send_packet(Conn c, List(Int) payload) {
-    if (!conn_ok(c)) { return c; }
+    if (!conn_ok(c)) { return same(c); }
     Sealed s = seal(c.tx, payload);
     Conn c2 = with_io(c, s.d, c.rx, c.buf, c.eof);
     return send_raw(c2, s.out);
@@ -136,10 +142,10 @@ Pkt pkt_err(Conn c, Str e) { return Pkt {.c = conn_err(c, e), .p = []}; }
 // compiler's key-entropy check precise about the connection's fields.
 @requires(network, declassify)
 pub Pkt recv_packet(Conn c0) {
-    if (!conn_ok(c0)) { return Pkt {.c = c0, .p = []}; }
+    if (!conn_ok(c0)) { return Pkt {.c = same(c0), .p = []}; }
     Conn c = fill(c0, 4);
     Int need = if (c.buf.len() < 4) { -2 } else { need_after_len(c.rx, c.buf[0..4]) };
-    Conn c2 = if (need >= 0) { fill(c, 4 + need) } else { c };
+    Conn c2 = if (need >= 0) { fill(c, 4 + need) } else { same(c) };
     Bool whole = need >= 0 && c2.buf.len() >= 4 + need;
     Opened o = if (whole) { open(c2.rx, c2.buf[0..4 + need]) } else { Opened {.d = c2.rx, .ok = false, .payload = []} };
     Str err = if (need == -2) { "the server closed the connection" }
@@ -166,7 +172,7 @@ pub Str disconnect_reason(List(Int) p) {
 @requires(network, declassify)
 pub Pkt next_msg(Conn c0) {
     Pkt k = next_once(c0);
-    if (!conn_ok(k.c) || k.p.len() > 0) { return k; }
+    if (!conn_ok(k.c) || k.p.len() > 0) { return Pkt {.c = same(k.c), .p = k.p}; }
     return next_msg(k.c);
 }
 
@@ -177,7 +183,7 @@ pub Pkt next_msg(Conn c0) {
 @requires(network, declassify)
 pub Pkt next_once(Conn c0) {
     Pkt k = recv_packet(c0);
-    if (!conn_ok(k.c)) { return k; }
+    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p}; }
     Int t = k.p[0];
     if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return Pkt {.c = k.c, .p = []}; }
     if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
@@ -195,15 +201,15 @@ pub Pkt next_once(Conn c0) {
 // EXT_INFO (RFC 8308): server-sig-algs and publickey-hostbound@openssh.com.
 Conn ext_info(Conn c, List(Int) p) {
     GotInt n = rd_u32(rd_at(p, 1));
-    if (!rd_ok(n.r) || n.v > 64) { return c; }
+    if (!rd_ok(n.r) || n.v > 64) { return same(c); }
     return ext_acc(c, n.r, n.v);
 }
 
 Conn ext_acc(Conn c, Rd r, Int left) {
-    if (left <= 0) { return c; }
+    if (left <= 0) { return same(c); }
     GotText name = rd_text(r);
     Got val = rd_str(name.r);
-    if (!rd_ok(val.r)) { return c; }
+    if (!rd_ok(val.r)) { return same(c); }
     List(Str) algs = if (name.v == "server-sig-algs") { str_split(ascii_text(val.v), ",") } else { c.sig_algs };
     Bool hb = c.hostbound || name.v == "publickey-hostbound@openssh.com";
     Bool pg = c.ping || name.v == "ping@openssh.com";
@@ -318,7 +324,7 @@ List(Str) key_types(List(List(Int)) ps, Int i, List(Str) acc) {
 @requires(network, declassify)
 Pkt kex_packet(Conn c) {
     Pkt k = recv_packet(c);
-    if (!conn_ok(k.c)) { return k; }
+    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p}; }
     Int t = k.p[0];
     if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
     if (!k.c.strict && (t == msg_ignore() || t == msg_debug())) { return kex_packet(k.c); }

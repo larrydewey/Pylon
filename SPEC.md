@@ -764,8 +764,14 @@ Implementation findings in the phase-0 code, fixed with this revision:
   check exceed the compiler's 4 GB budget when Resid compiles itself,
   and no pair improves on today's count, so none is landed yet. Pylon's
   `recv_packet` was rewritten with one success and one failure return,
-  which avoids (b) there. Next: bound (a)+(b) by record size or memoize
-  field reads, or thread cipher state outside the connection record.
+  which avoids (b) there, and the transport's functions return a
+  connection rebuilt field by field (`same(c)`) instead of their
+  argument, which avoids (a): with today's compiler Pylon is at 12 sites
+  (from 31). Extending the rebuilds to `auth.resid` made it worse (112):
+  more precision exposes interior sites without resolving them, so the
+  remaining sites need the analysis itself to scale (bound (a)+(b) by
+  record size, or memoize field reads), or cipher state threaded outside
+  the connection record.
 - **I7** An event loop could wait on a second packet that never came:
   after a transport-level message (OpenSSH's host-keys announcement),
   the reader looked for the next connection message before returning,
