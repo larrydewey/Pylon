@@ -562,11 +562,32 @@ PING 6
 
 Go-back-N per stream, 256 KiB window, 300 ms retransmission timeout.
 
-Limits of v1: `-L` forwards only (no terminal: `pylond` has no
-pseudo-terminal yet), an IPv4 literal host, no rekeying (9.5), no padding
-to 64 bytes, no cookie (`mac2`), no re-attach (10), no Landlock or
-seccomp (8.4); `pylond` exits after `--idle` seconds (default 600)
-without an authenticated packet.
+Further frames (v1): `SHELL 7 | sid | rows (2) | cols (2)` starts the
+principal's login shell on a pseudo-terminal, `RESIZE 9 | sid | rows |
+cols`, `ATTACH 10 | sid | session (4) | rows | cols` joins a kept
+terminal (its first bytes repaint the screen from pylond's emulator),
+`LIST 11 | nonce` / `SESSIONS 12 | nonce | entries`; a terminal's FIN
+carries its exit code. Terminal streams are "external": the link queues
+their bytes and the program moves them, so only pylond holds the right
+to start processes.
+
+Session daemon (10.3, 10.4): the first `pylond serve` for a server
+address becomes the principal's daemon, with a control socket in a 0700
+per-user runtime directory (`$XDG_RUNTIME_DIR` or `/tmp`, `pylon-UID`);
+later ones hand their bootstrap to it and exit, so every re-attach rides
+a fresh SSH login. Clients silent for 15 minutes are dropped; their
+terminals detach and keep running. Lifetime: `--keep` (7 days) without a
+client while terminals run, `--idle` (600 s) otherwise, `--ephemeral` 60 s.
+
+Rekeying (9.5): the client starts a new handshake every 2 minutes;
+pylond switches keys when it answers and refuses data under keys older
+than 3 minutes. Streams carry on.
+
+Limits of v1: `-L` forwards only over the Pylon protocol (`-D`/`-R` stay
+on SSH), an IPv4 literal host, no padding to 64 bytes, no cookie
+(`mac2`), no resume over UDP alone with a ticket (re-attach always takes
+a new SSH login, which is stricter than 10.4 requires), no Landlock or
+seccomp (8.4).
 
 ## 10. Sessions, screen sync and re-attach
 

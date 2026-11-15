@@ -45,6 +45,7 @@ import "proto.resid";
 Int window_bytes() { return 262144; }
 Int chunk_bytes() { return 1100; }
 Int rto_ns() { return 300000000; }
+pub Int key_life_ns() { return 180000000000; }
 
 // A stream: id, local TCP socket (-1 for an external stream), the first
 // unacknowledged offset and those bytes, the next offset to send, the
@@ -63,7 +64,7 @@ pub type Ev = { List(List(Int)) shells; List(List(Int)) resizes; List(List(Int))
 
 pub type Link = {
     Bool server; Int udp; List(Int) addr; Int port; SessionKeys k; Int tx_ctr; Window win;
-    List(St) streams; Int next_sid; Int last_rx; Int last_tx; Str err; Ev ev;
+    List(St) streams; Int next_sid; Int last_rx; Int last_tx; Str err; Ev ev; Int keyed;
 };
 
 Ev ev_none() { return Ev {.shells = [], .resizes = [], .exits = [], .attaches = [], .lists = [], .sessions = []}; }
@@ -79,34 +80,34 @@ Link ev_add(Link l, Int kind, List(Int) v) {
 
 pub Link link_new(Bool server, Int udp, List(Int) addr, Int port, SessionKeys k, Int now) {
     return Link {.server = server, .udp = udp, .addr = addr, .port = port, .k = k, .tx_ctr = 0, .win = window_new(),
-        .streams = [], .next_sid = if (server) { 2 } else { 1 }, .last_rx = now, .last_tx = now, .err = "", .ev = ev_none()};
+        .streams = [], .next_sid = if (server) { 2 } else { 1 }, .last_rx = now, .last_tx = now, .err = "", .ev = ev_none(), .keyed = now};
 }
 
 Link with_streams(Link l, List(St) ss) {
     return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
-        .streams = ss, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = l.ev};
+        .streams = ss, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = l.ev, .keyed = l.keyed};
 }
 
 Link with_ev(Link l, Ev e) {
     return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = e};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = e, .keyed = l.keyed};
 }
 
 pub Link link_err(Link l, Str e) {
     return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = e, .ev = l.ev};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = e, .ev = l.ev, .keyed = l.keyed};
 }
 
 // The same streams over a new local socket (the client moved).
 pub Link link_moved(Link l, Int udp) {
     return Link {.server = l.server, .udp = udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr, .win = l.win,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = l.ev};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = l.last_tx, .err = l.err, .ev = l.ev, .keyed = l.keyed};
 }
 
 // The same streams under keys from a new handshake, to the peer at addr:port.
 pub Link link_rekeyed(Link l, List(Int) addr, Int port, SessionKeys k, Int now) {
     return Link {.server = l.server, .udp = l.udp, .addr = addr, .port = port, .k = k, .tx_ctr = 0, .win = window_new(),
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = now, .err = "", .ev = l.ev};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = now, .err = "", .ev = l.ev, .keyed = now};
 }
 
 // The events, handed to the program once.
@@ -122,7 +123,7 @@ pub Link send_frame(Link l, List(Int) frame, Int now) {
     List(Int) pkt = data_seal(l.k, l.tx_ctr, frame);
     _ = resid_udp_send_to(l.udp, l.addr, l.port, pkt);
     return Link {.server = l.server, .udp = l.udp, .addr = l.addr, .port = l.port, .k = l.k, .tx_ctr = l.tx_ctr + 1, .win = l.win,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = now, .err = l.err, .ev = l.ev};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = l.last_rx, .last_tx = now, .err = l.err, .ev = l.ev, .keyed = l.keyed};
 }
 
 List(Int) u16(Int v) { return [(v >> 8) & 255, v & 255]; }
@@ -189,7 +190,7 @@ pub Link open_stream(Link l, Int fd, Str host, Int port, Int now) {
     Link l2 = send_frame(l, f_open(sid, host, port), now);
     Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, fd, now)]));
     return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
-        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev};
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
 }
 
 // A terminal on pylond (the client): SHELL, then an external stream.
@@ -200,7 +201,7 @@ pub Link open_shell(Link l, Int rows, Int cols, Int now) {
     Link l2 = send_frame(l, f_shell(sid, rows, cols), now);
     Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, -1, now)]));
     return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
-        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev};
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
 }
 
 // Attach to a session pylond keeps (the client): ATTACH, then an
@@ -212,7 +213,7 @@ pub Link attach(Link l, Int session, Int rows, Int cols, Int now) {
     Link l2 = send_frame(l, f, now);
     Link l3 = with_streams(l2, l2.streams.concat([st_new(sid, -1, now)]));
     return Link {.server = l3.server, .udp = l3.udp, .addr = l3.addr, .port = l3.port, .k = l3.k, .tx_ctr = l3.tx_ctr, .win = l3.win,
-        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev};
+        .streams = l3.streams, .next_sid = sid + 2, .last_rx = l3.last_rx, .last_tx = l3.last_tx, .err = l3.err, .ev = l3.ev, .keyed = l3.keyed};
 }
 
 // Ask pylond for its sessions (answered with SESSIONS for this nonce).
@@ -482,6 +483,9 @@ pub Bool for_link(Link l, List(Int) d) { return d.len() > 6 && l.k.ok && data_id
 // window, and its frame handled; dropped silently when it fails.
 @requires(network, declassify)
 pub Link link_input(Link l, List(Int) d, Int now) {
+    // Keys older than 3 minutes are refused (SPEC 9.5): a client rekeys
+    // every 2 minutes.
+    if (l.server && now - l.keyed > key_life_ns()) { return l; }
     DataIn o = data_open(l.k, d[6..d.len()]);
     if (!o.ok) { return l; }
     Seen sn = window_take(l.win, o.ctr);
@@ -490,7 +494,7 @@ pub Link link_input(Link l, List(Int) d, Int now) {
     List(Int) addr = if (l.server) { d[0..4] } else { l.addr };
     Int port = if (l.server) { d[4] * 256 + d[5] } else { l.port };
     Link l2 = Link {.server = l.server, .udp = l.udp, .addr = addr, .port = port, .k = l.k, .tx_ctr = l.tx_ctr, .win = sn.w,
-        .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = l.last_tx, .err = l.err, .ev = l.ev};
+        .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = l.last_tx, .err = l.err, .ev = l.ev, .keyed = l.keyed};
     return on_frame(l2, o.payload, now);
 }
 

@@ -248,6 +248,13 @@ except socket.timeout:
     check "pylon protocol: roaming mid-transfer, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
         bash -c "curl -s -m 60 http://127.0.0.1:$L3/big.bin | sha256sum"
     check "pylon protocol: the client did change sockets" 0 "moved to a new UDP socket" cat pr.log
+    # Rekeying every second during a transfer (the test hook; 2 minutes otherwise).
+    PYLON_TEST_REKEY_SECS=1 "$PYLON" -p $PORT -N -L $((PORT + 12)):127.0.0.1:$W2 --pylond "$PYLOND" "$USER_NAME@127.0.0.1" 2> pk.log & PK=$!
+    for _ in $(seq 100); do grep -q "forwarding" pk.log && break; sleep 0.2; done
+    check "pylon protocol: rekeying mid-transfer, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+        bash -c "sleep 2.5; curl -s -m 60 --limit-rate 600k http://127.0.0.1:$((PORT + 12))/big.bin | sha256sum"
+    check "pylon protocol: the keys did change" 0 "" bash -c "test \$(grep -c 'new session keys' pk.log) -ge 3"
+    kill $PK 2>/dev/null; wait $PK 2>/dev/null
     kill $PR $WEB2 2>/dev/null; wait $PR $WEB2 2>/dev/null
     check "pylon protocol: a terminal (type, resize, paste, exit status)" 0 "interactive ok" \
         python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT --pylond "$PYLOND" "$USER_NAME@127.0.0.1"

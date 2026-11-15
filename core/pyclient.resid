@@ -87,20 +87,21 @@ List(Int) ipv4_at(List(Str) p, Int i, List(Int) acc) {
 // PYLON_TEST_REBIND_AFTER) moves the client to a new UDP socket after that
 // many packets, as a change of network would.
 @requires(network, declassify, clock)
-pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after) {
+pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after, Rk rk) {
     if (str_len(l.err) > 0) { return l; }
     Int now = clock.monotonic_ns();
     List(Int) lfd = listen_fds(fs, 0, []);
     List(Int) sfds = stream_fds(l.streams, 0, []);
     List(Int) fds = [l.udp].concat(lfd).concat(sfds);
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
-    Drained g = drain(l, now, 64, []);
-    Link a = accept_into(g.l, fs, ready, 1, 0, now);
+    Drained g0 = drain(l, now, 64, []);
+    Rekeyed rr = rekey_step(g0.l, rk, g0.other, now);
+    Link a = accept_into(rr.l, fs, ready, 1, 0, now);
     Link b = retransmit(read_streams(a, sfds, ready, 1 + fs.len(), 0, now), 0, now);
     Link c = keepalive(b, now);
     Bool move = rebind_after > 0 && c.tx_ctr >= rebind_after;
     Link d = if (move) { rebind(c) } else { c };
-    return pylon_forwards(d, fs, if (move) { 0 } else { rebind_after });
+    return pylon_forwards(d, fs, if (move) { 0 } else { rebind_after }, rr.rk);
 }
 
 // A new local UDP socket (a new source address and port); the server
@@ -148,7 +149,7 @@ pub List(Fwd) listen_local(List(Fwd) fs, Int i, List(Fwd) acc) {
 // the same sealed size as a one-key frame, as over SSH (SPEC 5, 9.4); the
 // terminal's size is checked every pass and sent when it changed. Returns
 // the shell's exit code (255 when the stream was reset).
-pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; };
+pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; Rk rk; };
 
 @requires(network, declassify, terminal, clock(readonly))
 pub Int pylon_shell(Sh h, List(Fwd) fs) {
@@ -168,7 +169,9 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     List(Int) fds = [l0.udp].concat(kb).concat(lfd).concat(sfds);
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), wait_ms(h.k, now));
     Int t = clock.monotonic_ns();
-    Drained g = drain(l0, t, 64, []);
+    Drained g1 = drain(l0, t, 64, []);
+    Rekeyed rr = rekey_step(g1.l, h.rk, g1.other, t);
+    Drained g = Drained {.l = rr.l, .other = []};
     Bool key = !h.in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
     Int rm = room(g.l, h.sid);
     List(Int) got = if (key && rm > 0) { resid_read_some(if (rm < 4096) { rm } else { 4096 }) } else { [] };
@@ -196,7 +199,7 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     Bool move = h.rebind > 0 && l5.tx_ctr >= h.rebind;
     Link l6 = if (move) { rebind(l5) } else { l5 };
     return pylon_shell(Sh {.l = l6, .sid = h.sid, .rows = if (changed) { nr } else { h.rows }, .cols = if (changed) { nc } else { h.cols },
-        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }}, fs);
+        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }, .rk = rr.rk}, fs);
 }
 
 // The exit code reported for sid: -2 when none, -1 when the stream was reset.
@@ -258,3 +261,39 @@ pub Bool print_sessions(List(List(Int)) items, Int i) {
 }
 
 Str pad(Str s, Int n) { return if (str_len(s) >= n) { s + " " } else { pad(s + " ", n) }; }
+
+// ============================================================================
+// Rekeying (SPEC 9.5)
+// ============================================================================
+
+// A new handshake every `every` ns (2 minutes; pylond refuses keys older
+// than 3): a fresh ephemeral X25519 and ML-KEM key, so each period's keys
+// are forward-secret on their own. pylond switches to the new keys when
+// it answers; streams carry on (what is lost in between is resent).
+pub type Rk = { Boot b; Static c; Bool waiting; Pending p; Int sent; Int every; };
+pub type Rekeyed = { Link l; Rk rk; };
+
+@requires(declassify)
+pub Rk rk_new(Boot b, Static c, Int every) { return Rk {.b = b, .c = c, .waiting = false, .p = Pending {.pkt = [], .ck = [], .h = [], .e = c, .kem = mlkem768_keygen(), .idx = 0}, .sent = 0, .every = every}; }
+
+@requires(network, declassify, clock(readonly))
+pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
+    // An answer to our initiation.
+    List(Int) resp = if (r.waiting) { response(others, 0) } else { [] };
+    SessionKeys k = if (resp.len() > 0) { hs_finish(r.b, r.c, r.p, resp) } else { SessionKeys {.ok = false, .tx = [], .rx = [], .my_idx = 0, .their_idx = 0} };
+    _ = if (k.ok && r.every < 120000000000) { eprintln("pylon: new session keys (test hook)\r") } else { true };
+    if (k.ok) { return Rekeyed {.l = link_rekeyed(l, l.addr, l.port, k, now), .rk = Rk {.b = r.b, .c = r.c, .waiting = false, .p = r.p, .sent = r.sent, .every = r.every}}; }
+    // Time for new keys, or an initiation unanswered for a second.
+    Bool due = (!r.waiting && now - l.keyed >= r.every) || (r.waiting && now - r.sent > 1000000000);
+    if (!due) { return Rekeyed {.l = l, .rk = r}; }
+    Pending p = hs_init(r.b, r.c, clock.now_ns());
+    _ = resid_udp_send_to(l.udp, l.addr, l.port, p.pkt);
+    return Rekeyed {.l = l, .rk = Rk {.b = r.b, .c = r.c, .waiting = true, .p = p, .sent = now, .every = r.every}};
+}
+
+List(Int) response(List(List(Int)) xs, Int i) {
+    if (i >= xs.len()) { return []; }
+    List(Int) d = xs[i];
+    if (d.len() == 6 + resp_len() && d[6] == 2) { return d[6..d.len()]; }
+    return response(xs, i + 1);
+}

@@ -235,6 +235,8 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     Str rb = environment.get("PYLON_TEST_REBIND_AFTER");
     Int rebind_after = if (str_is_int(rb)) { str_parse_int(rb) } else { 0 };
     Link l0 = link_new(false, udp, addr, st.b.port, k, clock.monotonic_ns());
+    Str rks = environment.get("PYLON_TEST_REKEY_SECS");
+    Rk rk = rk_new(st.b, st.bc.c, if (str_is_int(rks) && str_parse_int(rks) > 0) { str_parse_int(rks) * 1000000000 } else { 120000000000 });
     if (sessions) {
         Listed ls0 = list_sessions(l0, 0, clock.monotonic_ns());
         if (!ls0.ok) { eprintln("pylon: pylond did not list its sessions"); return 1; }
@@ -248,11 +250,11 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
         _ = if (pick >= 0) { eprintln("pylon: attaching to session " + f"{pick}") } else { true };
         Link l1 = if (pick >= 0) { attach(found.l, pick, rows, cols, clock.monotonic_ns()) } else { open_shell(found.l, rows, cols, clock.monotonic_ns()) };
         _ = resid_term_raw();
-        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after}, ls);
+        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk}, ls);
         _ = resid_term_restore();
         return code;
     }
-    Link done = pylon_forwards(l0, ls, rebind_after);
+    Link done = pylon_forwards(l0, ls, rebind_after, rk);
     eprintln("pylon: " + done.err);
     return 1;
 }
