@@ -800,18 +800,130 @@ the emulator:
 
 ## 13. The local shell
 
-A Termux-like local userland is a later phase (17), and is **isolated by
-construction**:
+A shell on the device itself, for the principal's own work there, is
+**isolated by construction** (G8): it cannot reach Pylon's keys (there
+are none, but it cannot reach the agent either), the host database,
+Pylon's sessions or connections, or Symbolon. It is drawn in purple,
+"this device", never in a server's colours, and Pylon's own prompts are
+never drawn inside it (12).
 
-- It runs as a separate Android app UID (a companion package
-  `dev.pylon.local`), or in an `isolatedProcess` service where the
-  userland allows, never in Pylon's process.
-- It has no access to Pylon's storage, no binding to Symbolon's agent
-  service (the signature permission is not granted to it), and no IPC to
-  Pylon other than a terminal byte stream Pylon renders.
-- Pylon can SSH *from* the local shell only through a socket the
-  principal explicitly exposes for that session, which goes through the
-  same host trust and consent as any other connection.
+**Shape.** `pylon-local` (`cli/pylon_local.resid`) is a small Resid
+launcher the app starts in place of `pylon --app`, with the same frames
+(1 keys, 2 a size; back: 1 output, 4 ready, and 5 the exit status, last).
+Its output goes through `pylon-term`, the confined emulator, like any
+host's (12), and the app relays bytes without parsing them. The launcher
+forks a PTY broker (the only process that starts the shell), then
+confines itself (`resid_sandbox_confine`: no files, no execution) before
+it reads a byte from the shell or the app. When the app closes the pane
+it closes the launcher's input; the launcher hangs the terminal up, which
+ends the shell.
+
+The shell itself cannot run under `resid_sandbox_confine`: that seccomp
+filter refuses `execve` and `fork`, and a shell that cannot run programs
+is no shell. Resid gives programs no other way to restrict a child
+(`resid_raw_syscall` is internal to its runtime), so on Linux the
+confinement is built from the kernel's namespaces by `unshare(1)`
+(util-linux), as below.
+
+**Linux (desktop).**
+
+- The app starts `pylon-local` with an environment of `HOME`, `SHELL`,
+  `LANG`, `USER`, `PATH`, `PYLON_HOME` and `SSH_AUTH_SOCK` only; the last
+  two are read solely to refuse a layout where the local shell's home
+  would contain Pylon's files or the agent's socket. The shell gets none
+  of it: it starts under `env -i` with `HOME`, `TERM`, a fixed `PATH`,
+  `SHELL`, `LANG`, `USER`/`LOGNAME` and `PYLON_LOCAL=1`. No
+  `SSH_AUTH_SOCK`, `PYLON_HOME`, `XDG_RUNTIME_DIR`, `DISPLAY`,
+  `WAYLAND_DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`.
+- `unshare --user --map-root-user --mount --pid --fork --kill-child
+  --net` runs an init script the launcher writes at each start
+  (`~/.local/share/pylon-local/init-v1.sh`). As root of the new user
+  namespace (the principal's own uid outside) it builds a new root on a
+  tmpfs: `/usr`, `/etc`, `/opt` and the `/bin`, `/sbin`, `/lib*` links
+  or directories of the system, bind-mounted read-only; a fresh `/dev`
+  (null, zero, full, random, urandom, tty, a new devpts instance, shm);
+  a fresh `/proc` of the new pid namespace; empty `/tmp`, `/var/tmp` and
+  `/run`; and the local shell's own home, `~/.local/share/pylon-local/home`,
+  mounted at `$HOME`. It `pivot_root`s into it, unmounts the old root,
+  makes `/` read-only, and runs the shell as the principal's uid in a
+  nested user namespace, which locks every mount made before it (the
+  shell cannot unmount them to uncover anything). The shell gets a
+  terminal of its own from that root's devpts through `script(1)`, so
+  job control works although the outer terminal's session leader is
+  outside its pid namespace. Any step that fails stops the init: the
+  shell never runs unconfined.
+- What that guarantees, and `tests/local_shell.sh` checks (with bash and
+  dash, as the principal and as an unprivileged user): the shell cannot
+  read `PYLON_HOME` (`known_hosts`, the host list, pins), nor anything
+  else of the real home directory (`~/.ssh`, Symbolon's vault), nor
+  `/run` and `XDG_RUNTIME_DIR` (agent sockets, the session bus), nor
+  other users' files: none of them is in its root. It cannot connect to
+  `SSH_AUTH_SOCK` (the path does not exist there). Pylon's processes
+  (`pylon --app`, `pylon-term`, the app) are outside its pid namespace:
+  it cannot signal or trace them or read their `/proc/PID/environ`,
+  `mem` or `fd`. It has no network (only a loopback that is down), so
+  it reaches neither Pylon's loopback forwards (11) nor abstract Unix
+  sockets (X11, D-Bus), which belong to the network namespace. Setuid
+  programs do not raise its privileges (their owner is not mapped in its
+  user namespace).
+- What it does not guarantee: it can read what the system directories
+  hold for every user (`/usr`, `/etc`), and it runs as the principal's
+  uid, so files it writes in its home are the principal's. It is not a
+  seccomp sandbox: the full system-call surface of the kernel is
+  reachable, so a kernel bug reachable from an unprivileged user
+  namespace is reachable from it. The setting "Give the local shell the
+  network" (off by default) leaves it the device's network, and with it
+  Pylon's loopback forwards and any abstract socket. It needs a kernel
+  and distribution that allow unprivileged user namespaces; where they
+  are refused (for example Ubuntu's AppArmor restriction on them) the
+  local shell does not start, and says so.
+
+**Android.** Linux namespaces are not available to apps; Android's
+isolation is the app UID and SELinux, so the strongest available sandbox
+is an `isolatedProcess` service, and that is what Pylon uses.
+
+- `LocalShellService` is declared `android:isolatedProcess="true"` in
+  its own process (`:local`), not exported. Android runs it under a UID
+  allocated for that process alone (the `isolated_app` SELinux domain),
+  with no permissions: no `INTERNET`, so no network; no storage, so it
+  cannot open Pylon's files directory (PYLON_HOME, the host list, pins,
+  the pylond builds); it cannot look up system services beyond the
+  minimum, and cannot bind Symbolon's agent service, which requires a
+  signature permission an isolated UID never holds. It is a different
+  UID from Pylon's, so it cannot signal or trace Pylon's processes or
+  read their `/proc` entries.
+- Per shell, the activity hands the service one end of a socket pair
+  over binder; the service runs `libpylon_local.so --android` from the
+  APK's native library directory with an empty environment and relays
+  the pair to it; the launcher starts `/system/bin/sh` on a PTY of its own
+  (from the core, `resid_pty_*`) under `env -i` and confines itself. The
+  launcher's error output comes back as frames of type 7, text for the
+  principal. Nothing but that byte stream crosses between the sandbox and
+  Pylon; the emulator runs in Pylon's process tree as for any session.
+- What does not hold on Android in this version: the local shell has no
+  storage at all (an isolated process has none), so it is a shell over
+  the system's own tools (toybox), not a userland one can install
+  packages into; that needs the companion package below. Whether
+  `isolated_app` may execute the launcher from the native library
+  directory and open `/dev/ptmx` depends on the device's SELinux policy;
+  it has not been verified on a device. Where it is refused, the shell
+  reports the refusal and does not start; Pylon never falls back to
+  running a shell in its own UID.
+- Later: a companion package, `dev.pylon.local`, with its own UID and
+  storage, for a persistent userland; the same frames over a socket the
+  companion opens to Pylon, and the same rule that nothing else crosses.
+
+**SSH from the local shell: deferred.** Pylon would let the local shell
+reach a host only through a socket the principal grants for one
+session, going through the same host trust and consent as any other
+connection. It is not implemented: it needs a per-session grant and its
+own consent sheet, a socket that exists inside the shell's root (Linux)
+or is passed into the isolated process (Android) without becoming a
+general channel back into Pylon, and a server side in the core that runs
+the full connection path (6, 7) for a request whose origin is the
+sandbox. Until then the local shell has no way to ask Pylon for
+anything, which is the property G8 needs; the principal opens hosts in
+Pylon beside it.
 
 ## 14. Storage and synchronization
 
@@ -841,7 +953,27 @@ content.
 - **Screenshots and recents.** `FLAG_SECURE` keeps terminal content out
   of screenshots, screen recording and the recents thumbnail by default.
 - **Linux desktop (phase 2).** Tabs and splits; `SSH_AUTH_SOCK` to
-  `symbolon ssh-agent`; `pylon` CLI.
+  `symbolon ssh-agent`; `pylon` CLI. *Done in the app
+  (`app/lib/desktop/`):* each tab is a tree of panes, each pane its own
+  session (a host's, or a local shell, 13), split side by side or one
+  above the other, with dividers that can be dragged (10% to 90%). Each
+  pane's terminal takes its size from its own area and resizes its
+  session (and its emulator) when a split, a closed pane, a dragged
+  divider or the window changes it. Keys go to the focused pane only; a
+  click focuses a pane. Shortcuts take Ctrl+Shift, which shells leave
+  alone, and are never sent to the host: Ctrl+Shift+T a new tab (a
+  palette of hosts and the local shell), Ctrl+Shift+L a local shell,
+  Ctrl+Shift+E and Ctrl+Shift+O split right and down with a new session
+  to the focused pane's host, Ctrl+Shift+W close the focused pane,
+  Ctrl+Shift+arrows move the focus, Ctrl+PageUp/PageDown change tabs,
+  Ctrl+Shift+V paste (with the confirmations of 12), Ctrl+Shift+K the
+  palette. Closing a pane ends its session; closing a tab ends all of
+  its sessions; a tab goes with its last pane. A host not yet pinned
+  opens the pinning page, never a session (6). The title bar shows the
+  tabs (the local shell in purple, a host tagged `production` in red);
+  the status bar, what protects the focused pane. Phones and tablets
+  keep the one-terminal layout (`PYLON_LAYOUT=phone` forces it on a
+  desktop).
 - **Windows, macOS, iOS (phase 3+).** Requires Symbolon on those
   platforms first; the core needs Resid targets for them.
 
@@ -873,7 +1005,7 @@ content.
 | 1b | Without Symbolon (7.6): hardware keys, external agents, imported key files, with the warning. |
 | 2 | `pylond`: delivery (8) with reproducible, logged releases; Pylon protocol (9); persistent sessions with signed re-attach, screen sync and scrollback (10); Pylon streams (11); formal models and external review. Linux desktop app. |
 | 3 | Restricted agent forwarding, SSHFP/DNSSEC resolver, host and user certificates, organization policy. |
-| 4 | Local shell (13). Windows, macOS, iOS. |
+| 4 | Local shell (13). Windows, macOS, iOS. *Begun: the local shell on Linux (namespaces) and Android (an isolated process), without storage on Android and without SSH from it.* |
 | 5 | Direct Pylon authentication without SSH on hosts that run `pylond`: Symbolon-signed handshakes and optional host attestation (SEV-SNP, TDX, TPM via Resid's `lib/verify/`). |
 
 ## 18. Open questions
