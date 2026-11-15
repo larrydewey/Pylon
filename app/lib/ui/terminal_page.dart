@@ -1,17 +1,19 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../backend/model.dart';
-import '../term/keys.dart';
+import '../backend/select.dart';
 import '../term/term_view.dart';
 import '../theme.dart';
 import 'app_state.dart';
+import 'prompts.dart';
 import 'session_page.dart';
 import 'widgets.dart';
 
+/// One terminal, full screen (phones and tablets). For the local shell
+/// ([Host.local]) it is drawn in purple, "this device", with what the
+/// sandbox keeps out stated under the terminal (SPEC 13).
 class TerminalPage extends StatefulWidget {
   const TerminalPage({super.key, required this.st, required this.host});
   final AppState st;
@@ -27,6 +29,8 @@ class _TerminalPageState extends State<TerminalPage> {
   final view = GlobalKey<TermViewState>();
   bool ctrl = false, alt = false;
 
+  bool get local => widget.host.local;
+
   @override
   void initState() {
     super.initState();
@@ -34,7 +38,7 @@ class _TerminalPageState extends State<TerminalPage> {
     sub = s.changes.listen((_) {
       if (!mounted) return;
       setState(() {});
-      _clipboard();
+      askClipboard(context, s);
     });
   }
 
@@ -42,77 +46,6 @@ class _TerminalPageState extends State<TerminalPage> {
   void dispose() {
     sub?.cancel();
     super.dispose();
-  }
-
-  // OSC 52: a program on the host wants to write to the clipboard. Asked
-  // every time (SPEC 12); never the other way round.
-  Future<void> _clipboard() async {
-    if (s.clipboardRequests.isEmpty) return;
-    final req = s.clipboardRequests.removeAt(0);
-    String text;
-    try {
-      text = utf8.decode(base64.decode(String.fromCharCodes(req)), allowMalformed: true);
-    } catch (_) {
-      return;
-    }
-    final ok = await showModalBottomSheet<bool>(
-      context: context,
-      backgroundColor: P.surface,
-      builder: (c) => Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Let ${widget.host.name} copy to your clipboard?', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 8),
-          Text('A program on the server wants to put ${text.length} characters on this device\'s clipboard. Programs on a server can never read your clipboard.', style: const TextStyle(color: Color(0xFFC9D1DB))),
-          const SizedBox(height: 12),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(color: P.ink2, borderRadius: BorderRadius.circular(10), border: Border.all(color: P.line)),
-            child: Text(visible(text.length > 300 ? '${text.substring(0, 300)}…' : text), style: const TextStyle(fontFamily: mono, fontSize: 12)),
-          ),
-          const SizedBox(height: 14),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Allow this once')),
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text("Don't allow")),
-        ]),
-      ),
-    );
-    if (ok == true) await Clipboard.setData(ClipboardData(text: text));
-  }
-
-  Future<void> _paste() async {
-    final d = await Clipboard.getData(Clipboard.kTextPlain);
-    final t = d?.text ?? '';
-    if (t.isEmpty) return;
-    final bracketed = s.screen.bracketedPaste;
-    if (KeyEncoder.pasteNeedsConfirm(t, bracketed: bracketed)) {
-      if (!mounted) return;
-      final lines = '\n'.allMatches(t).length + 1;
-      final ok = await showModalBottomSheet<bool>(
-        context: context,
-        backgroundColor: P.surface,
-        builder: (c) => Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Paste $lines lines into the shell?', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            const Text("The program running isn't expecting a paste, so each line would run as a command as soon as it arrives.", style: TextStyle(color: Color(0xFFC9D1DB))),
-            const SizedBox(height: 12),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: P.ink2, borderRadius: BorderRadius.circular(10), border: Border.all(color: P.line)),
-              child: Text(visible(t.length > 600 ? '${t.substring(0, 600)}…' : t), style: const TextStyle(fontFamily: mono, fontSize: 12)),
-            ),
-            const SizedBox(height: 14),
-            FilledButton(onPressed: () => Navigator.pop(c, true), child: Text('Paste $lines lines')),
-            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
-          ]),
-        ),
-      );
-      if (ok != true) return;
-    }
-    s.input(KeyEncoder.paste(t, bracketed: bracketed));
   }
 
   Widget _key(String label, List<int> bytes, {bool latched = false, VoidCallback? onTap}) => Expanded(
@@ -124,40 +57,65 @@ class _TerminalPageState extends State<TerminalPage> {
               style: OutlinedButton.styleFrom(
                 padding: EdgeInsets.zero,
                 minimumSize: const Size(0, 44),
-                backgroundColor: latched ? P.tealDeep : P.surface,
-                side: BorderSide(color: latched ? P.tealLine : P.line),
+                backgroundColor: latched ? (local ? P.purpleLine : P.tealDeep) : (local ? P.localKey : P.surface),
+                side: BorderSide(color: latched ? (local ? P.purple : P.tealLine) : (local ? P.purpleLine : P.line)),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
-              onPressed: onTap ?? () {
-                s.input(bytes);
-                view.currentState?.focus();
-              },
-              child: Text(label, style: TextStyle(fontFamily: mono, fontSize: 13, color: latched ? P.tealText : P.text)),
+              onPressed: onTap ??
+                  () {
+                    s.input(bytes);
+                    view.currentState?.focus();
+                  },
+              child: Text(label, style: TextStyle(fontFamily: mono, fontSize: 13, color: latched ? (local ? P.purple : P.tealText) : (local ? P.localText : P.text))),
             ),
           ),
         ),
       );
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _title() {
     final h = widget.host;
     final ended = s.exitCode != null;
-    return Scaffold(
-      backgroundColor: P.ink2,
+    if (local) {
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Local shell · $deviceName', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: P.localText)),
+        Text(ended ? 'Ended (${s.exitCode})' : 'Sandboxed · no network to your hosts · no keys', style: const TextStyle(fontSize: 12, color: P.localMuted)),
+      ]);
+    }
+    return InkWell(
+      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(st: widget.st, host: h))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(s.title.isNotEmpty ? visible(s.title) : h.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        Row(children: [
+          Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : P.teal, shape: BoxShape.circle)),
+          const SizedBox(width: 6),
+          Text(ended ? 'Ended (${s.exitCode})' : (h.mode == Mode.pylon ? 'Pylon · post-quantum · roaming' : 'SSH · pinned host key'), style: const TextStyle(fontSize: 12, color: P.muted)),
+        ]),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final page = Scaffold(
+      backgroundColor: local ? P.localInk : P.ink2,
       appBar: AppBar(
         titleSpacing: 0,
-        title: InkWell(
-          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(st: widget.st, host: h))),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(s.title.isNotEmpty ? visible(s.title) : h.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            Row(children: [
-              Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : P.teal, shape: BoxShape.circle)),
-              const SizedBox(width: 6),
-              Text(ended ? 'Ended (${s.exitCode})' : (h.mode == Mode.pylon ? 'Pylon · post-quantum · roaming' : 'SSH · pinned host key'), style: const TextStyle(fontSize: 12, color: P.muted)),
-            ]),
-          ]),
-        ),
-        actions: [IconButton(tooltip: 'Paste', icon: const Icon(Icons.content_paste), onPressed: _paste)],
+        backgroundColor: local ? P.purpleDeep : P.ink,
+        foregroundColor: local ? P.localText : P.text,
+        shape: local ? const Border(bottom: BorderSide(color: P.purpleLine)) : null,
+        title: _title(),
+        actions: [
+          IconButton(tooltip: 'Paste', icon: const Icon(Icons.content_paste), onPressed: () => pasteInto(context, s)),
+          if (local && s.exitCode == null)
+            IconButton(
+              tooltip: 'End the local shell',
+              icon: const Icon(Icons.close),
+              onPressed: () {
+                widget.st.end(s);
+                Navigator.pop(context);
+              },
+            ),
+        ],
       ),
       body: Column(children: [
         if (s.status.trim().isNotEmpty)
@@ -174,13 +132,15 @@ class _TerminalPageState extends State<TerminalPage> {
             screen: s.screen,
             ctrl: ctrl,
             alt: alt,
+            cursor: local ? P.purple : P.teal,
             onModsUsed: () => setState(() => ctrl = alt = false),
             onInput: s.input,
             onResize: s.resize,
           ),
         ),
+        if (local) const LocalNote(),
         Container(
-          color: P.ink,
+          decoration: BoxDecoration(color: local ? P.purpleDeep : P.ink, border: local ? const Border(top: BorderSide(color: P.purpleLine)) : null),
           padding: const EdgeInsets.fromLTRB(5, 4, 5, 8),
           child: Row(children: [
             _key('Esc', [27]),
@@ -195,5 +155,26 @@ class _TerminalPageState extends State<TerminalPage> {
         ),
       ]),
     );
+    // The local shell's frame: purple all round, "this device".
+    return local ? DecoratedBox(position: DecorationPosition.foreground, decoration: BoxDecoration(border: Border.all(color: P.purpleLine, width: 3)), child: page) : page;
   }
+}
+
+/// What the local shell's sandbox keeps out, under its terminal.
+class LocalNote extends StatelessWidget {
+  const LocalNote({super.key});
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(color: P.purpleDeep, borderRadius: BorderRadius.circular(12), border: Border.all(color: P.purpleLine)),
+        child: Text(
+          desktopLayout
+              ? 'A sandbox of its own: its own home directory, no network, nothing of Pylon\'s files, agent or sessions. Purple always means "this computer", never a server.'
+              : 'A separate sandbox with its own user ID: it can\'t see Pylon\'s hosts, keys, sessions or Symbolon, and has no network or storage. Purple always means "this phone", never a server.',
+          style: const TextStyle(fontSize: 12, height: 1.5, color: P.localMuted),
+        ),
+      );
 }

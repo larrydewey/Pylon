@@ -30,8 +30,12 @@ class Palette {
 
 /// Draws a [Screen] and turns keys into bytes for the host. Ctrl and Alt
 /// may be latched by the extra-keys row ([ctrl], [alt]).
+///
+/// Focus sits on a hidden text field, so a soft keyboard or an input
+/// method has somewhere to type into; keys it does not turn into text
+/// (Enter, arrows, Ctrl and Alt chords) bubble up to this view first.
 class TermView extends StatefulWidget {
-  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed});
+  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed, this.autofocus = false, this.onFocused, this.cursor = P.teal, this.reserved});
 
   final Screen screen;
   final void Function(List<int> bytes) onInput;
@@ -39,25 +43,54 @@ class TermView extends StatefulWidget {
   final double fontSize;
   final bool ctrl, alt;
   final VoidCallback? onModsUsed;
+  final bool autofocus;
+
+  /// Called when this view takes the keyboard focus (a click, a tap).
+  final VoidCallback? onFocused;
+
+  /// The cursor's colour: teal for a host, purple for the local shell.
+  final Color cursor;
+
+  /// Keys the window keeps for itself (the desktop's shortcuts): never
+  /// sent to the host.
+  final bool Function(KeyEvent e)? reserved;
 
   @override
   State<TermView> createState() => TermViewState();
 }
 
 class TermViewState extends State<TermView> {
-  final _focus = FocusNode();
+  final _focus = FocusNode(skipTraversal: true);
+  final _textFocus = FocusNode();
   final _text = TextEditingController();
   int _rows = 0, _cols = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.autofocus) WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? focus() : null);
+  }
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    _textFocus.dispose();
+    _text.dispose();
+    super.dispose();
+  }
+
+  bool get hasFocus => _focus.hasFocus;
 
   Size _cell() {
     final tp = TextPainter(text: TextSpan(text: 'M', style: TextStyle(fontFamily: mono, fontSize: widget.fontSize, height: 1.25)), textDirection: TextDirection.ltr)..layout();
     return Size(tp.width, tp.height);
   }
 
-  void focus() => _focus.requestFocus();
+  void focus() => _textFocus.requestFocus();
 
   KeyEventResult _onKey(FocusNode node, KeyEvent e) {
     if (e is KeyUpEvent) return KeyEventResult.ignored;
+    if (widget.reserved?.call(e) ?? false) return KeyEventResult.handled;
     final hk = HardwareKeyboard.instance;
     final ctrl = hk.isControlPressed || widget.ctrl;
     final alt = hk.isAltPressed || widget.alt;
@@ -93,8 +126,11 @@ class TermViewState extends State<TermView> {
         child: Focus(
           focusNode: _focus,
           onKeyEvent: _onKey,
+          onFocusChange: (has) {
+            if (has) widget.onFocused?.call();
+          },
           child: Stack(children: [
-            Positioned.fill(child: Container(color: P.ink2, padding: const EdgeInsets.fromLTRB(8, 4, 8, 4), child: CustomPaint(painter: _ScreenPainter(widget.screen, cell, widget.fontSize)))),
+            Positioned.fill(child: Container(color: P.ink2, padding: const EdgeInsets.fromLTRB(8, 4, 8, 4), child: CustomPaint(painter: _ScreenPainter(widget.screen, cell, widget.fontSize, widget.cursor)))),
             // Typed text arrives here (soft keyboards): sent at once and
             // cleared, with suggestions and learning off (SPEC 15).
             Positioned(
@@ -106,6 +142,7 @@ class TermViewState extends State<TermView> {
                 opacity: 0,
                 child: TextField(
                   controller: _text,
+                  focusNode: _textFocus,
                   autocorrect: false,
                   enableSuggestions: false,
                   enableIMEPersonalizedLearning: false,
@@ -128,10 +165,11 @@ class TermViewState extends State<TermView> {
 }
 
 class _ScreenPainter extends CustomPainter {
-  _ScreenPainter(this.s, this.cell, this.fontSize);
+  _ScreenPainter(this.s, this.cell, this.fontSize, this.cursor);
   final Screen s;
   final Size cell;
   final double fontSize;
+  final Color cursor;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -148,7 +186,7 @@ class _ScreenPainter extends CustomPainter {
         }
         final cursorHere = s.cursorVisible && x == s.cx && y == s.cy;
         if (cursorHere) {
-          bg = P.teal;
+          bg = cursor;
           fg = P.ink2;
         }
         final r = Rect.fromLTWH(x * cell.width, y * cell.height, cell.width + 0.5, cell.height + 0.5);
@@ -177,5 +215,5 @@ class _ScreenPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_ScreenPainter old) => !identical(old.s, s) || old.cell != cell;
+  bool shouldRepaint(_ScreenPainter old) => !identical(old.s, s) || old.cell != cell || old.cursor != cursor;
 }

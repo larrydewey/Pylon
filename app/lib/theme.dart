@@ -23,6 +23,11 @@ class P {
   static const purple = Color(0xFFC4B5FD);
   static const purpleDeep = Color(0xFF17131F);
   static const purpleLine = Color(0xFF3A2F52);
+  // The local shell (purple always means "this device", never a server).
+  static const localInk = Color(0xFF0D0B12);
+  static const localText = Color(0xFFECE7F6);
+  static const localMuted = Color(0xFFB7AECB);
+  static const localKey = Color(0xFF211B2D);
 }
 
 const mono = 'JetBrainsMono';
