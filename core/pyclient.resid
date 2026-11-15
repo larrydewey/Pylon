@@ -28,6 +28,20 @@ pub Str run_command(Str hash, Int idle, Bool ephemeral, Bool unconfined) {
         + "test \"$(sha256sum \"$f\" | cut -c1-64)\" = " + hash + " && exec \"$f\" serve --run \"$r\" --idle " + f"{idle}" + (if (ephemeral) { " --ephemeral" } else { "" }) + (if (unconfined) { " --allow-unconfined" } else { "" });
 }
 
+// The host's machine type (`uname -m`), for picking the pylond build:
+// "x86_64" or "aarch64" (arm64 named so), else what it said.
+pub type Arch = { Conn c; Str arch; Str err; };
+
+@requires(network, declassify)
+pub Arch host_arch(Conn c0) {
+    Chan ch = open_session(c0);
+    if (!chan_ok(ch)) { return Arch {.c = ch.c, .arch = "", .err = ch.err}; }
+    Chan done = pump(send_eof(exec(capturing(ch), "uname -m")));
+    if (!chan_ok(done)) { return Arch {.c = done.c, .arch = "", .err = done.err}; }
+    Str a = str_trim(ascii_text(done.inbox));
+    return Arch {.c = done.c, .arch = if (a == "arm64") { "aarch64" } else { a }, .err = ""};
+}
+
 pub type Pushed = { Conn c; Str err; };
 
 @requires(network, declassify)

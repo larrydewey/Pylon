@@ -14,11 +14,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // The Resid core ships as executables named lib*.so (jniLibs/arm64-v8a,
+    // copied there by tools/android-core.sh); they must be extracted to
+    // nativeLibraryDir to be executable.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "dev.pylon.pylon"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION

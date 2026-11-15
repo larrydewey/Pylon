@@ -17,6 +17,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # pylond builds pushed to servers (tools/android-core.sh)
+    - assets/pylond/
   fonts:
     # JetBrains Mono 2.304 (SIL Open Font License 1.1, assets/fonts/JetBrainsMono-OFL.txt)
     - family: JetBrainsMono

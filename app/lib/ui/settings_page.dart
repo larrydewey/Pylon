@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../backend/select.dart';
 import '../theme.dart';
 import 'app_state.dart';
 import 'warning_page.dart';
@@ -50,7 +51,10 @@ class _SettingsPageState extends State<SettingsPage> {
               title: const Text('Block screenshots'),
               subtitle: const Text('Also hides the terminal in recent apps', style: TextStyle(color: P.muted)),
               value: st.blockScreenshots,
-              onChanged: (v) => setState(() => st.blockScreenshots = v),
+              onChanged: (v) {
+                setState(() => st.blockScreenshots = v);
+                setSecure(v);
+              },
             ),
           ]),
         ),

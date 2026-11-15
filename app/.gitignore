@@ -46,3 +46,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# The Resid core, built by tools/android-core.sh
+/android/app/src/main/jniLibs/
+/assets/pylond/pylond-*

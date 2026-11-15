@@ -7,10 +7,11 @@ import 'ui/hosts_page.dart';
 import 'ui/sessions_page.dart';
 import 'ui/settings_page.dart';
 
-void main() {
-  final st = AppState(makeBackend());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final st = AppState(await makeBackend());
   runApp(PylonApp(st: st));
-  st.load();
+  await st.load();
 }
 
 class PylonApp extends StatelessWidget {

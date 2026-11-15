@@ -12,15 +12,25 @@ import 'model.dart';
 /// Symbolon's) and `pylon-term` (confined) turns the host's output into
 /// screens. This app only relays bytes between them and draws screens.
 class ProcessBackend implements Backend {
-  ProcessBackend(this.binDir, this.home);
+  /// A desktop layout: `pylon`, `pylon-term` and `pylond` side by side.
+  ProcessBackend(String binDir, this.home)
+      : pylonPath = '$binDir/pylon',
+        termPath = '$binDir/pylon-term',
+        pylondPath = '$binDir/pylond';
 
-  /// Where `pylon`, `pylon-term` and `pylond` live.
-  final String binDir;
+  /// Explicit paths (Android: the native library directory for the core,
+  /// a directory of pylond builds per machine type).
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home);
+
+  final String pylonPath, termPath;
+
+  /// A pylond binary, or a directory of pylond-x86_64 / pylond-aarch64.
+  final String pylondPath;
 
   /// PYLON_HOME: pins, CAs, pin history, and this app's host list.
   final String home;
 
-  String get _pylon => '$binDir/pylon';
+  String get _pylon => pylonPath;
   String get _hostsFile => '$home/app_hosts.json';
   Map<String, String> get _env => {'PYLON_HOME': home};
 
@@ -84,9 +94,9 @@ class _ProcSession extends Session {
     status = 'Connecting…';
     changed();
     try {
-      _term = await Process.start('${b.binDir}/pylon-term', ['$rows', '$cols']);
-      final args = ['--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (host.mode == Mode.pylon) ...['--pylond', '${b.binDir}/pylond'], host.target];
-      _conn = await Process.start('${b.binDir}/pylon', args, environment: b._env);
+      _term = await Process.start(b.termPath, ['$rows', '$cols']);
+      final args = ['--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (host.mode == Mode.pylon) ...['--pylond', b.pylondPath], host.target];
+      _conn = await Process.start(b.pylonPath, args, environment: b._env);
     } catch (e) {
       status = 'Cannot start the Pylon core: $e';
       // `this.`: a bare exitCode here is dart:io's (this process's status).

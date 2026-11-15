@@ -1,4 +1,6 @@
 import 'demo_backend.dart';
 import 'model.dart';
 
-Backend makeBackend() => DemoBackend();
+Future<Backend> makeBackend() async => DemoBackend();
+
+Future<void> setSecure(bool on) async {}

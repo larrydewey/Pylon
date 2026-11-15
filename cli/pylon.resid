@@ -262,10 +262,17 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
     List(Int) addr = ipv4(host);
     if (addr.len() != 4) { eprintln("pylon: the Pylon protocol (v1) needs the host as an IPv4 address"); return 2; }
     if (!only_local(fs, 0)) { eprintln("pylon: the Pylon protocol (v1) carries -L forwards only"); return 2; }
-    if (!filesystem.exists(path)) { eprintln("pylon: no pylond at " + path); return 2; }
-    List(Int) bin = filesystem.read_bytes(path);
+    // A directory holds one build per machine type: pylond-x86_64, pylond-aarch64.
+    Bool dir = filesystem.is_dir(path);
+    Arch ar = if (dir) { host_arch(c) } else { Arch {.c = c, .arch = "", .err = ""} };
+    if (str_len(ar.err) > 0) { eprintln("pylon: " + ar.err); return 1; }
+    Bool plain = ar.arch == "x86_64" || ar.arch == "aarch64";
+    if (dir && !plain) { eprintln("pylon: no pylond for this host's machine type (" + display_text(bytes_of(ar.arch)) + ")"); return 2; }
+    Str file = if (dir) { path + "/pylond-" + ar.arch } else { path };
+    if (!filesystem.exists(file)) { eprintln("pylon: no pylond at " + file); return 2; }
+    List(Int) bin = filesystem.read_bytes(file);
     Str hash = hex_encode(sha256_bytes(bin));
-    Pushed p = push_pylond(c, bin, hash);
+    Pushed p = push_pylond(ar.c, bin, hash);
     if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return 1; }
     Started st = start_pylond(p.c, hash, 600, has_flag(pflags, "ephemeral"), has_flag(pflags, "allow-unconfined"));
     if (str_len(st.err) > 0) { eprintln("pylon: " + st.err); return 1; }
