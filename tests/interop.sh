@@ -344,8 +344,10 @@ except socket.timeout:
         curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://localhost:$W2/small.txt"
     check "pylon protocol: SOCKS5 (-D), 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
         bash -c "curl -s -m 60 --socks5 127.0.0.1:$DP http://127.0.0.1:$W2/big.bin | sha256sum"
-    check "pylon protocol: SOCKS5 (-D), a closed port is refused (reply 5)" 7 "" \
-        curl -s -m 10 --socks5 "127.0.0.1:$DP" "http://127.0.0.1:1/"
+    # curl reports the refusal as 7 (couldn't connect) or, from 8.x, 97
+    # (proxy handshake error): either is the SOCKS reply 5 reaching it.
+    check "pylon protocol: SOCKS5 (-D), a closed port is refused (reply 5)" 0 "" \
+        bash -c "curl -s -m 10 --socks5 127.0.0.1:$DP http://127.0.0.1:1/; r=\$?; echo curl exit \$r; [ \$r = 7 ] || [ \$r = 97 ]"
     check "pylon protocol: SOCKS5 (-D), a name with odd bytes is refused" 97 "" \
         curl -s -m 10 --socks5-hostname "127.0.0.1:$DP" "http://a_b.example:$W2/"
     kill $PD 2>/dev/null; wait $PD 2>/dev/null
@@ -461,6 +463,10 @@ check "unknown user key fails cleanly"         1 "accepted none" \
 # --- post-quantum hybrid (mlkem768x25519-sha256) ------------------------------
 # OpenSSH 9.6 here has no ML-KEM, so a reference server built on OpenSSL's
 # primitives (pq_server.py) checks the hybrid exchange end to end.
+# The reference server needs ML-KEM in Python's cryptography (45 or later);
+# where it is older (Ubuntu's package), the OpenSSH cases above, when the
+# sshd has ML-KEM, are the hybrid's check.
+if python3 -c "from cryptography.hazmat.primitives.asymmetric import mlkem" 2>/dev/null; then
 PQPORT=$((PORT + 8)); PQSEED=0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526
 PQFP=$(python3 -c "
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -483,6 +489,9 @@ sleep 0.5
 check "pq: a corrupted ML-KEM ciphertext fails the signature" 1 "does not verify" \
     "$PYLON" -p $PQPORT "$USER_NAME@127.0.0.1" true
 kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
+else
+    echo "skip pq: this Python's cryptography has no ML-KEM"
+fi
 
 # --- hostile servers (refused before any key exchange completes) -------------
 hostile() {   # scenario expected-substring
