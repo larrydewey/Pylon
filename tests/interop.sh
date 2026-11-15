@@ -55,6 +55,8 @@ fp() { ssh-keygen -lf "$1" | cut -d' ' -f2; }
 
 check() {   # name expected-exit expected-output-substring command...
     local name="$1" want="$2" grepfor="$3"; shift 3
+    # ONLY=REGEX runs just the matching checks (pinning always runs).
+    if [ -n "${ONLY:-}" ] && ! grep -qE -- "$ONLY|pin accepts" <<<"$name"; then return 0; fi
     local out; out="$("$@" 2>&1)"; local got=$?
     if [ "$got" = "$want" ] && { [ -z "$grepfor" ] || grep -q -- "$grepfor" <<<"$out"; }; then
         PASS=$((PASS + 1)); echo "ok   $name"
@@ -122,6 +124,36 @@ for t in ecdsa rsa; do
 done
 start_sshd "HostKey $WORK/host_ed25519"
 "$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_ed25519.pub)" > /dev/null
+
+# --- host certificates (SPEC 6.1.1), with no pins at all ----------------------
+ssh-keygen -q -t ed25519 -N '' -f host_ca; ssh-keygen -q -t ed25519 -N '' -f other_ca
+for v in good wrongname expired untrusted; do cp host_ecdsa host_cert_$v; cp host_ecdsa.pub host_cert_$v.pub; done
+ssh-keygen -q -s host_ca -I good -h -n 127.0.0.1 -V -5m:+1h host_cert_good.pub
+ssh-keygen -q -s host_ca -I wrong -h -n other.example -V -5m:+1h host_cert_wrongname.pub
+ssh-keygen -q -s host_ca -I old -h -n 127.0.0.1 -V -2h:-1h host_cert_expired.pub
+ssh-keygen -q -s other_ca -I other -h -n 127.0.0.1 -V -5m:+1h host_cert_untrusted.pub
+CAH="$WORK/ca_home"; mkdir -p "$CAH"
+start_sshd "HostKey $WORK/host_cert_good" "HostCertificate $WORK/host_cert_good-cert.pub"
+check "certificate: refused while no CA is trusted" 1 "does not trust a key on first use" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "certificate: a CA for another domain does not count" 0 "trusting" \
+    env PYLON_HOME="$CAH" "$PYLON" ca '*.example.org' "$(cat host_ca.pub)"
+check "certificate: still refused" 1 "does not trust a key on first use" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "certificate: trust the CA for this host" 0 "trusting" \
+    env PYLON_HOME="$CAH" "$PYLON" ca 127.0.0.1 "$(cat host_ca.pub)"
+check "certificate: accepted without a pin" 0 "via-cert" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo via-cert"
+start_sshd "HostKey $WORK/host_cert_wrongname" "HostCertificate $WORK/host_cert_wrongname-cert.pub"
+check "certificate: for another name is refused" 1 "not for 127.0.0.1" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+start_sshd "HostKey $WORK/host_cert_expired" "HostCertificate $WORK/host_cert_expired-cert.pub"
+check "certificate: expired is refused" 1 "expired" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+start_sshd "HostKey $WORK/host_cert_untrusted" "HostCertificate $WORK/host_cert_untrusted-cert.pub"
+check "certificate: from an untrusted CA is refused" 1 "CA you do not trust" \
+    env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+start_sshd "HostKey $WORK/host_ed25519"
 
 # --- user key types ----------------------------------------------------------
 start_sshd "HostKey $WORK/host_ed25519"

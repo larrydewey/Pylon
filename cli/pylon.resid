@@ -65,6 +65,7 @@ Int usage() {
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
     eprintln("       pylon history [HOST]                    what happened to pins");
+    eprintln("       pylon ca [PATTERN 'ALG BASE64']         trust a host CA for PATTERN (host, *.domain, *)");
     return 2;
 }
 
@@ -92,7 +93,7 @@ Int cmd_pin(Opts o, Int via) {
     if (!str_starts_with(want, "SHA256:")) { eprintln("pylon: the fingerprint must be SHA256:... as ssh-keygen -lf prints it"); return 2; }
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { eprintln("pylon: " + c.err); return 1; }
-    Handshake h = handshake(c, Trust {.pinned = [], .probe = true}, o.no_strict);
+    Handshake h = handshake(c, probing(), o.no_strict);
     _ = resid_tcp_close(c.fd);
     if (h.c.err != probe_done()) { eprintln("pylon: " + h.c.err); return 1; }
     if (h.fingerprint != want) {
@@ -145,7 +146,7 @@ Authed login(Str user, Str host, Opts o, Int via) {
     if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
     if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
-    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false}, o.no_strict);
+    Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false, .cas = cas_for(host), .name = host, .now = clock.now_sec()}, o.no_strict);
     if (!conn_ok(h.c)) {
         _ = resid_tcp_close(c.fd);
         Bool changed = str_contains(h.c.err, "HOST KEY HAS CHANGED");
@@ -167,6 +168,18 @@ Str pin_details(List(Pin) ps, Int i, Str acc) {
     Str when = if (str_len(ps[i].when) > 0) { " on " + ps[i].when } else { "" };
     Str by = if (str_len(ps[i].by) > 0) { " from " + ps[i].by } else { "" };
     return pin_details(ps, i + 1, acc + "\nPinned: " + fingerprint(ps[i].blob) + when + by);
+}
+
+// pylon ca [PATTERN 'ALG BASE64']: trust a host CA for names under
+// PATTERN (the key obtained out of band), or list the trusted CAs.
+@requires(filesystem, environment, clock(readonly))
+Int cmd_ca(Opts o) {
+    if (o.rest.len() == 0) { _ = print_lines(ca_lines(), 0); return 0; }
+    if (o.rest.len() != 2) { return usage(); }
+    Str why = add_ca(o.rest[0], o.rest[1]);
+    if (str_len(why) > 0) { eprintln("pylon: " + why); return 1; }
+    println("trusting the CA for " + str_to_lower(o.rest[0]));
+    return 0;
 }
 
 // pylon history [HOST[:PORT]]: what happened to pins (SPEC 6.2).
@@ -390,10 +403,11 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history";
+    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
+    if (verb == "ca") { return cmd_ca(o); }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
 }

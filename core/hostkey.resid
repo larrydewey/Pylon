@@ -45,6 +45,112 @@ pub Option(PubKey) key_of_blob(List(Int) blob) {
     return None;
 }
 
+// ============================================================================
+// Host certificates (PROTOCOL.certkeys; SPEC 6.1.1)
+// ============================================================================
+
+// A certificate: the certified key (its blob the plain key's, so pins and
+// fingerprints name the key), the certificate type (2 for a host), valid
+// principals, the validity window in seconds since the epoch, whether
+// there are no critical options, the CA's key blob, the CA's signature and
+// the bytes it covers.
+pub type Cert = { Bool ok; PubKey key; Int ctype; List(Str) principals; Int after; Int before; Bool crit_none; List(Int) ca; List(Int) sig; List(Int) signed; Str id; };
+
+Cert no_cert() { return Cert {.ok = false, .key = no_key(), .ctype = 0, .principals = [], .after = 0, .before = 0, .crit_none = false, .ca = [], .sig = [], .signed = [], .id = ""}; }
+
+pub Bool is_cert_alg(Str alg) { return str_ends_with(alg, "-cert-v01@openssh.com"); }
+
+// The signature algorithm a certificate algorithm signs with.
+pub Str plain_alg(Str alg) { return if (is_cert_alg(alg)) { str_slice(alg, 0, str_len(alg) - 21) } else { alg }; }
+
+pub Cert cert_of_blob(List(Int) blob) {
+    GotText t = rd_text(rd(blob));
+    Got nonce = rd_str(t.r);
+    if (!rd_ok(nonce.r)) { return no_cert(); }
+    // The certified key's fields, rebuilt as a plain key blob.
+    InnerKey ik = inner_key(t.v, nonce.r);
+    if (!ik.ok) { return no_cert(); }
+    Option(PubKey) k = key_of_blob(ik.blob);
+    PubKey key = k else { no_key() };
+    if (key.kind == "") { return no_cert(); }
+    Got serial = take(ik.r, 8);
+    GotInt ctype = rd_u32(serial.r);
+    GotText id = rd_text(ctype.r);
+    Got princ = rd_str(id.r);
+    Got after = take(princ.r, 8);
+    Got before = take(after.r, 8);
+    Got crit = rd_str(before.r);
+    Got ext = rd_str(crit.r);
+    Got res = rd_str(ext.r);
+    Got ca = rd_str(res.r);
+    Got sig = rd_str(ca.r);
+    if (!rd_ok(sig.r) || !rd_done(sig.r)) { return no_cert(); }
+    List(Str) ps = names_of(princ.v);
+    return Cert {.ok = true, .key = key, .ctype = ctype.v, .principals = ps, .after = u64_of(after.v), .before = u64_of(before.v),
+        .crit_none = crit.v.len() == 0, .ca = ca.v, .sig = sig.v, .signed = blob[0..ca.r.at], .id = id.v};
+}
+
+type InnerKey = { Bool ok; List(Int) blob; Rd r; };
+
+InnerKey inner_key(Str alg, Rd r) {
+    if (alg == "ssh-ed25519-cert-v01@openssh.com") {
+        Got pk = rd_str(r);
+        return InnerKey {.ok = rd_ok(pk.r), .blob = sstr("ssh-ed25519").concat(sstring(pk.v)), .r = pk.r};
+    }
+    if (alg == "ecdsa-sha2-nistp256-cert-v01@openssh.com" || alg == "ecdsa-sha2-nistp384-cert-v01@openssh.com") {
+        Got curve = rd_str(r);
+        Got q = rd_str(curve.r);
+        return InnerKey {.ok = rd_ok(q.r), .blob = sstr(plain_alg(alg)).concat(sstring(curve.v)).concat(sstring(q.v)), .r = q.r};
+    }
+    if (alg == "ssh-rsa-cert-v01@openssh.com") {
+        Got e = rd_str(r);
+        Got n = rd_str(e.r);
+        return InnerKey {.ok = rd_ok(n.r), .blob = sstr("ssh-rsa").concat(sstring(e.v)).concat(sstring(n.v)), .r = n.r};
+    }
+    return InnerKey {.ok = false, .blob = [], .r = rd_bad(r)};
+}
+
+// A packed list of strings (the principals field).
+List(Str) names_of(List(Int) b) { return names_acc(rd(b), []); }
+List(Str) names_acc(Rd r, List(Str) acc) {
+    if (!rd_ok(r) || rd_done(r) || acc.len() > 256) { return acc; }
+    GotText t = rd_text(r);
+    if (!rd_ok(t.r)) { return acc; }
+    return names_acc(t.r, acc.concat([t.v]));
+}
+
+// A uint64, saturated at 2^62 (OpenSSH writes "forever" as 2^64 - 1).
+Int u64_of(List(Int) b) {
+    Int hi = be32(b, 0);
+    if (hi >= 1073741824) { return 4611686018427387904; }
+    return (hi << 32) | be32(b, 4);
+}
+
+// Why a host certificate is not acceptable for `host` at time `now`
+// under the trusted CA blobs `cas`, or "".
+pub Str cert_refusal(Cert c, Str host, Int now, List(List(Int)) cas) {
+    if (!c.ok) { return "the host presented a malformed certificate"; }
+    if (c.ctype != 2) { return "the host presented a user certificate, not a host certificate"; }
+    if (!c.crit_none) { return "the host certificate has critical options Pylon does not understand"; }
+    if (!c.principals.contains(str_to_lower(host))) { return "the host certificate is not for " + host + " (it names " + str_join(c.principals, ", ") + ")"; }
+    if (now < c.after) { return "the host certificate is not valid yet"; }
+    if (now >= c.before) { return "the host certificate has expired"; }
+    if (!blob_in(cas, c.ca, 0)) { return "the host certificate was signed by a CA you do not trust for " + host + " (" + fingerprint(c.ca) + ")"; }
+    Option(PubKey) ca = key_of_blob(c.ca);
+    PubKey cak = ca else { no_key() };
+    if (cak.kind == "") { return "the host certificate's CA key is not usable"; }
+    GotText salg = rd_text(rd(c.sig));
+    Bool sig_ok = sig_algs_of(cak).contains(salg.v) && verify_blob(cak, salg.v, c.signed, c.sig);
+    if (!sig_ok) { return "the host certificate's signature does not verify"; }
+    return "";
+}
+
+Bool blob_in(List(List(Int)) xs, List(Int) b, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (same_bytes(xs[i], b)) { return true; }
+    return blob_in(xs, b, i + 1);
+}
+
 // The signature algorithms a key may be used with, in our preference.
 pub List(Str) sig_algs_of(PubKey k) {
     if (k.kind == "rsa") { return ["rsa-sha2-512", "rsa-sha2-256"]; }

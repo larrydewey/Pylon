@@ -152,3 +152,69 @@ pub Str civil(Int days) {
 }
 
 Str two(Int v) { return if (v < 10) { "0" + f"{v}" } else { f"{v}" }; }
+
+// ============================================================================
+// Trusted host CAs (SPEC 6.1.1): $PYLON_HOME/host_cas, lines of
+//
+//   PATTERN ALG BASE64
+//
+// PATTERN is a host name, "*.domain" (any name ending in .domain) or "*".
+// A CA is trusted only for the names its pattern covers.
+// ============================================================================
+
+pub Bool pattern_covers(Str pattern, Str host) {
+    Str p = str_to_lower(pattern);
+    Str h = str_to_lower(host);
+    if (p == "*") { return true; }
+    if (str_starts_with(p, "*.")) { return str_ends_with(h, str_slice(p, 1, str_len(p))) && str_len(h) > str_len(p) - 1; }
+    return p == h;
+}
+
+@requires(filesystem(readonly), environment)
+pub List(List(Int)) cas_for(Str host) {
+    Str path = pylon_home() + "/host_cas";
+    if (!filesystem.exists(path)) { return []; }
+    return ca_acc(str_split(filesystem.read_all(path), "\n"), host, 0, []);
+}
+
+List(List(Int)) ca_acc(List(Str) lines, Str host, Int i, List(List(Int)) acc) {
+    if (i >= lines.len()) { return acc; }
+    List(Str) f = str_split(str_trim(lines[i]), " ");
+    Bool hit = f.len() >= 3 && pattern_covers(f[0], host);
+    List(Int) blob = if (hit) { base64_decode(f[2]) } else { [] };
+    Option(PubKey) k = if (hit) { key_of_blob(blob) } else { None };
+    Bool good = match k { None => false, Some(x) => x.alg == f[1] };
+    return ca_acc(lines, host, i + 1, if (good) { acc.concat([blob]) } else { acc });
+}
+
+// Trust the CA key `line` ("ALG BASE64 [comment]", as in a .pub file) for
+// names under `pattern`. "" on success, else why not.
+@requires(filesystem, environment, clock(readonly))
+pub Str add_ca(Str pattern, Str line) {
+    List(Str) f = str_split(str_trim(line), " ");
+    if (f.len() < 2) { return "give the CA's public key as ALG BASE64"; }
+    List(Int) blob = base64_decode(f[1]);
+    Option(PubKey) k = key_of_blob(blob);
+    Bool good = match k { None => false, Some(x) => x.alg == f[0] };
+    if (!good) { return "not a usable public key (ssh-ed25519, ecdsa-sha2-nistp256/384 or ssh-rsa of 2048 bits or more)"; }
+    Bool pat_ok = str_len(pattern) > 0 && str_len(pattern) < 256 && !str_contains(pattern, " ") && (pattern == "*" || !str_contains(str_slice(pattern, 1, str_len(pattern)), "*"));
+    if (!pat_ok) { return "the pattern must be a host name, *.domain or *"; }
+    Str dir = pylon_home();
+    _ = filesystem.create_dir(dir);
+    Bool ok = filesystem.append_bytes(dir + "/host_cas", bytes_of(str_to_lower(pattern) + " " + f[0] + " " + f[1] + "\n"));
+    _ = history("ca-trusted", str_to_lower(pattern), fingerprint(blob), "");
+    return if (ok) { "" } else { "cannot write " + dir + "/host_cas" };
+}
+
+@requires(filesystem(readonly), environment)
+pub List(Str) ca_lines() {
+    Str path = pylon_home() + "/host_cas";
+    if (!filesystem.exists(path)) { return []; }
+    return ca_show(str_split(filesystem.read_all(path), "\n"), 0, []);
+}
+
+List(Str) ca_show(List(Str) ls, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    return ca_show(ls, i + 1, if (f.len() >= 3) { acc.concat([f[0] + " " + f[1] + " " + fingerprint(base64_decode(f[2]))]) } else { acc });
+}

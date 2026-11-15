@@ -31,6 +31,24 @@ pub List(Str) our_host_key_algs() {
     return ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "rsa-sha2-512", "rsa-sha2-256"];
 }
 
+// With a CA trusted for the host, its certificate algorithms come first.
+pub List(Str) our_cert_algs() {
+    return ["ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com"];
+}
+
+// The host key a negotiated algorithm names: a certificate's certified
+// key (the certificate itself is checked under the trust policy), or the
+// plain key.
+pub PubKey host_key_of(List(Int) blob, Str alg) {
+    if (is_cert_alg(alg)) {
+        Cert c = cert_of_blob(blob);
+        return if (c.ok) { c.key } else { no_key() };
+    }
+    Option(PubKey) ok = key_of_blob(blob);
+    return ok else { no_key() };
+}
+
 pub List(Str) our_ciphers() { return ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "aes128-gcm@openssh.com"]; }
 
 // The host key algorithms offered, with those matching a pinned key's type
@@ -263,9 +281,8 @@ List(Int) pub_iv(List(Secret(UInt(8))) iv) { return ints_of(declassify(secret_jo
 // a rekey; c2s and s2c are the negotiated ciphers.
 @requires(declassify)
 pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg, Str c2s, Str s2c, List(Int) old_sid) {
-    Option(PubKey) ok = key_of_blob(r.host_blob);
-    PubKey host = ok else { no_key() };
-    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
+    PubKey host = host_key_of(r.host_blob, hk_alg);
+    if (host.kind == "" || host.alg != key_type_of_alg(plain_alg(hk_alg))) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
     // Empty when the result is all zeros: a low-order point (RFC 7748 6.1).
     List(Secret(UInt(8))) shared = x25519g_shared(e.priv, r.q_s);
     if (shared.len() != 32) { return Exchanged {.err = "the server's key share is invalid", .m = no_material(), .host = host}; }
@@ -277,7 +294,7 @@ pub Exchanged finish_ecdh(Ecdh e, Reply r, Str v_c, Str v_s, List(Int) i_c, List
     Int ks = cipher_key_len(s2c);
     Derived d = derive_all(shared, hin, old_sid, ivc, ivs, kc, ks);
     List(Int) h = pub_hash(d.h);
-    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
+    if (!verify_blob(host, plain_alg(hk_alg), h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
     Material m = Material {.h = h, .iv_c = pub_iv(d.iv_c), .iv_s = pub_iv(d.iv_s), .key_c = d.key_c, .key_s = d.key_s};
     return Exchanged {.err = "", .m = m, .host = host};
 }
@@ -302,9 +319,8 @@ pub List(Int) hybrid_init_payload(Hybrid h) { return [msg_kex_ecdh_init()].conca
 
 @requires(declassify)
 pub Exchanged finish_hybrid(Hybrid hy, Reply r, Str v_c, Str v_s, List(Int) i_c, List(Int) i_s, Str hk_alg, Str c2s, Str s2c, List(Int) old_sid) {
-    Option(PubKey) ok = key_of_blob(r.host_blob);
-    PubKey host = ok else { no_key() };
-    if (host.kind == "" || host.alg != key_type_of_alg(hk_alg)) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
+    PubKey host = host_key_of(r.host_blob, hk_alg);
+    if (host.kind == "" || host.alg != key_type_of_alg(plain_alg(hk_alg))) { return Exchanged {.err = "the server's host key is not of the negotiated type", .m = no_material(), .host = host}; }
     List(Secret(UInt(8))) kpq = mlkem768_decaps(hy.kem.dk, r.q_s[0..1088]);
     // Empty when the X25519 result is all zeros (a low-order point).
     List(Secret(UInt(8))) kcl = x25519g_shared(hy.x.priv, r.q_s[1088..1120]);
@@ -314,7 +330,7 @@ pub Exchanged finish_hybrid(Hybrid hy, Reply r, Str v_c, Str v_s, List(Int) i_c,
         .concat(sstring(r.host_blob)).concat(sstring(hybrid_init(hy))).concat(sstring(r.q_s));
     Derived d = derive_shape(kenc, hin, old_sid, cipher_iv_len(c2s), cipher_iv_len(s2c), cipher_key_len(c2s), cipher_key_len(s2c));
     List(Int) h = pub_hash(d.h);
-    if (!verify_blob(host, hk_alg, h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
+    if (!verify_blob(host, plain_alg(hk_alg), h, r.sig)) { return Exchanged {.err = "the server's signature over the key exchange does not verify", .m = no_material(), .host = host}; }
     Material m = Material {.h = h, .iv_c = pub_iv(d.iv_c), .iv_s = pub_iv(d.iv_s), .key_c = d.key_c, .key_s = d.key_s};
     return Exchanged {.err = "", .m = m, .host = host};
 }
