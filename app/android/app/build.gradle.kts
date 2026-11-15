@@ -35,9 +35,12 @@ android {
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
         // flag during build.
-        // Symbolon's release certificates (SHA-256, comma-separated): the only
-        // agent service Pylon binds (SPEC 7.3). Empty: no agent on Android.
-        buildConfigField("String", "SYMBOLON_CERTS", "\"" + (project.findProperty("symbolonCerts") ?: "") + "\"")
+        // Symbolon's signing certificates (SHA-256, comma-separated): the only
+        // agent service Pylon binds (SPEC 7.3). The default is the certificate
+        // Symbolon's published APKs carry; -PsymbolonCerts replaces it.
+        val symbolonCerts = (project.findProperty("symbolonCerts") as String?)?.takeIf { it.isNotBlank() }
+            ?: "7edf81fe80818c5593d8a3fb323a24791d090775403aea2cd88c507330c79826"
+        buildConfigField("String", "SYMBOLON_CERTS", "\"" + symbolonCerts + "\"")
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         // The core exists for this one (tools/android-core.sh).
