@@ -177,6 +177,14 @@ check "app mode: a session over framed pipes" 0 "app ok" \
     python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
 check "app mode: the emulator process (confined)" 0 "term process ok" \
     python3 "$(dirname "$HOSTILE")/term_proc.py" "$(dirname "$PYLON")/pylon-term"
+FLUTTER="${FLUTTER:-$(command -v flutter || echo /home/user/tools/flutter/bin/flutter)}"
+if [ -x "$FLUTTER" ] && [ -d "$(dirname "$HOSTILE")/../app" ]; then
+    check "app: the Flutter app's process backend, end to end" 0 "All tests passed" \
+        env PYLON_BIN_DIR="$(cd "$(dirname "$PYLON")" && pwd)" PYLON_TEST_TARGET="$USER_NAME@127.0.0.1" PYLON_TEST_PORT=$PORT \
+        bash -c "cd '$(dirname "$HOSTILE")/../app' && '$FLUTTER' test test/process_backend_test.dart 2>&1"
+else
+    echo "skip app backend test (no flutter)"
+fi
 check "interactive without a terminal is refused" 2 "needs a terminal" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' < /dev/null"
 

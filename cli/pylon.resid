@@ -65,6 +65,7 @@ Int usage() {
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
     eprintln("       pylon history [HOST]                    what happened to pins");
+    eprintln("       pylon pins                              every pinned key");
     eprintln("       pylon ca [PATTERN 'ALG BASE64']         trust a host CA for PATTERN (host, *.domain, *)");
     return 2;
 }
@@ -405,11 +406,12 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca";
+    Bool sub = verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
     if (verb == "ca") { return cmd_ca(o); }
+    if (verb == "pins") { _ = print_lines(pin_lines(), 0); return 0; }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
 }

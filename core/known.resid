@@ -218,3 +218,21 @@ List(Str) ca_show(List(Str) ls, Int i, List(Str) acc) {
     List(Str) f = str_split(str_trim(ls[i]), " ");
     return ca_show(ls, i + 1, if (f.len() >= 3) { acc.concat([f[0] + " " + f[1] + " " + fingerprint(base64_decode(f[2]))]) } else { acc });
 }
+
+// Every pin, as "TOKEN ALG FINGERPRINT DATE DEVICE" ("-" for unknowns).
+@requires(filesystem(readonly), environment)
+pub List(Str) pin_lines() {
+    Str path = pylon_home() + "/known_hosts";
+    if (!filesystem.exists(path)) { return []; }
+    return pl_acc(str_split(filesystem.read_all(path), "\n"), 0, []);
+}
+
+List(Str) pl_acc(List(Str) ls, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    Bool ok = f.len() >= 3;
+    Str when = if (ok) { field(f, "pinned=", 3) } else { "" };
+    Str by = if (ok) { field(f, "by=", 3) } else { "" };
+    Str line = if (ok) { f[0] + " " + f[1] + " " + fingerprint(base64_decode(f[2])) + " " + (if (str_len(when) > 0) { when } else { "-" }) + " " + (if (str_len(by) > 0) { by } else { "-" }) } else { "" };
+    return pl_acc(ls, i + 1, if (ok) { acc.concat([line]) } else { acc });
+}
