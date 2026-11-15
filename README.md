@@ -49,7 +49,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
 
 Tested against OpenSSH 9.6 (and the handshake against Dropbear 2022.83):
-COUNT interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+153 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
 `pylond` release (tampered builds and manifests, k-1 signatures,
