@@ -48,7 +48,12 @@ fi
 
 # Everything at the same absolute paths as outside, so the commands (and
 # the paths a build records) are the ones a host build would use.
-mounts=(-v "$ROOT:$ROOT" -v "$out:$out" -v "$tree:$tree:ro")
+# The compiler caches the runtime it compiles with clang beside rt.ll, keyed
+# by the runtime and the flags but not by which clang made it: a host build
+# leaves its own clang's runtime there. The container gets an empty cache.
+mkdir -p "$RESID_HOME/rtcache"
+mounts=(-v "$ROOT:$ROOT" -v "$out:$out" -v "$tree:$tree:ro"
+        --mount "type=tmpfs,dst=$RESID_HOME/rtcache,tmpfs-mode=1777")
 key=""
 if [ -n "${RESID_SIGNING_KEY:-}" ]; then
     key="$(readlink -f "$RESID_SIGNING_KEY")"
