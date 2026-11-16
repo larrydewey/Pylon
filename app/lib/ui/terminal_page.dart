@@ -112,9 +112,9 @@ class _TerminalPageState extends State<TerminalPage> {
               tooltip: local ? 'End the local shell' : 'Disconnect',
               icon: Icon(local ? Icons.close : Icons.link_off),
               onPressed: () async {
-                if (!await confirmDisconnect(context, s) || !mounted) return;
+                if (!await confirmDisconnect(context, s) || !context.mounted) return;
                 widget.st.end(s);
-                if (mounted) Navigator.pop(context);
+                if (context.mounted) Navigator.pop(context);
               },
             )
           else
