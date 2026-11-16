@@ -1,5 +1,5 @@
-# Pylon's DNSSEC validator for SSHFP against live DNS, compared with BIND's
-# delv name by name (tests/dnssec_live.sh). The build sandbox has no DNS on
+# Pylon's DNSSEC validator for SSHFP against live DNS, compared with the
+# validating resolver's own verdict name by name (tests/dnssec_live.sh). The build sandbox has no DNS on
 # port 53, so this is where the validator meets the real root.
 name: dnssec-live
 
