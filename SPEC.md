@@ -214,7 +214,15 @@ A host key is accepted only through one of:
    principal or their Symbolon organization trusts for that host name,
    within its validity window, with the host name among its principals.
 2. **SSHFP records** (RFC 4255, SHA-256 only) for the host name, validated
-   with DNSSEC by Pylon's own resolver (not the OS's AD bit).
+   with DNSSEC by Pylon's own resolver (not the OS's AD bit), from the
+   IANA root trust anchors down (6.4). Only a *secure* answer counts: a
+   secure record of the key's type that matches accepts the key, and Pylon
+   then pins it (the pin and the host's history name the source and the
+   zone), so later changes follow 6.2. Secure records of the key's type
+   that do not match end the connection before authentication, as a
+   changed key does. An insecure (unsigned), bogus or indeterminate
+   answer never accepts a key; it is shown on the first-use screen with
+   its reason, and the procedure of 6.1.4 applies.
 3. **A pinned key** in the principal's synced host database (6.3).
 4. **First use under quorum.** A key seen for the first time is shown
    with its fingerprint and art; to pin it, the principal either compares
@@ -226,6 +234,31 @@ A host key is accepted only through one of:
    that network would deceive both. A network attacker (A1) must then
    deceive several vantage points on independent paths, or the
    principal's out-of-band check.
+
+   The out-of-band value is any of: a bare `SHA256:` fingerprint, the
+   output of `ssh-keygen -lf` (one or more lines; every `SHA256:` field
+   counts), or the QR payload below. MD5 fingerprints are refused. The
+   key is pinned only if the key the host presents in a fresh key
+   exchange has one of the fingerprints given (at most 8).
+
+   **QR payload.** One line of ASCII words separated by single spaces,
+   read in QR byte mode:
+
+   ```
+   pylon-hostkey/1 HOST[:PORT] SHA256:B64 [SHA256:B64 ...]
+   ```
+
+   `HOST` is the host name or IPv4 address as the principal connects to
+   it (lower case; letters, digits, `.`, `-`, `_`), `PORT` is given when
+   it is not 22 (a payload without one is for port 22), and each fingerprint is `SHA256:` and the 43 unpadded
+   base64 characters `ssh-keygen -l` prints (1 to 8 of them, nothing
+   else). The payload binds the fingerprints to the host: a payload for
+   another host or port is refused rather than applied, and an unknown
+   version tag (`pylon-hostkey/2`, ...) is refused. A host can show it
+   with, e.g.,
+   `echo "pylon-hostkey/1 $(hostname -f) $(for k in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf $k | cut -d' ' -f2; done)" | qrencode -t ansiutf8`.
+   Parsers: `core/oob.resid` (CLI) and `app/lib/backend/hostkey_qr.dart`
+   (the app's scanner, to come).
 
 Plain trust-on-first-use is available per host only, never globally, and
 is marked on the host.
@@ -246,6 +279,82 @@ trust, jump paths, per-host policy) are Symbolon vault items of a new
 type `pylon-host`, synchronized end-to-end encrypted by Symbolon. The
 database holds no secrets but is integrity-critical; it is protected by
 Symbolon's vault MACs, so a malicious sync server cannot add a pin.
+
+### 6.4 SSHFP and DNSSEC as implemented (CLI)
+
+`core/dns.resid` (messages), `core/dnssec.resid` (the validator, sans
+I/O), `core/resolver.resid` (the network side), `core/oob.resid` (6.1.4
+values). The validator trusts no resolver: it asks a recursive resolver
+for raw records and checks every signature itself.
+
+*Resolver.* The nameservers of `/etc/resolv.conf` (IPv4, at most three),
+or `PYLON_DNS=IP[:PORT][,...]`. Queries carry EDNS0 (1232 bytes) with DO
+and CD set, a random ID, recursion desired; an answer counts only from
+the server's address and port, with the same ID and the question echoed.
+A truncated answer is asked again over TCP. Each server is asked twice,
+1.5 s each, before the next.
+
+*Walk.* From the root DNSKEY RRset, which must contain a key matching a
+trust anchor and be signed by it, down the host name one label at a
+time: the DS RRset at each name, signed by the current zone, moves the
+walk into the child (whose DNSKEY RRset must hold a key matching a DS and
+be signed by it; then all its zone keys are usable); a proven absence of
+DS (NSEC or NSEC3) at a delegation ends the walk as *insecure*; a proven
+absence at a name that is no delegation, or an empty non-terminal, lets
+it carry on in the same zone; a proven non-existence ends it as a secure
+"no such name". At the host name the SSHFP RRset must be signed by the
+current zone (*secure*), or its absence proven (secure, no records).
+Signatures must name the zone as signer, cover the type, state exactly
+the owner's labels, be within their validity window (32-bit serial
+arithmetic) and verify under a zone key (Zone Key flag, not revoked,
+protocol 3) with their tag and algorithm. Denial: NSEC matching, covering
+(with the wildcard proof for NXDOMAIN), empty non-terminals and wildcard
+NODATA; NSEC3 matching, closest-encloser proofs, wildcard proofs and
+opt-out (RFC 5155 8; an opt-out span is insecure). At most 40 queries,
+and bounded work per answer whatever a resolver sends (8 RRSIGs per
+owner, 4 keys per key tag, 8 NSEC/NSEC3 records: the KeyTrap class,
+CVE-2023-50387).
+
+*Verdicts.* `secure` (records, or a proven none), `insecure` (an unsigned
+delegation, opt-out, only unsupported algorithms or digests, NSEC3 with
+more than 150 iterations), `bogus` (any signature or proof that fails,
+a DS no DNSKEY matches, an RRset without signatures in a signed zone) and
+`indeterminate` (no answer, SERVFAIL or REFUSED, an alias, a wildcard
+expansion, a signature by an RSA key under 2048 bits). The CLI shows one line for each, e.g.
+
+```
+SSHFP: 1 SHA-256 record(s) for db1.example.org. (secure, DNSSEC-validated in example.org.)
+SSHFP: not usable for db1.example.org.: insecure (the delegation to example.org. is not signed (no DS)); unsigned DNS is never trusted
+SSHFP: not usable for db1.example.org.: BOGUS (the SSHFP RRset of db1.example.org.: its signature has expired); this can be an attack on DNS
+SSHFP: not checked for db1.example.org.: indeterminate (no usable answer for .: no answer from 10.0.0.53 within 1.5 s)
+```
+
+*At first connection.* A host with no pin and a DNS name (not an address
+literal) is looked up before the connection. The key exchange offers the
+key types the secure records name first. A secure match is accepted and
+pinned (`by=sshfp`, history event `sshfp ... DNSSEC-validated in ZONE`)
+with a line on stderr naming the fingerprint and the zone; a secure
+mismatch is refused (`THE HOST KEY DOES NOT MATCH THE HOST'S
+DNSSEC-SIGNED SSHFP RECORDS`, recorded as `refused`); otherwise the usual
+first-use refusal carries the SSHFP line. A pinned host is never looked
+up: its pin decides (6.2). `pylon sshfp HOST` prints the verdict and the
+records (exit 0 only when secure).
+
+*Trust anchors.* The DS records of the root KSK-2017 (key tag 20326) and
+KSK-2024 (key tag 38696), both RSA/SHA-256, digest SHA-256, compiled in
+(`iana_anchors`); the tests check them against the root DNSKEYs as
+DNSViz 0.11.2 ships them. `PYLON_TEST_DNSSEC_ANCHOR="TAG ALG 2 HEX"`
+replaces them for tests only, with a warning on every use.
+
+Limits: algorithms 8 (RSA/SHA-256, keys of 2048 bits or more, like the
+rest of Pylon: a zone signed with a shorter RSA key is indeterminate),
+13, 14 and 15; DS digests 2 and 4 (SHA-1 DS records are ignored); no
+CNAME/DNAME following and no wildcard-expanded SSHFP; IPv4 resolvers
+only; no cache (every lookup walks from the root, about 2 queries per
+zone and one per other label); anchors are updated with Pylon, not by
+RFC 5011. The validator is exercised against constructed, signed zones
+(`tests/dnssec_zone.py`) and published known answers (RFC 8080, RFC 5155,
+a P-256 vector); it has not yet been run against the live DNS from CI.
 
 ## 7. User authentication and key custody
 
@@ -1004,7 +1113,7 @@ content.
 | 1 | Android app: host list, terminal emulator, Symbolon IPC, host trust of 6 with sync, SFTP, forwards, ProxyJump. |
 | 1b | Without Symbolon (7.6): hardware keys, external agents, imported key files, with the warning. |
 | 2 | `pylond`: delivery (8) with reproducible, logged releases; Pylon protocol (9); persistent sessions with signed re-attach, screen sync and scrollback (10); Pylon streams (11); formal models and external review. Linux desktop app. |
-| 3 | Restricted agent forwarding, SSHFP/DNSSEC resolver, host and user certificates, organization policy. |
+| 3 | Restricted agent forwarding, SSHFP/DNSSEC resolver, host and user certificates, organization policy. *In the CLI: the SSHFP/DNSSEC validator (6.4) and host certificates.* |
 | 4 | Local shell (13). Windows, macOS, iOS. *Begun: the local shell on Linux (namespaces) and Android (an isolated process), without storage on Android and without SSH from it.* |
 | 5 | Direct Pylon authentication without SSH on hosts that run `pylond`: Symbolon-signed handshakes and optional host attestation (SEV-SNP, TDX, TPM via Resid's `lib/verify/`). |
 

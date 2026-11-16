@@ -1,0 +1,272 @@
+// DNS messages (RFC 1035, RFC 6891) for Pylon's own validating resolver
+// (SPEC 6.1.2): domain names in wire form, queries with EDNS0 and the DO
+// and CD bits, and a total parser for responses.
+//
+// Names are kept as their uncompressed wire bytes, lower-cased: the
+// canonical form of RFC 4034 6.2 for owner names, which is also what
+// every comparison here wants. Raw RDATA is kept as received, so a
+// signature is checked over exactly the bytes that were signed; the
+// types Pylon validates (DNSKEY, DS, SSHFP, NSEC, NSEC3) carry no
+// compressible names, and a compression pointer inside an RRSIG or NSEC
+// makes the record unusable rather than being followed.
+
+import "crypto.resid";
+
+pub Int t_a() { return 1; }
+pub Int t_ns() { return 2; }
+pub Int t_cname() { return 5; }
+pub Int t_soa() { return 6; }
+pub Int t_ds() { return 43; }
+pub Int t_sshfp() { return 44; }
+pub Int t_rrsig() { return 46; }
+pub Int t_nsec() { return 47; }
+pub Int t_dnskey() { return 48; }
+pub Int t_nsec3() { return 50; }
+pub Int t_dname() { return 39; }
+pub Int t_opt() { return 41; }
+
+// ============================================================================
+// Names
+// ============================================================================
+
+pub List(Int) root_name() { return [0]; }
+
+Int lower_byte(Int c) { return if (c >= 65 && c <= 90) { c + 32 } else { c }; }
+
+pub List(Int) lower_bytes(List(Int) b) { return lb_acc(b, 0, []); }
+List(Int) lb_acc(List(Int) b, Int i, List(Int) acc) {
+    if (i >= b.len()) { return acc; }
+    return lb_acc(b, i + 1, acc.concat([lower_byte(b[i])]));
+}
+
+// A host name as text ("host.example.org", a trailing dot allowed) in
+// wire form, lower-cased; [] when it is not a host name Pylon looks up:
+// labels of 1 to 63 letters, digits, hyphens and underscores, at most
+// 253 characters, and not all-numeric (an IPv4 literal is no name).
+pub List(Int) name_from_text(Str s0) {
+    Str s = if (str_ends_with(s0, ".")) { str_slice(s0, 0, str_len(s0) - 1) } else { s0 };
+    if (str_len(s) == 0 || str_len(s) > 253) { return []; }
+    List(Str) ls = str_split(str_to_lower(s), ".");
+    if (all_numeric(ls, 0)) { return []; }
+    return nt_acc(ls, 0, []);
+}
+
+Bool all_numeric(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    return str_is_int(ls[i]) && all_numeric(ls, i + 1);
+}
+
+List(Int) nt_acc(List(Str) ls, Int i, List(Int) acc) {
+    if (i >= ls.len()) { return acc.concat([0]); }
+    Str l = ls[i];
+    if (str_len(l) == 0 || str_len(l) > 63 || !label_ok(l, 0)) { return []; }
+    return nt_acc(ls, i + 1, acc.concat([str_len(l)]).concat(bytes_of(l)));
+}
+
+Bool label_ok(Str l, Int i) {
+    if (i >= str_len(l)) { return true; }
+    Int c = str_char_at(l, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 45 || c == 95;
+    return ok && label_ok(l, i + 1);
+}
+
+// The labels of a wire name, leftmost first (the root has none).
+pub List(List(Int)) name_labels(List(Int) n) { return nl_acc(n, 0, []); }
+List(List(Int)) nl_acc(List(Int) n, Int i, List(List(Int)) acc) {
+    if (i >= n.len() || n[i] == 0 || i + 1 + n[i] > n.len()) { return acc; }
+    return nl_acc(n, i + 1 + n[i], acc.concat([n[i + 1..i + 1 + n[i]]]));
+}
+
+pub Int name_count(List(Int) n) { return name_labels(n).len(); }
+
+pub List(Int) name_of_labels(List(List(Int)) ls, Int i) {
+    if (i >= ls.len()) { return [0]; }
+    return [ls[i].len()].concat(ls[i]).concat(name_of_labels(ls, i + 1));
+}
+
+// The name without its leftmost label (the root stays the root).
+pub List(Int) name_parent(List(Int) n) {
+    if (n.len() <= 1) { return [0]; }
+    return n[1 + n[0]..n.len()];
+}
+
+// The ancestor of n (or n itself) with k labels.
+pub List(Int) name_suffix(List(Int) n, Int k) {
+    List(List(Int)) ls = name_labels(n);
+    if (k >= ls.len()) { return n; }
+    return name_of_labels(ls[ls.len() - k..ls.len()], 0);
+}
+
+// "*." + n.
+pub List(Int) wildcard_of(List(Int) n) { return [1, 42].concat(n); }
+
+pub Bool name_eq(List(Int) a, List(Int) b) { return a.len() == b.len() && hex_encode(a) == hex_encode(b); }
+
+// Is a equal to b or below it?
+pub Bool name_under(List(Int) a, List(Int) b) {
+    Int ka = name_count(a);
+    Int kb = name_count(b);
+    return ka >= kb && name_eq(name_suffix(a, kb), b);
+}
+
+// Canonical DNS name order (RFC 4034 6.1): -1, 0 or 1.
+pub Int name_cmp(List(Int) a, List(Int) b) {
+    List(List(Int)) la = name_labels(a);
+    List(List(Int)) lb = name_labels(b);
+    return nc_acc(la, lb, la.len() - 1, lb.len() - 1);
+}
+
+Int nc_acc(List(List(Int)) la, List(List(Int)) lb, Int i, Int j) {
+    if (i < 0 && j < 0) { return 0; }
+    if (i < 0) { return -1; }
+    if (j < 0) { return 1; }
+    Int c = bytes_cmp(lower_bytes(la[i]), lower_bytes(lb[j]), 0);
+    if (c != 0) { return c; }
+    return nc_acc(la, lb, i - 1, j - 1);
+}
+
+// Unsigned byte-string order, a prefix first.
+pub Int bytes_cmp(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len() && i >= b.len()) { return 0; }
+    if (i >= a.len()) { return -1; }
+    if (i >= b.len()) { return 1; }
+    if (a[i] < b[i]) { return -1; }
+    if (a[i] > b[i]) { return 1; }
+    return bytes_cmp(a, b, i + 1);
+}
+
+// The longest common ancestor of two names.
+pub List(Int) common_ancestor(List(Int) a, List(Int) b) { return ca_acc(a, b, 0, name_count(a), name_count(b)); }
+List(Int) ca_acc(List(Int) a, List(Int) b, Int k, Int ka, Int kb) {
+    if (k >= ka || k >= kb || !name_eq(name_suffix(a, k + 1), name_suffix(b, k + 1))) { return name_suffix(a, k); }
+    return ca_acc(a, b, k + 1, ka, kb);
+}
+
+// A name for display: printable ASCII, anything else as \DDD.
+pub Str name_text(List(Int) n) {
+    List(List(Int)) ls = name_labels(n);
+    if (ls.len() == 0) { return "."; }
+    return str_join(lt_acc(ls, 0, []), ".") + ".";
+}
+List(Str) lt_acc(List(List(Int)) ls, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    return lt_acc(ls, i + 1, acc.concat([label_text(ls[i], 0, "")]));
+}
+Str label_text(List(Int) l, Int i, Str acc) {
+    if (i >= l.len()) { return acc; }
+    Int c = l[i];
+    Bool plain = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95 || c == 42;
+    return label_text(l, i + 1, acc + if (plain) { str_from_code(c) } else { "\\" + f"{c}" });
+}
+
+// ============================================================================
+// Queries
+// ============================================================================
+
+// A query for (qname, qtype, IN) with id: recursion desired, checking
+// disabled (Pylon validates; the resolver must hand over what it has even
+// when it would call it bogus), EDNS0 with a 1232-byte buffer and DO set.
+pub List(Int) query_msg(Int id, List(Int) qname, Int qtype) {
+    List(Int) head = [(id >> 8) & 255, id & 255, 1, 16, 0, 1, 0, 0, 0, 0, 0, 1];
+    List(Int) opt = [0, 0, 41, 4, 208, 0, 0, 128, 0, 0, 0];
+    return head.concat(qname).concat([(qtype >> 8) & 255, qtype & 255, 0, 1]).concat(opt);
+}
+
+// ============================================================================
+// Responses
+// ============================================================================
+
+pub type RR = { List(Int) name; Int rtype; Int class; Int ttl; List(Int) rdata; };
+
+// flags: the 16-bit flags word (QR 0x8000, TC 0x0200, rcode the low 4 bits).
+pub type Msg = { Bool ok; Str err; Int id; Int flags; Int rcode; List(Int) qname; Int qtype; List(RR) an; List(RR) ns; };
+
+pub Msg msg_err(Str e) { return Msg {.ok = false, .err = e, .id = -1, .flags = 0, .rcode = -1, .qname = [], .qtype = 0, .an = [], .ns = []}; }
+
+pub Bool msg_tc(Msg m) { return (m.flags & 512) != 0; }
+
+type GotName = { Int next; List(Int) name; };
+
+Int u16(List(Int) b, Int i) { return if (i < 0 || i + 2 > b.len()) { -1 } else { b[i] * 256 + b[i + 1] }; }
+Int u32at(List(Int) b, Int i) { return if (i < 0 || i + 4 > b.len()) { -1 } else { (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3] }; }
+
+// The name at `at`, following compression pointers (each strictly
+// backwards, so there are no loops), lower-cased. next is where the
+// record continues; -1 when malformed.
+GotName read_name(List(Int) m, Int at) { return rn_acc(m, at, -1, [], 0); }
+
+GotName rn_acc(List(Int) m, Int at, Int next, List(Int) acc, Int hops) {
+    if (at < 0 || at >= m.len() || acc.len() > 255 || hops > 127) { return GotName {.next = -1, .name = []}; }
+    Int l = m[at];
+    if (l == 0) {
+        List(Int) n = acc.concat([0]);
+        if (n.len() > 255) { return GotName {.next = -1, .name = []}; }
+        return GotName {.next = if (next >= 0) { next } else { at + 1 }, .name = n};
+    }
+    if (l >= 192) {
+        if (at + 1 >= m.len()) { return GotName {.next = -1, .name = []}; }
+        Int to = ((l & 63) << 8) | m[at + 1];
+        if (to >= at) { return GotName {.next = -1, .name = []}; }
+        return rn_acc(m, to, if (next >= 0) { next } else { at + 2 }, acc, hops + 1);
+    }
+    if (l > 63 || at + 1 + l > m.len()) { return GotName {.next = -1, .name = []}; }
+    return rn_acc(m, at + 1 + l, next, acc.concat([l]).concat(lower_bytes(m[at + 1..at + 1 + l])), hops);
+}
+
+// An uncompressed name at the start of `b` (inside RDATA): its length in
+// bytes, or -1.
+pub Int plain_name_len(List(Int) b, Int at) { return pn_acc(b, at, 0); }
+Int pn_acc(List(Int) b, Int at, Int n) {
+    if (at >= b.len() || n > 255) { return -1; }
+    Int l = b[at];
+    if (l == 0) { return if (n + 1 > 255) { -1 } else { n + 1 }; }
+    if (l > 63) { return -1; }
+    return pn_acc(b, at + 1 + l, n + 1 + l);
+}
+
+type GotRRs = { Int next; List(RR) rrs; };
+
+GotRRs read_rrs(List(Int) m, Int at, Int count, List(RR) acc) {
+    if (at < 0) { return GotRRs {.next = -1, .rrs = []}; }
+    if (count <= 0) { return GotRRs {.next = at, .rrs = acc}; }
+    GotName n = read_name(m, at);
+    Int p = n.next;
+    Int rlen = if (p >= 0) { u16(m, p + 8) } else { -1 };
+    if (p < 0 || rlen < 0 || p + 10 + rlen > m.len()) { return GotRRs {.next = -1, .rrs = []}; }
+    RR r = RR {.name = n.name, .rtype = u16(m, p), .class = u16(m, p + 2), .ttl = u32at(m, p + 4), .rdata = m[p + 10..p + 10 + rlen]};
+    return read_rrs(m, p + 10 + rlen, count - 1, acc.concat([r]));
+}
+
+// A response, checked against the query it answers: the same id, QR set,
+// opcode QUERY, the one question echoed (name, type, class IN).
+pub Msg parse_response(List(Int) m, Int id, List(Int) qname, Int qtype) {
+    if (m.len() < 12) { return msg_err("a truncated DNS message"); }
+    Int flags = u16(m, 2);
+    if (u16(m, 0) != id || (flags & 32768) == 0 || ((flags >> 11) & 15) != 0) { return msg_err("a DNS message that does not answer the query"); }
+    if (u16(m, 4) != 1) { return msg_err("a DNS answer without its question"); }
+    GotName q = read_name(m, 12);
+    if (q.next < 0 || u16(m, q.next) != qtype || u16(m, q.next + 2) != 1 || !name_eq(q.name, qname)) { return msg_err("a DNS answer to another question"); }
+    GotRRs an = read_rrs(m, q.next + 4, u16(m, 6), []);
+    GotRRs ns = read_rrs(m, an.next, u16(m, 8), []);
+    if (ns.next < 0) { return msg_err("a malformed DNS message"); }
+    return Msg {.ok = true, .err = "", .id = id, .flags = flags, .rcode = flags & 15, .qname = q.name, .qtype = qtype, .an = an.rrs, .ns = ns.rrs};
+}
+
+// Records of `rrs` with owner n and type t (class IN only).
+pub List(RR) rrs_of(List(RR) rrs, List(Int) n, Int t) { return ro_acc(rrs, n, t, 0, []); }
+List(RR) ro_acc(List(RR) rrs, List(Int) n, Int t, Int i, List(RR) acc) {
+    if (i >= rrs.len()) { return acc; }
+    Bool hit = rrs[i].rtype == t && rrs[i].class == 1 && name_eq(rrs[i].name, n);
+    return ro_acc(rrs, n, t, i + 1, if (hit) { acc.concat([rrs[i]]) } else { acc });
+}
+
+// Records of `rrs` of type t, whatever their owner (class IN only).
+pub List(RR) rrs_typed(List(RR) rrs, Int t) { return rt_acc(rrs, t, 0, []); }
+List(RR) rt_acc(List(RR) rrs, Int t, Int i, List(RR) acc) {
+    if (i >= rrs.len()) { return acc; }
+    Bool hit = rrs[i].rtype == t && rrs[i].class == 1;
+    return rt_acc(rrs, t, i + 1, if (hit) { acc.concat([rrs[i]]) } else { acc });
+}
+
+pub Int rr_u16(List(Int) b, Int i) { return u16(b, i); }
+pub Int rr_u32(List(Int) b, Int i) { return u32at(b, i); }

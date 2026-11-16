@@ -8,7 +8,8 @@ SSH side of Termux.
   X25519 hybrid, curve25519, AEAD
   ciphers only, Ed25519/ECDSA/RSA-SHA2), strict key exchange (the Terrapin
   fix) required, no trust on first use, host keys pinned only against a
-  fingerprint you obtained out of band.
+  fingerprint you obtained out of band (pasted, or scanned as a QR code),
+  a host certificate, or SSHFP records Pylon validates with DNSSEC itself.
 - **No keys in Pylon.** Every signature comes from
   [Symbolon](https://github.com/larrydewey/symbolon) (threshold keys, a
   consent sheet per signature), bound to the session and the host key
@@ -41,7 +42,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Files | `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3); a local file is never replaced without `--force`; server messages shown escaped; over the Pylon protocol (`--pylond FILE`) resumable with `--resume` (per-chunk hashes, the whole file's hash checked) |
 | Jump hosts | `-J USER@JUMP[:PORT]` on any command: the jump host is verified under its own pins, the target under its own, end to end through a direct-tcpip channel; no agent forwarding |
 | Pylon protocol (experimental) | `--pylond FILE USER@HOST` (a terminal) or `--pylond FILE -N -L/-D/-R ...`: pushes `pylond` over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel, closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; packets padded to 64 bytes; silent to unauthenticated datagrams, and under load a cookie (`mac2`) before any asymmetric work (SPEC 9.7) |
-| Host trust | pinned keys (`pylon pin HOST FINGERPRINT`; re-pinning replaces the old key) or host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked); a changed key names the old pin; `pylon history [HOST]` |
+| Host trust | pinned keys (`pylon pin HOST FINGERPRINT`, where FINGERPRINT is `SHA256:...`, `ssh-keygen -lf` output as arguments or pasted with `-`, or the QR payload `pylon-hostkey/1 HOST[:PORT] SHA256:...` of SPEC 6.1.4; re-pinning replaces the old key), host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked), or SSHFP records validated by Pylon's own DNSSEC validator from the IANA root anchors (RSA/SHA-256, ECDSA P-256/P-384, Ed25519; NSEC and NSEC3 denial; a secure match pins the key, anything insecure, bogus or indeterminate never does and is shown; `pylon sshfp HOST`; SPEC 6.4); a changed key names the old pin; `pylon history [HOST]` |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 | Local shell | `pylon-local` (SPEC 13): a shell on the device that cannot reach Pylon's files, the agent, Pylon's processes or the network. Linux: an empty environment and new user, mount, pid and network namespaces with a root of its own (system directories read-only, its own home at `~/.local/share/pylon-local/home`); Android: an `isolatedProcess` service (its own UID, no permissions, no storage), not yet verified on a device. No SSH from it yet |
 | Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
@@ -49,12 +50,17 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 Tested against OpenSSH 9.6, against OpenSSH 10.2 in CI (`openssh10`
 workflow: built from source, the post-quantum hybrid negotiated with
 OpenSSH itself), and the handshake against Dropbear 2022.83:
-119 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+COUNT interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
-post-quantum and hostile-server cases in `tests/interop.sh`,
-known-answer tests for the key derivation in `tests/kex_test.resid`, and
-a mutation fuzzer in `tests/fuzz_proxy.py`.
+post-quantum, SSHFP/DNSSEC (against a signed test root served by
+`tests/dnssec_zone.py`), out-of-band pinning and hostile-server cases in
+`tests/interop.sh`, known-answer tests for the key derivation in
+`tests/kex_test.resid`, the DNSSEC validator over recorded signed
+answers (secure, insecure, bogus and indeterminate walks) and published
+known answers in `tests/dnssec_test.resid`, and a mutation fuzzer in
+`tests/fuzz_proxy.py`. Live DNSSEC against the real root has not been
+exercised yet (the build sandbox has no DNS on port 53).
 
 Without an sshd that has ML-KEM (OpenSSH before 9.9), the hybrid is
 checked against a reference server built on OpenSSL's primitives
@@ -83,7 +89,10 @@ servers without the Terrapin fix), `--no-obfuscate-keystrokes`, `-N -L
 [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT`, `-R
 [localhost:]RPORT:HOST:HOSTPORT` (each repeatable), `-J USER@JUMP[:PORT]`, `--pylond FILE` (experimental, a terminal or `-N` with `-L`/`-D`/`-R`). With no COMMAND, `pylon
 USER@HOST` opens an interactive shell. Pinned keys live in
-`$PYLON_HOME/known_hosts` (default `~/.config/pylon/known_hosts`).
+`$PYLON_HOME/known_hosts` (default `~/.config/pylon/known_hosts`). A host
+with no pin is looked up for SSHFP records through the resolvers of
+`/etc/resolv.conf` (or `PYLON_DNS=IP[:PORT],...`); Pylon checks every
+signature itself, so the resolver need not be trusted.
 
 ## Tests
 
@@ -94,6 +103,8 @@ residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, repla
 residc test tests/term_test.resid  # the terminal emulator core
 tests/local_shell.sh build         # the local shell can't read PYLON_HOME or reach SSH_AUTH_SOCK
 (cd app && flutter test)           # the app: keys, frames, tabs and splits, the local shell's backend
+residc test tests/dnssec_test.resid # the DNSSEC validator (fixtures: tests/dnssec_zone.py fixtures FILE)
+residc test tests/oob_test.resid   # out-of-band fingerprints and the QR payload
 
 # Fuzzing through a mutating proxy in front of a running sshd (port 2222),
 # with the host pinned under the proxy's port:
