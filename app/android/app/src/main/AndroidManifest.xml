@@ -2,6 +2,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- The active network's DNS servers (MainActivity.resolvConf). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Symbolon's agent service (SymbolonAgent) requires this. It is
+         signature|knownSigner: Android grants it, at install, only to a Pylon
+         signed with a certificate Symbolon names, and only when Symbolon was
+         installed first. -->
+    <uses-permission android:name="dev.symbolon.permission.SSH_SIGN" />
     <application
         android:label="Pylon"
         android:extractNativeLibs="true"
@@ -50,6 +55,9 @@
 
          In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
     <queries>
+        <!-- Symbolon, whose signer SymbolonAgent checks before it binds: an
+             app is invisible to Pylon without this (Android 11 and later). -->
+        <package android:name="dev.symbolon.app" />
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

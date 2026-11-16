@@ -211,7 +211,9 @@ Authed login(Str user, Str host, Opts o, Int via) {
     Conn none = conn_new(-1);
     if (agent == -1) { return Authed {.c = none, .ok = false, .why = "no agent (set SSH_AUTH_SOCK to Symbolon's agent)"}; }
     List(Ident) ids = agent_ids(agent);
-    if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = "the agent holds no keys"}; }
+    // In the Android app an unreachable Symbolon also answers with nothing.
+    Str nokeys = if (environment.get("PYLON_AGENT") == "app") { "Symbolon offered no keys: it holds none, or Pylon cannot reach it (Pylon must be installed after Symbolon)" } else { "the agent holds no keys" };
+    if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = nokeys}; }
     // A host with no pin: what DNSSEC-validated SSHFP records say (SPEC 6.1.2).
     Verdict dv = if (pinned.len() == 0) { dns_for(host) } else { no_dns() };
     Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
