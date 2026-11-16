@@ -24,77 +24,94 @@ import io.flutter.plugin.common.MethodChannel
 
 /**
  * The Dart side runs the Resid core as processes: `libpylon.so` (the
- * connection) and `libpylon_term.so` (the confined emulator) are static
- * executables packaged as native libraries, so Android extracts them to
+ * connection) and `libpylon_term.so` (the emulator, in [TermService]) are
+ * static executables packaged as native libraries, so Android extracts them to
  * nativeLibraryDir, the one place an app may execute its own code from.
  * Terminal content is kept out of screenshots and recents (FLAG_SECURE)
  * unless the principal turns that off (SPEC 15).
  *
- * The local shell (SPEC 13) runs in [LocalShellService], an isolated
- * process under a UID of its own; this activity holds one end of a socket
- * pair per shell and passes bytes between it and the Dart side
- * ("localStart", "localInput", "localClose"; output on "pylon/local").
+ * The local shell (SPEC 13) and the terminal emulator (SPEC 12) run in
+ * isolated processes under UIDs of their own ([LocalShellService],
+ * [TermService]); this activity holds one end of a socket pair per program
+ * and passes bytes between it and the Dart side ("localStart" with kind
+ * "shell" or "term", "localInput", "localClose"; output on "pylon/local").
  */
 class MainActivity : FlutterActivity() {
     private val agent by lazy { SymbolonAgent(applicationContext) }
 
-    // The local shells: their ends of the socket pairs, by id.
+    // The isolated programs (local shells, terminal emulators): their ends
+    // of the socket pairs, by id, and which service runs each.
     private val shells = HashMap<Int, ParcelFileDescriptor>()
     private val shellOut = HashMap<Int, OutputStream>()
+    private val shellOf = HashMap<Int, Isolated>()
     private var nextShell = 1
     private var localSink: EventChannel.EventSink? = null
-    private var localBinder: IBinder? = null
-    private val localWaiting = ArrayList<(IBinder?) -> Unit>()
     private val writer = Executors.newSingleThreadExecutor()
-    private val localConn = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            localBinder = service
-            val w = ArrayList(localWaiting)
-            localWaiting.clear()
-            w.forEach { it(service) }
+
+    /** One isolated service, bound on first use. */
+    private inner class Isolated(val cls: Class<out IsolatedRelayService>, val descriptor: String) {
+        var binder: IBinder? = null
+        val waiting = ArrayList<(IBinder?) -> Unit>()
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                binder = service
+                val w = ArrayList(waiting)
+                waiting.clear()
+                w.forEach { it(service) }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                // The sandbox died: everything it ran ends with it.
+                binder = null
+                for ((id, i) in HashMap(shellOf)) if (i === this@Isolated) closeShell(id)
+            }
         }
 
-        override fun onServiceDisconnected(name: ComponentName?) {
-            // The sandbox died: every local shell ends with it.
-            localBinder = null
-            for (id in ArrayList(shells.keys)) closeShell(id)
+        fun with(then: (IBinder?) -> Unit) {
+            val b = binder
+            if (b != null) { then(b); return }
+            waiting.add(then)
+            if (waiting.size == 1 && !bindService(Intent(this@MainActivity, cls), conn, Context.BIND_AUTO_CREATE)) {
+                waiting.clear()
+                then(null)
+            }
+        }
+
+        fun unbind() {
+            if (binder != null || waiting.isNotEmpty()) {
+                try { unbindService(conn) } catch (_: IllegalArgumentException) {}
+            }
         }
     }
 
-    private fun withLocalService(then: (IBinder?) -> Unit) {
-        val b = localBinder
-        if (b != null) { then(b); return }
-        localWaiting.add(then)
-        if (localWaiting.size == 1 && !bindService(Intent(this, LocalShellService::class.java), localConn, Context.BIND_AUTO_CREATE)) {
-            localWaiting.clear()
-            then(null)
-        }
-    }
+    private val localShell = Isolated(LocalShellService::class.java, LocalShellService.DESCRIPTOR)
+    private val term = Isolated(TermService::class.java, TermService.DESCRIPTOR)
 
-    private fun startShell(rows: Int, cols: Int, result: MethodChannel.Result) = withLocalService { b ->
-        if (b == null) { result.error("local", "the local shell service cannot be bound", null); return@withLocalService }
+    private fun startShell(svc: Isolated, rows: Int, cols: Int, result: MethodChannel.Result) = svc.with { b ->
+        if (b == null) { result.error("local", "the isolated service cannot be bound", null); return@with }
         val pair = ParcelFileDescriptor.createSocketPair()
         val id = nextShell++
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         try {
-            data.writeInterfaceToken(LocalShellService.DESCRIPTOR)
+            data.writeInterfaceToken(svc.descriptor)
             data.writeFileDescriptor(pair[1].fileDescriptor)
             data.writeInt(rows)
             data.writeInt(cols)
-            b.transact(LocalShellService.START, data, reply, 0)
+            b.transact(IsolatedRelayService.START, data, reply, 0)
             reply.readException()
         } catch (e: Exception) {
             pair[0].close()
             pair[1].close()
-            result.error("local", "the local shell service failed: ${e.message}", null)
-            return@withLocalService
+            result.error("local", "the isolated service failed: ${e.message}", null)
+            return@with
         } finally {
             data.recycle()
             reply.recycle()
         }
         pair[1].close()
         shells[id] = pair[0]
+        shellOf[id] = svc
         shellOut[id] = ParcelFileDescriptor.AutoCloseOutputStream(pair[0].dup())
         Thread {
             val input = ParcelFileDescriptor.AutoCloseInputStream(pair[0].dup())
@@ -118,6 +135,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun closeShell(id: Int) {
+        shellOf.remove(id)
         val out = shellOut.remove(id)
         val fd = shells.remove(id)
         writer.execute {
@@ -128,9 +146,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         for (id in ArrayList(shells.keys)) closeShell(id)
-        if (localBinder != null || localWaiting.isNotEmpty()) {
-            try { unbindService(localConn) } catch (_: IllegalArgumentException) {}
-        }
+        localShell.unbind()
+        term.unbind()
         super.onDestroy()
     }
 
@@ -231,7 +248,7 @@ class MainActivity : FlutterActivity() {
                 "localStart" -> {
                     val rows = call.argument<Number>("rows")?.toInt() ?: 24
                     val cols = call.argument<Number>("cols")?.toInt() ?: 80
-                    startShell(rows, cols, result)
+                    startShell(if (call.argument<String>("kind") == "term") term else localShell, rows, cols, result)
                 }
                 "localInput" -> {
                     val id = call.argument<Number>("id")?.toInt()

@@ -49,6 +49,14 @@
             android:isolatedProcess="true"
             android:process=":local"
             android:exported="false" />
+        <!-- The terminal emulator (SPEC 12): the parser of a hostile host's
+             output, in an isolated process of its own, apart from the
+             connection, Symbolon's binding and the local shell. -->
+        <service
+            android:name=".TermService"
+            android:isolatedProcess="true"
+            android:process=":term"
+            android:exported="false" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

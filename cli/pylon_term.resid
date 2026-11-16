@@ -8,6 +8,13 @@
 // its input and writing its output (resid_sandbox_confine). A bug in it
 // yields a process that can draw one terminal and nothing else.
 //
+//   pylon-term ROWS COLS [--android | --allow-unconfined]
+//
+// Without Landlock it refuses to run, unless the platform confines it:
+// --android, given only by Pylon's TermService, an Android isolatedProcess
+// (a UID of its own, no permissions, no storage, no network, no binder to
+// Symbolon; SPEC 12). Phones' kernels have no Landlock.
+//
 // Frames both ways: type (1) | length (4, big-endian) | payload.
 //
 //   app -> term
@@ -113,7 +120,8 @@ Int main() {
     List(Str) none = [];
     Int c = resid_sandbox_confine(none, none);
     if (c < 0) { eprintln("pylon-term: confinement failed"); return 1; }
-    if (c == 0 && !(args.count() >= 4 && args.get(3) == "--allow-unconfined")) { eprintln("pylon-term: this kernel cannot confine the emulator (no Landlock)"); return 3; }
+    Bool platform = args.count() >= 4 && (args.get(3) == "--android" || args.get(3) == "--allow-unconfined");
+    if (c == 0 && !platform) { eprintln("pylon-term: this kernel cannot confine the emulator (no Landlock)"); return 3; }
     Term t = term_new(rows, cols);
     _ = print_bytes(screen(t));
     return serve(St {.t = t, .buf = [], .title = ""});

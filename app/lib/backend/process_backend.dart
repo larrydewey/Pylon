@@ -32,9 +32,12 @@ abstract class Conduit {
 }
 
 class ProcessConduit implements Conduit {
-  ProcessConduit(this.p);
+  ProcessConduit(this.p) {
+    // An ended process's input takes nothing more.
+    p.exitCode.then((_) => _ended = true);
+  }
   final Process p;
-  bool _closed = false;
+  bool _closed = false, _ended = false;
 
   @override
   Stream<List<int>> get output => p.stdout;
@@ -42,7 +45,12 @@ class ProcessConduit implements Conduit {
   Stream<String> get messages => p.stderr.transform(utf8.decoder);
   @override
   void add(List<int> frame) {
-    if (!_closed) p.stdin.add(frame);
+    if (_closed || _ended) return;
+    try {
+      p.stdin.add(frame);
+    } on StateError {
+      _ended = true;
+    }
   }
 
   @override
@@ -69,12 +77,13 @@ class ProcessBackend implements Backend {
         pylondPath = '$binDir/pylond',
         localPath = '$binDir/pylon-local',
         localConduit = null,
+        termConduit = null,
         resolvConf = null;
 
   /// Explicit paths (Android: the native library directory for the core,
   /// a directory of pylond builds per machine type, and the local shell
   /// through the isolated service, [localConduit]).
-  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose, this.localPath, this.localConduit, this.resolvConf});
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose, this.localPath, this.localConduit, this.termConduit, this.resolvConf});
 
   /// Where the core's agent requests go when it has no SSH_AUTH_SOCK
   /// (Android: Symbolon's agent service, SPEC 7.3). Gets a session's
@@ -84,6 +93,11 @@ class ProcessBackend implements Backend {
 
   /// Ends a session's agent connection.
   void Function(int conn)? agentClose;
+
+  /// Starts a terminal emulator elsewhere than in a child process
+  /// (Android: in the isolated TermService, SPEC 12; phones have no
+  /// Landlock for pylon-term to confine itself with).
+  final Future<Conduit> Function(int rows, int cols)? termConduit;
 
   /// The network's DNS servers and search domains as resolv.conf text, for
   /// a system without /etc/resolv.conf (Android), asked at each start since
@@ -206,7 +220,8 @@ class ProcSession extends Session {
   final ProcessBackend b;
   final Future<Conduit> Function() _connect;
   Conduit? _conn;
-  Process? _term;
+  // The emulator: a child process, or the isolated service on Android.
+  Conduit? _term;
   bool _closed = false;
 
   // Until the core says the terminal is ready (frame 4) it reads nothing
@@ -233,26 +248,39 @@ class ProcSession extends Session {
     status = local ? 'Starting the local shell…' : 'Connecting…';
     changed();
     try {
-      _term = await Process.start(b.termPath, ['$rows', '$cols']);
+      final tc = b.termConduit;
+      _term = tc != null ? await tc(rows, cols) : ProcessConduit(await Process.start(b.termPath, ['$rows', '$cols']));
       _conn = await _connect();
     } catch (e) {
       status = local ? 'Cannot start the local shell: $e' : 'Cannot start the Pylon core: $e';
       // `this.`: a bare exitCode here is dart:io's (this process's status).
       this.exitCode = 255;
-      _term?.kill();
+      _term?.close();
       changed();
       return;
     }
     if (_closed) {
       _conn?.close();
-      _term?.kill();
+      _term?.close();
       return;
     }
-    _term!.stdout.listen(_onTerm);
+    _term!.output.listen(_onTerm);
+    // The emulator ending before the session (it refused to run, or failed)
+    // ends the session: there is nothing to draw its output with.
+    final termSaid = StringBuffer();
+    _term!.messages.listen(termSaid.write);
+    _term!.exitCode.then((c) {
+      if (this.exitCode != null || _closed) return;
+      final why = termSaid.toString().trim();
+      status = 'The terminal emulator stopped${why.isEmpty ? ' ($c)' : ': $why'}';
+      this.exitCode = 255;
+      _conn?.close();
+      changed();
+    });
     _conn!.output.listen((d) {
       for (final (t, p) in _fromConn.add(d)) {
         if (t == 1) {
-          _term?.stdin.add(frame(1, p));
+          _term?.add(frame(1, p));
         } else if (t == 3 && !local) {
           _agentRequest(Uint8List.fromList(p));
         } else if (t == 4 && !_ready) {
@@ -274,7 +302,7 @@ class ProcSession extends Session {
     });
     _conn!.exitCode.then((c) {
       this.exitCode = _reported ?? c;
-      _term?.stdin.close().catchError((_) {});
+      _term?.close();
       changed();
     });
     resize(rows, cols);
@@ -323,7 +351,7 @@ class ProcSession extends Session {
     if (this.exitCode != null || _closed) return;
     final p = [(rows >> 8) & 255, rows & 255, (cols >> 8) & 255, cols & 255];
     _toConn(frame(2, p));
-    _term?.stdin.add(frame(2, p));
+    _term?.add(frame(2, p));
   }
 
   @override
@@ -331,8 +359,7 @@ class ProcSession extends Session {
     _closed = true;
     if (!local) b.agentClose?.call(_agentConn);
     _conn?.close();
-    _term?.stdin.close().catchError((_) {});
-    _term?.kill();
+    _term?.close();
   }
 }
 

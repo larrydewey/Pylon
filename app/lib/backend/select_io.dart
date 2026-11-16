@@ -45,6 +45,7 @@ Future<Backend> makeBackend() async {
         agent: (conn, req) async => await platform.invokeMethod<Uint8List>('agent', {'conn': conn, 'request': req}),
         agentClose: (conn) => platform.invokeMethod('agentClose', conn),
         localConduit: ServiceConduit.start,
+        termConduit: (rows, cols) => ServiceConduit.start(rows, cols, kind: 'term'),
         resolvConf: () => platform.invokeMethod<String>('resolvConf'));
   }
   final env = Platform.environment;
@@ -101,7 +102,9 @@ class ServiceConduit implements Conduit {
   static final Map<int, ServiceConduit> _open = {};
   static StreamSubscription<dynamic>? _sub;
 
-  static Future<Conduit> start(int rows, int cols) async {
+  /// [kind] "shell": the local shell (LocalShellService); "term": a
+  /// terminal emulator (TermService), each in an isolated process.
+  static Future<Conduit> start(int rows, int cols, {String kind = 'shell'}) async {
     _sub ??= _events.receiveBroadcastStream().listen((e) {
       final m = e as Map;
       final c = _open[m['id'] as int];
@@ -110,8 +113,8 @@ class ServiceConduit implements Conduit {
       if (data is Uint8List) c._got(data);
       if (m['end'] == true) c._ended();
     });
-    final id = await platform.invokeMethod<int>('localStart', {'rows': rows, 'cols': cols});
-    if (id == null) throw StateError('the local shell service did not start');
+    final id = await platform.invokeMethod<int>('localStart', {'rows': rows, 'cols': cols, 'kind': kind});
+    if (id == null) throw StateError('the isolated service did not start');
     return _open[id] = ServiceConduit._(id);
   }
 
