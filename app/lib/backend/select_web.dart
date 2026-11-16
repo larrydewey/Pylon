@@ -10,3 +10,6 @@ bool get desktopLayout => false;
 String get deviceName => 'this device';
 
 String get agentNote => 'Demo';
+
+/// No key-holding app in the demo.
+Future<bool> openKeyHolder() async => false;

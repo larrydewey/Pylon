@@ -118,6 +118,7 @@ class _TerminalPageState extends State<TerminalPage> {
         ],
       ),
       body: Column(children: [
+        if (s.agentKeys == AgentKeys.none || s.agentKeys == AgentKeys.unreachable) _KeysCard(session: s),
         if (s.status.trim().isNotEmpty)
           Container(
             width: double.infinity,
@@ -177,4 +178,50 @@ class LocalNote extends StatelessWidget {
           style: const TextStyle(fontSize: 12, height: 1.5, color: P.localMuted),
         ),
       );
+}
+
+/// Symbolon has no SSH key to offer, or Pylon cannot reach it: what to do
+/// there, and a way to get there, in place of a bare refusal.
+class _KeysCard extends StatelessWidget {
+  const _KeysCard({required this.session});
+  final Session session;
+
+  @override
+  Widget build(BuildContext context) {
+    final none = session.agentKeys == AgentKeys.none;
+    final host = session.host.address;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(color: P.amberDeep, borderRadius: BorderRadius.circular(12), border: Border.all(color: P.amberLine)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(none ? 'Symbolon has no SSH key yet' : 'Pylon cannot reach Symbolon',
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: P.amber)),
+        const SizedBox(height: 8),
+        Text(
+          none
+              ? '1. In Symbolon, open SSH keys and make a key (or import one).\n'
+                  '2. Add its public key to ~/.ssh/authorized_keys on $host.\n'
+                  '3. Come back and connect again. Symbolon asks you before it signs.'
+              : 'Symbolon holds the keys Pylon signs in with. Install Symbolon, or if it is '
+                  'installed, install Pylon again after it: Android grants Pylon access to '
+                  'Symbolon only when Symbolon is already there.',
+          style: const TextStyle(fontSize: 13, height: 1.4, color: P.text),
+        ),
+        const SizedBox(height: 10),
+        FilledButton.icon(
+          key: const Key('open-symbolon'),
+          icon: const Icon(Icons.vpn_key_outlined, size: 18),
+          label: Text(none ? 'Open SSH keys in Symbolon' : 'Open Symbolon'),
+          onPressed: () async {
+            final ok = await openKeyHolder();
+            if (!ok && context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Symbolon is not installed on this phone.')));
+            }
+          },
+        ),
+      ]),
+    );
+  }
 }

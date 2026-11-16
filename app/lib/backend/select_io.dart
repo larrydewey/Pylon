@@ -64,6 +64,13 @@ Future<void> setSecure(bool on) async {
 /// one-terminal layout (PYLON_LAYOUT=phone: the phone layout anywhere).
 bool get desktopLayout => (Platform.isLinux || Platform.isMacOS || Platform.isWindows) && Platform.environment['PYLON_LAYOUT'] != 'phone';
 
+/// Opens Symbolon at its SSH keys (Android), the app that holds the keys;
+/// false where there is no such app or it could not be opened.
+Future<bool> openKeyHolder() async {
+  if (!Platform.isAndroid) return false;
+  return await platform.invokeMethod<bool>('openSymbolonKeys') ?? false;
+}
+
 /// Where signatures come from, for the desktop's title bar.
 String get agentNote => Platform.isAndroid ? 'Symbolon' : (Platform.environment['SSH_AUTH_SOCK'] != null ? 'Agent at SSH_AUTH_SOCK' : 'No agent (SSH_AUTH_SOCK unset)');
 

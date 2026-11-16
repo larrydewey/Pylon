@@ -191,6 +191,10 @@ class MainActivity : FlutterActivity() {
                     )
                 )
                 "resolvConf" -> result.success(resolvConf())
+                "openSymbolonKeys" -> Thread {
+                    val ok = agent.openKeys()
+                    runOnUiThread { result.success(ok) }
+                }.start()
                 "agent" -> {
                     val conn = (call.argument<Number>("conn"))?.toLong()
                     val req = call.argument<ByteArray>("request")

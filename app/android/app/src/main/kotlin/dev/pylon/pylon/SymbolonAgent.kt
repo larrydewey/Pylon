@@ -37,6 +37,8 @@ class SymbolonAgent(private val ctx: Context) {
     companion object {
         const val PACKAGE = "dev.symbolon.app"
         const val ACTION = "dev.symbolon.action.SSH_AGENT"
+        /** Symbolon's SSH keys page, where the principal makes or imports a key. */
+        const val ACTION_SSH_KEYS = "dev.symbolon.action.SSH_KEYS"
         const val CALL = IBinder.FIRST_CALL_TRANSACTION
         const val WAIT = IBinder.FIRST_CALL_TRANSACTION + 1
         const val CLOSE = IBinder.FIRST_CALL_TRANSACTION + 2
@@ -48,6 +50,21 @@ class SymbolonAgent(private val ctx: Context) {
     }
 
     @Volatile private var binder: IBinder? = null
+
+    /**
+     * Opens Symbolon at its SSH keys (falling back to its start page for a
+     * Symbolon without that entry), but only the Symbolon signed by a pinned
+     * certificate: another app cannot take the principal there in its place.
+     */
+    fun openKeys(): Boolean {
+        if (!signerOk()) return false
+        val keys = Intent(ACTION_SSH_KEYS).setPackage(PACKAGE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val start = ctx.packageManager.getLaunchIntentForPackage(PACKAGE)?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        for (i in listOfNotNull(keys, start)) {
+            try { ctx.startActivity(i); return true } catch (_: android.content.ActivityNotFoundException) {}
+        }
+        return false
+    }
 
     private fun signerOk(): Boolean {
         if (PINNED.isEmpty()) return false

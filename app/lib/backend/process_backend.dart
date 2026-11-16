@@ -286,6 +286,12 @@ class ProcSession extends Session {
     final a = b.agent;
     // No agent: an empty failure message (SSH_AGENT_FAILURE).
     final reply = a == null ? null : await a(_agentConn, req);
+    // A request for the agent's keys (11): an empty answer (12, count 0)
+    // or none at all is something the principal fixes in Symbolon.
+    if (a != null && req.length >= 5 && req[4] == 11) {
+      agentKeys = keysIn(reply);
+      changed();
+    }
     _conn?.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
   }
 
@@ -313,6 +319,8 @@ class ProcSession extends Session {
 
   @override
   void resize(int rows, int cols) {
+    // An ended session's emulator input is closed; the view still lays out.
+    if (exitCode != null || _closed) return;
     final p = [(rows >> 8) & 255, rows & 255, (cols >> 8) & 255, cols & 255];
     _toConn(frame(2, p));
     _term?.stdin.add(frame(2, p));
@@ -326,4 +334,12 @@ class ProcSession extends Session {
     _term?.stdin.close().catchError((_) {});
     _term?.kill();
   }
+}
+
+/// What an agent's reply to a key request says: some keys, none, or (no
+/// reply, or the failure message) that the agent could not be reached.
+AgentKeys keysIn(Uint8List? reply) {
+  if (reply == null || reply.length < 9 || reply[4] != 12) return AgentKeys.unreachable;
+  final n = (reply[5] << 24) | (reply[6] << 16) | (reply[7] << 8) | reply[8];
+  return n == 0 ? AgentKeys.none : AgentKeys.some;
 }

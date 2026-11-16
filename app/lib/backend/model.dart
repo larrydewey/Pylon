@@ -53,6 +53,9 @@ class Outcome {
   final String message;
 }
 
+/// What the app's agent said about its keys (see [Session.agentKeys]).
+enum AgentKeys { unknown, some, none, unreachable }
+
 /// A live terminal: the latest screen from the confined emulator, its
 /// title, and how it ended. [changes] fires on every update.
 abstract class Session {
@@ -63,6 +66,11 @@ abstract class Session {
   String title = '';
   int? exitCode;
   String status = '';
+
+  /// What the app's agent (Symbolon, on Android) answered when the core
+  /// asked for its keys: [AgentKeys.none] for an empty list,
+  /// [AgentKeys.unreachable] when Pylon could not reach it.
+  AgentKeys agentKeys = AgentKeys.unknown;
   final List<Uint8List> clipboardRequests = [];
   final _changes = StreamController<void>.broadcast();
   Stream<void> get changes => _changes.stream;
