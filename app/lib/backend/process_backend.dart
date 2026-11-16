@@ -320,7 +320,7 @@ class ProcSession extends Session {
   @override
   void resize(int rows, int cols) {
     // An ended session's emulator input is closed; the view still lays out.
-    if (exitCode != null || _closed) return;
+    if (this.exitCode != null || _closed) return;
     final p = [(rows >> 8) & 255, rows & 255, (cols >> 8) & 255, cols & 255];
     _toConn(frame(2, p));
     _term?.stdin.add(frame(2, p));
