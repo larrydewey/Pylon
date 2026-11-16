@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.ConnectivityManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
@@ -161,6 +162,20 @@ class MainActivity : FlutterActivity() {
         return ok
     }
 
+    /** The active network's DNS servers and search domains as resolv.conf
+     *  text, for the core's RESID_RESOLV_CONF: Android has no
+     *  /etc/resolv.conf, and the core looks names up itself. Link-local
+     *  servers are left out (the text has no room for their interface).
+     *  Empty when there is no active network. */
+    private fun resolvConf(): String {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return ""
+        val lp = cm.getLinkProperties(cm.activeNetwork) ?: return ""
+        val servers = lp.dnsServers.filter { !it.isLinkLocalAddress }.mapNotNull { it.hostAddress }.map { "nameserver $it" }
+        val domains = (lp.domains ?: "").split(',', ' ').map { it.trim().trimEnd('.') }.filter { it.isNotEmpty() }
+        val search = if (domains.isEmpty()) emptyList() else listOf("search " + domains.joinToString(" "))
+        return (servers + search).joinToString("\n")
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, "pylon/local").setStreamHandler(object : EventChannel.StreamHandler {
@@ -175,6 +190,7 @@ class MainActivity : FlutterActivity() {
                         "files" to filesDir.absolutePath,
                     )
                 )
+                "resolvConf" -> result.success(resolvConf())
                 "agent" -> {
                     val conn = (call.argument<Number>("conn"))?.toLong()
                     val req = call.argument<ByteArray>("request")

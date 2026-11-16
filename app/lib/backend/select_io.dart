@@ -13,7 +13,8 @@ const platform = MethodChannel('pylon/platform');
 /// The core's binaries. Android: libpylon.so and libpylon_term.so in the
 /// native library directory, the pylond builds and their signed release
 /// unpacked from the app's assets, PYLON_HOME in the app's private files,
-/// and the local shell in the isolated service (libpylon_local.so there).
+/// the local shell in the isolated service (libpylon_local.so there), and
+/// the active network's DNS servers, since Android has no /etc/resolv.conf.
 /// Desktop: PYLON_BIN_DIR, else beside this executable, and PYLON_HOME as the command-line client
 /// uses it. With PYLON_DEMO=1, or no core found, the demo backend (which
 /// says so on every screen).
@@ -43,7 +44,8 @@ Future<Backend> makeBackend() async {
     return ProcessBackend.at('$bin/libpylon.so', '$bin/libpylon_term.so', pylond, '$files/pylon',
         agent: (conn, req) async => await platform.invokeMethod<Uint8List>('agent', {'conn': conn, 'request': req}),
         agentClose: (conn) => platform.invokeMethod('agentClose', conn),
-        localConduit: ServiceConduit.start);
+        localConduit: ServiceConduit.start,
+        resolvConf: () => platform.invokeMethod<String>('resolvConf'));
   }
   final env = Platform.environment;
   if (env['PYLON_DEMO'] == '1') return DemoBackend();

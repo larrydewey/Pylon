@@ -68,12 +68,13 @@ class ProcessBackend implements Backend {
         termPath = '$binDir/pylon-term',
         pylondPath = '$binDir/pylond',
         localPath = '$binDir/pylon-local',
-        localConduit = null;
+        localConduit = null,
+        resolvConf = null;
 
   /// Explicit paths (Android: the native library directory for the core,
   /// a directory of pylond builds per machine type, and the local shell
   /// through the isolated service, [localConduit]).
-  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose, this.localPath, this.localConduit});
+  ProcessBackend.at(this.pylonPath, this.termPath, this.pylondPath, this.home, {this.agent, this.agentClose, this.localPath, this.localConduit, this.resolvConf});
 
   /// Where the core's agent requests go when it has no SSH_AUTH_SOCK
   /// (Android: Symbolon's agent service, SPEC 7.3). Gets a session's
@@ -83,6 +84,12 @@ class ProcessBackend implements Backend {
 
   /// Ends a session's agent connection.
   void Function(int conn)? agentClose;
+
+  /// The network's DNS servers and search domains as resolv.conf text, for
+  /// a system without /etc/resolv.conf (Android), asked at each start since
+  /// the network changes: the core looks names up itself, through
+  /// RESID_RESOLV_CONF. Empty or null: the core reads /etc/resolv.conf.
+  final Future<String?> Function()? resolvConf;
 
   int _conns = 0;
 
@@ -104,7 +111,14 @@ class ProcessBackend implements Backend {
 
   String get _pylon => pylonPath;
   String get _hostsFile => '$home/app_hosts.json';
-  Map<String, String> get _env => {'PYLON_HOME': home, if (agent != null) 'PYLON_AGENT': 'app'};
+  Future<Map<String, String>> _env() async {
+    final conf = await resolvConf?.call();
+    return {
+      'PYLON_HOME': home,
+      if (agent != null) 'PYLON_AGENT': 'app',
+      if (conf != null && conf.isNotEmpty) 'RESID_RESOLV_CONF': conf,
+    };
+  }
 
   /// pylon-local's environment: nothing of the app's but what it needs
   /// to find the local home and to refuse a layout that would put
@@ -144,7 +158,7 @@ class ProcessBackend implements Backend {
 
   @override
   Future<List<Pin>> pins() async {
-    final r = await Process.run(_pylon, ['pins'], environment: _env);
+    final r = await Process.run(_pylon, ['pins'], environment: await _env());
     final out = <Pin>[];
     for (final l in (r.stdout as String).split('\n')) {
       final f = l.split(' ');
@@ -155,20 +169,20 @@ class ProcessBackend implements Backend {
 
   @override
   Future<Outcome> pin(Host h, String fingerprint) async {
-    final r = await Process.run(_pylon, ['pin', '-p', '${h.port}', h.address, fingerprint], environment: _env);
+    final r = await Process.run(_pylon, ['pin', '-p', '${h.port}', h.address, fingerprint], environment: await _env());
     return Outcome(r.exitCode == 0, '${r.stdout}${r.stderr}'.trim());
   }
 
   @override
   Future<Outcome> trustCa(String pattern, String key) async {
-    final r = await Process.run(_pylon, ['ca', pattern, key], environment: _env);
+    final r = await Process.run(_pylon, ['ca', pattern, key], environment: await _env());
     return Outcome(r.exitCode == 0, '${r.stdout}${r.stderr}'.trim());
   }
 
   @override
   Session open(Host h, int rows, int cols) => ProcSession(this, h, rows, cols, () async {
         final args = ['--app', '-p', '${h.port}', if (h.jump.isNotEmpty) ...['-J', h.jump], if (h.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', pylondPath], h.target];
-        return ProcessConduit(await Process.start(pylonPath, args, environment: _env));
+        return ProcessConduit(await Process.start(pylonPath, args, environment: await _env()));
       });
 
   @override

@@ -99,7 +99,10 @@ USER@HOST` opens an interactive shell. Pinned keys live in
 `$PYLON_HOME/known_hosts` (default `~/.config/pylon/known_hosts`). A host
 with no pin is looked up for SSHFP records through the resolvers of
 `/etc/resolv.conf` (or `PYLON_DNS=IP[:PORT],...`); Pylon checks every
-signature itself, so the resolver need not be trusted.
+signature itself, so the resolver need not be trusted. Where there is no
+`/etc/resolv.conf` (Android), `RESID_RESOLV_CONF` carries its text: the
+app sets it from the active network, so host names and search domains
+work there as they do on the desktop.
 
 ## Tests
 

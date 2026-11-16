@@ -6,6 +6,8 @@
 //
 // Resolvers: $PYLON_DNS ("IP[:PORT][,IP[:PORT]...]", an IPv6 address with
 // a port in brackets: "[IP6]:PORT") or the nameserver lines of
+// $RESID_RESOLV_CONF (resolv.conf text, which the Android app sets from the
+// active network, there being no /etc/resolv.conf there) or of
 // /etc/resolv.conf (IPv4 or IPv6), at most three, each asked twice with a
 // 1.5 s wait before the next.
 
@@ -36,9 +38,14 @@ pub Server server_of(Str s0) {
 pub List(Server) resolvers() {
     Str env = environment.get("PYLON_DNS");
     if (str_len(env) > 0) { return servers_of(str_split(env, ","), 0, []); }
+    Str conf = environment.get("RESID_RESOLV_CONF");
+    if (str_len(conf) > 0) { return conf_servers(conf); }
     if (!filesystem.exists("/etc/resolv.conf")) { return []; }
-    return conf_acc(str_split(filesystem.read_all("/etc/resolv.conf"), "\n"), 0, []);
+    return conf_servers(filesystem.read_all("/etc/resolv.conf"));
 }
+
+// The nameservers of resolv.conf text, at most three.
+pub List(Server) conf_servers(Str text) { return conf_acc(str_split(text, "\n"), 0, []); }
 
 List(Server) servers_of(List(Str) xs, Int i, List(Server) acc) {
     if (i >= xs.len() || acc.len() >= 3) { return acc; }
@@ -62,7 +69,7 @@ Int new_id() {
 // One question to the resolvers, in turn, until one answers.
 @requires(network, clock(readonly))
 pub Msg ask(List(Server) ss, List(Int) qname, Int qtype) {
-    if (ss.len() == 0) { return msg_err("no resolver (nameserver in /etc/resolv.conf, or PYLON_DNS)"); }
+    if (ss.len() == 0) { return msg_err("no resolver (nameserver in /etc/resolv.conf or RESID_RESOLV_CONF, or PYLON_DNS)"); }
     return ask_at(ss, qname, qtype, 0, 0, "");
 }
 

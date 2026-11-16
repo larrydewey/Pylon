@@ -84,6 +84,13 @@ test "resolver servers" {
     assert(server_of("resolver.example").port == 0 && server_of("[2001:db8::53]x").port == 0 && server_of("1.2.3.4:0").port == 0, "refused");
 }
 
+test "resolv.conf text" {
+    // What the Android app passes in RESID_RESOLV_CONF.
+    List(Server) ss = conf_servers("nameserver 100.85.255.254\nnameserver fc00:a:a::400\nsearch netbird.selfhosted");
+    assert(ss.len() == 2 && ss[0].host == "100.85.255.254" && ss[1].addr.len() == 16 && ss[1].port == 53, "nameservers, the search line skipped");
+    assert(conf_servers("").len() == 0 && conf_servers("search example.test").len() == 0, "none");
+}
+
 test "forward specs with an IPv6 host" {
     Fwd f = parse_fwd(0, "8080:[2001:db8::7]:80");
     assert(f.lport == 8080 && f.host == "2001:db8::7" && f.hport == 80, "-L");

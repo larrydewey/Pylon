@@ -291,7 +291,10 @@ for raw records and checks every signature itself.
 
 *Resolver.* The nameservers of `/etc/resolv.conf` (IPv4 or IPv6, at most
 three), or `PYLON_DNS=IP[:PORT][,...]` (an IPv6 address with a port in
-brackets, `[ADDR]:PORT`). Queries carry EDNS0 (1232 bytes) with DO
+brackets, `[ADDR]:PORT`). `RESID_RESOLV_CONF`, resolv.conf text, stands
+in for the file where there is none: the Android app sets it from the
+active network's DNS servers and search domains, and the Resid runtime
+reads it too, for the addresses of names it connects to. Queries carry EDNS0 (1232 bytes) with DO
 and CD set, a random ID, recursion desired; an answer counts only from
 the server's address and port, with the same ID and the question echoed.
 A truncated answer is asked again over TCP. Each server is asked twice,
