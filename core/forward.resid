@@ -25,6 +25,7 @@ import "crypto.resid";
 import "wire.resid";
 import "transport.resid";
 import "session.resid";
+import "addr.resid";
 
 // kind: 0 local (-L), 1 dynamic (-D), 2 remote (-R). For -R, lport is
 // the port on the server and lfd is unused.
@@ -44,9 +45,17 @@ Int fwd_window() { return 2097152; }
 Int fwd_max_packet() { return 32768; }
 
 // A forward spec of `kind`, or one with lport 0 when malformed. Only a
-// loopback bind address is accepted, on either side.
+// loopback bind address is accepted, on either side. An IPv6 HOST is in
+// brackets ("8080:[::1]:80").
 pub Fwd parse_fwd(Int kind, Str spec) {
-    List(Str) p = str_split(spec, ":");
+    Int ob = index_of(spec, "[");
+    Int cb = index_of(spec, "]");
+    Bool br = ob >= 0 && cb > ob;
+    Str inner = if (br) { str_slice(spec, ob + 1, cb) } else { "" };
+    if ((ob >= 0 || cb >= 0) && (!br || ipv6(inner).len() != 16)) { return no_fwd(); }
+    // The bracketed host stands in as one field while the spec is split.
+    List(Str) p0 = str_split(if (br) { str_slice(spec, 0, ob) + "\x01" + str_slice(spec, cb + 1, str_len(spec)) } else { spec }, ":");
+    List(Str) p = unmask(p0, 0, inner, []);
     if (kind == 1) {
         Bool b1 = p.len() == 2;
         if (!(p.len() == 1 || b1) || (b1 && p[0] != "127.0.0.1" && p[0] != "localhost")) { return no_fwd(); }
@@ -64,6 +73,11 @@ pub Fwd parse_fwd(Int kind, Str spec) {
     Int hp = if (ok) { str_parse_int(p[o + 2]) } else { 0 };
     if (!ok || lp < 1 || lp > 65535 || hp < 1 || hp > 65535) { return no_fwd(); }
     return Fwd {.kind = kind, .lport = lp, .host = p[o + 1], .hport = hp, .lfd = -1};
+}
+
+List(Str) unmask(List(Str) p, Int i, Str inner, List(Str) acc) {
+    if (i >= p.len()) { return acc; }
+    return unmask(p, i + 1, inner, acc.concat([if (p[i] == "\x01") { inner } else { p[i] }]));
 }
 
 Int msg_request_success() { return 81; }

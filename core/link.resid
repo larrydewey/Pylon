@@ -48,6 +48,7 @@ import "crypto.resid";
 import "wire.resid";
 import "cipher.resid";
 import "proto.resid";
+import "addr.resid";
 
 Int window_bytes() { return 262144; }
 Int chunk_bytes() { return 1100; }
@@ -583,14 +584,15 @@ pub type Drained = { Link l; List(List(Int)) other; };
 pub Drained drain(Link l, Int now, Int budget, List(List(Int)) other) {
     if (budget <= 0) { return Drained {.l = l, .other = other}; }
     List(Int) d = resid_udp_recv_from(l.udp, 2048);
-    if (d.len() < 6) { return Drained {.l = l, .other = other}; }
+    if (d.len() == 0) { return Drained {.l = l, .other = other}; }
+    if (!dg_ok(d)) { return drain(l, now, budget - 1, other); }
     if (!for_link(l, d)) { return drain(l, now, budget - 1, other.concat([d])); }
     return drain(link_input(l, d, now), now, budget - 1, other);
 }
 
-// Whether a received datagram ([addr, port, packet...]) is a data packet
-// for this link's keys.
-pub Bool for_link(Link l, List(Int) d) { return d.len() > 6 && l.k.ok && data_idx(d[6..d.len()]) == l.k.my_idx; }
+// Whether a received datagram (core/addr.resid) is a data packet for this
+// link's keys.
+pub Bool for_link(Link l, List(Int) d) { return dg_len(d) > 0 && l.k.ok && data_idx(dg_body(d)) == l.k.my_idx; }
 
 // One received datagram for this link: opened, checked against the replay
 // window, and its frame handled; dropped silently when it fails.
@@ -599,13 +601,13 @@ pub Link link_input(Link l, List(Int) d, Int now) {
     // Keys older than 3 minutes are refused (SPEC 9.5): a client rekeys
     // every 2 minutes.
     if (l.server && now - l.keyed > key_life_ns()) { return l; }
-    DataIn o = data_open(l.k, d[6..d.len()]);
+    DataIn o = data_open(l.k, dg_body(d));
     if (!o.ok) { return l; }
     Seen sn = window_take(l.win, o.ctr);
     if (!sn.fresh) { return l; }
     // Roaming: pylond follows the client to the address it now sends from.
-    List(Int) addr = if (l.server) { d[0..4] } else { l.addr };
-    Int port = if (l.server) { d[4] * 256 + d[5] } else { l.port };
+    List(Int) addr = if (l.server) { dg_addr(d) } else { l.addr };
+    Int port = if (l.server) { dg_port(d) } else { l.port };
     Link l2 = Link {.server = l.server, .udp = l.udp, .addr = addr, .port = port, .k = l.k, .tx_ctr = l.tx_ctr, .win = sn.w,
         .streams = l.streams, .next_sid = l.next_sid, .last_rx = now, .last_tx = l.last_tx, .err = l.err, .ev = l.ev, .keyed = l.keyed};
     return on_frame(l2, o.payload, now);

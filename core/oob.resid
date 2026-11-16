@@ -7,7 +7,9 @@
 //   256 SHA256:BASE64 root@h (ED25519)    lines of `ssh-keygen -lf`, one
 //                                          or more (every SHA256: field)
 //   pylon-hostkey/1 HOST[:PORT] SHA256:BASE64 [SHA256:BASE64 ...]
-//                                          the QR payload (SPEC 6.1.4):
+//                                          the QR payload (SPEC 6.1.4; an
+//                                          IPv6 HOST with a port is in
+//                                          brackets, [ADDR]:PORT):
 //                                          the fingerprints bound to the
 //                                          host they are for
 //
@@ -15,6 +17,7 @@
 // the payload form that is not exactly that.
 
 import "crypto.resid";
+import "addr.resid";
 
 // err: why the text is refused ("" when usable). host/port: from a
 // payload (host "" otherwise; port 0 when the payload names none). fps:
@@ -81,13 +84,15 @@ Oob loose(List(Str) ws, Int i, List(Str) acc) {
 Oob payload(List(Str) ws) {
     if (ws.len() < 3) { return oob_err("the payload names no host or no fingerprint"); }
     if (ws.len() > 2 + oob_max()) { return oob_err("more than " + f"{oob_max()}" + " fingerprints"); }
-    List(Str) hp = str_split(ws[1], ":");
-    Str host = str_to_lower(hp[0]);
-    Bool port_ok = hp.len() == 1 || (hp.len() == 2 && str_is_int(hp[1]) && str_len(hp[1]) <= 5 && str_parse_int(hp[1]) >= 1 && str_parse_int(hp[1]) <= 65535);
-    if (str_len(host) == 0 || str_len(host) > 253 || !host_chars(host, 0) || !port_ok) { return oob_err("the payload's host is not HOST or HOST:PORT"); }
+    HostRest hr = split_host(ws[1]);
+    Str host = str_to_lower(hr.host);
+    Str ps = if (str_len(hr.rest) > 1) { str_slice(hr.rest, 1, str_len(hr.rest)) } else { "" };
+    Bool port_ok = str_len(hr.rest) == 0 || (str_is_int(ps) && str_len(ps) <= 5 && str_parse_int(ps) >= 1 && str_parse_int(ps) <= 65535);
+    Bool host_ok = ipv6(host).len() == 16 || host_chars(host, 0);
+    if (str_len(host) == 0 || str_len(host) > 253 || !host_ok || !port_ok) { return oob_err("the payload's host is not HOST, HOST:PORT or [IPV6]:PORT"); }
     List(Str) fps = strict(ws, 2, []);
     if (fps.len() == 0) { return oob_err("the payload holds something other than SHA256: fingerprints"); }
-    return Oob {.err = "", .host = host, .port = if (hp.len() == 2) { str_parse_int(hp[1]) } else { 0 }, .fps = fps};
+    return Oob {.err = "", .host = host, .port = if (str_len(ps) > 0) { str_parse_int(ps) } else { 0 }, .fps = fps};
 }
 
 List(Str) strict(List(Str) ws, Int i, List(Str) acc) {
@@ -107,5 +112,8 @@ Bool host_chars(Str s, Int i) {
 // The payload for a host and its keys' fingerprints (what a host shows as
 // a QR code for the principal to scan).
 pub Str payload_for(Str host, Int port, List(Str) fps) {
-    return payload_tag() + " " + str_to_lower(host) + (if (port != 22 && port > 0) { ":" + f"{port}" } else { "" }) + " " + str_join(fps, " ");
+    Bool v6 = ipv6(host).len() == 16;
+    Str h = if (v6) { ip_text(ipv6(host)) } else { str_to_lower(host) };
+    Bool shown = port != 22 && port > 0;
+    return payload_tag() + " " + (if (v6 && shown) { "[" + h + "]" } else { h }) + (if (shown) { ":" + f"{port}" } else { "" }) + " " + str_join(fps, " ");
 }

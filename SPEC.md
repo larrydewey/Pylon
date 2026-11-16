@@ -248,9 +248,11 @@ A host key is accepted only through one of:
    pylon-hostkey/1 HOST[:PORT] SHA256:B64 [SHA256:B64 ...]
    ```
 
-   `HOST` is the host name or IPv4 address as the principal connects to
-   it (lower case; letters, digits, `.`, `-`, `_`), `PORT` is given when
-   it is not 22 (a payload without one is for port 22), and each fingerprint is `SHA256:` and the 43 unpadded
+   `HOST` is the host name, IPv4 address or IPv6 address as the principal
+   connects to it (a name in lower case: letters, digits, `.`, `-`, `_`;
+   an IPv6 address in its RFC 5952 form, in brackets when a port follows:
+   `[ADDR]:PORT`), `PORT` is given when it is not 22 (a payload without
+   one is for port 22), and each fingerprint is `SHA256:` and the 43 unpadded
    base64 characters `ssh-keygen -l` prints (1 to 8 of them, nothing
    else). The payload binds the fingerprints to the host: a payload for
    another host or port is refused rather than applied, and an unknown
@@ -287,8 +289,9 @@ I/O), `core/resolver.resid` (the network side), `core/oob.resid` (6.1.4
 values). The validator trusts no resolver: it asks a recursive resolver
 for raw records and checks every signature itself.
 
-*Resolver.* The nameservers of `/etc/resolv.conf` (IPv4, at most three),
-or `PYLON_DNS=IP[:PORT][,...]`. Queries carry EDNS0 (1232 bytes) with DO
+*Resolver.* The nameservers of `/etc/resolv.conf` (IPv4 or IPv6, at most
+three), or `PYLON_DNS=IP[:PORT][,...]` (an IPv6 address with a port in
+brackets, `[ADDR]:PORT`). Queries carry EDNS0 (1232 bytes) with DO
 and CD set, a random ID, recursion desired; an answer counts only from
 the server's address and port, with the same ID and the question echoed.
 A truncated answer is asked again over TCP. Each server is asked twice,
@@ -349,8 +352,7 @@ replaces them for tests only, with a warning on every use.
 Limits: algorithms 8 (RSA/SHA-256, keys of 2048 bits or more, like the
 rest of Pylon: a zone signed with a shorter RSA key is indeterminate),
 13, 14 and 15; DS digests 2 and 4 (SHA-1 DS records are ignored); no
-CNAME/DNAME following and no wildcard-expanded SSHFP; IPv4 resolvers
-only; no cache (every lookup walks from the root, about 2 queries per
+CNAME/DNAME following and no wildcard-expanded SSHFP; no cache (every lookup walks from the root, about 2 queries per
 zone and one per other label); anchors are updated with Pylon, not by
 RFC 5011. The validator is exercised against constructed, signed zones
 (`tests/dnssec_zone.py`) and published known answers (RFC 8080, RFC 5155,
@@ -814,7 +816,7 @@ asymmetric work:
 
 ```
 cookie  3 | 0 0 0 | idx_c (4) | nonce (12) | ChaCha20-Poly1305(cookie (16)) (32)   52 bytes
-        cookie = HMAC-SHA256(R, source address | port)[0..16], R random, replaced every 2 minutes
+        cookie = HMAC-SHA256(R, source address (4 or 16 bytes) | port (2))[0..16], R random, replaced every 2 minutes
         sealed under SHA-256("pylon/1 cookie" | S | psk), associated data the init's mac1
 ```
 
@@ -904,7 +906,13 @@ Rekeying (9.5): the client starts a new handshake every 2 minutes;
 pylond switches keys when it answers and refuses data under keys older
 than 3 minutes. Streams carry on.
 
-Limits of v1: an IPv4 literal host, files of up to 64 MiB (held in
+The UDP link goes to the address the SSH connection reached (IPv6 or
+IPv4, whichever the host name or literal gave), and `pylond` binds the
+address that connection arrived on. Through a jump host the SSH
+connection ends at a local pipe, so the host must then be an IP address
+literal, reached directly.
+
+Limits of v1: files of up to 64 MiB (held in
 memory whole) with printable-ASCII remote paths, no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).
 

@@ -4,11 +4,14 @@
 //   SHA256:BASE64                          a bare fingerprint
 //   256 SHA256:BASE64 root@h (ED25519)     lines of `ssh-keygen -lf`
 //   pylon-hostkey/1 HOST[:PORT] SHA256:... the QR payload, bound to a host
+//                                          (an IPv6 HOST with a port in
+//                                          brackets: [ADDR]:PORT)
 //
 // The app compares the result with the key the host presents (through
 // `pylon pin`); nothing here trusts a key by itself.
 
 import 'dart:convert';
+import 'dart:io';
 
 class HostKeyValue {
   /// The host the payload names, or null for a bare value or lines.
@@ -78,15 +81,42 @@ HostKeyValue parseHostKeyValue(String text) {
   return HostKeyValue(null, null, fps);
 }
 
+/// An IPv6 address in its RFC 5952 form (as the CLI writes it).
+String _canonical6(InternetAddress a) => InternetAddress.fromRawAddress(a.rawAddress).address;
+
+/// A payload's HOST[:PORT]: the host (an IPv6 one canonical, any other in
+/// lower case; null when malformed) and the port text (null when none).
+(String?, String?) _splitHost(String spec) {
+  String? v6(String s) {
+    final a = InternetAddress.tryParse(s);
+    return a != null && a.type == InternetAddressType.IPv6 ? _canonical6(a) : null;
+  }
+
+  if (spec.startsWith('[')) {
+    final close = spec.indexOf(']');
+    final h = close > 0 ? v6(spec.substring(1, close)) : null;
+    final rest = close > 0 ? spec.substring(close + 1) : '';
+    if (h == null || (rest.isNotEmpty && !rest.startsWith(':'))) return (null, null);
+    return (h, rest.isEmpty ? null : rest.substring(1));
+  }
+  final bare = v6(spec);
+  if (bare != null) return (bare, null);
+  final hp = spec.split(':');
+  final host = hp[0].toLowerCase();
+  if (hp.length > 2 || !_host.hasMatch(host)) return (null, null);
+  return (host, hp.length == 2 ? hp[1] : null);
+}
+
 HostKeyValue _payload(List<String> ws) {
   if (ws.length < 3) throw const HostKeyValueError('the payload names no host or no fingerprint');
   if (ws.length > 2 + maxFingerprints) throw const HostKeyValueError('more than $maxFingerprints fingerprints');
-  final hp = ws[1].split(':');
-  final host = hp[0].toLowerCase();
+  final hr = _splitHost(ws[1]);
+  final host = hr.$1;
+  final ps = hr.$2;
   int? port;
-  if (hp.length == 2 && RegExp(r'^[0-9]{1,5}$').hasMatch(hp[1])) port = int.parse(hp[1]);
-  final portOk = hp.length == 1 || (port != null && port >= 1 && port <= 65535);
-  if (!_host.hasMatch(host) || !portOk) throw const HostKeyValueError("the payload's host is not HOST or HOST:PORT");
+  if (ps != null && RegExp(r'^[0-9]{1,5}$').hasMatch(ps)) port = int.parse(ps);
+  final portOk = ps == null || (port != null && port >= 1 && port <= 65535);
+  if (host == null || !portOk) throw const HostKeyValueError("the payload's host is not HOST, HOST:PORT or [IPV6]:PORT");
   final fps = <String>[];
   for (final w in ws.skip(2)) {
     final n = normalizeFingerprint(w);
@@ -97,5 +127,10 @@ HostKeyValue _payload(List<String> ws) {
 }
 
 /// The payload a host shows as a QR code for the principal to scan.
-String hostKeyPayload(String host, int port, List<String> fingerprints) =>
-    '$payloadTag ${host.toLowerCase()}${port != 22 ? ':$port' : ''} ${fingerprints.join(' ')}';
+String hostKeyPayload(String host, int port, List<String> fingerprints) {
+  final a = InternetAddress.tryParse(host);
+  final v6 = a != null && a.type == InternetAddressType.IPv6;
+  final h = v6 ? _canonical6(a) : host.toLowerCase();
+  final shown = port != 22;
+  return '$payloadTag ${v6 && shown ? '[$h]' : h}${shown ? ':$port' : ''} ${fingerprints.join(' ')}';
+}

@@ -12,6 +12,7 @@ import "../core/proto.resid";
 import "../core/link.resid";
 import "../core/forward.resid";
 import "../core/files.resid";
+import "../core/addr.resid";
 
 // The command that stores pylond: a 0700 cache directory, a temporary
 // file checked against the hash, then renamed into place (SPEC 8.3). The
@@ -97,26 +98,13 @@ SessionKeys connect_c(Int udp, List(Int) addr, Int port, Boot b, Static c, Int t
     _ = resid_udp_send_to(udp, addr, port, p.pkt);
     List(Int) ready = resid_tcp_poll([udp], [1], 1000);
     List(Int) d = resid_udp_recv_from(udp, 2048);
-    List(Int) got = if (d.len() == 6 + cookie_len()) { cookie_open(cookie_key(b.s_pub, b.psk), p, d[6..d.len()]) } else { [] };
+    List(Int) got = if (dg_len(d) == cookie_len()) { cookie_open(cookie_key(b.s_pub, b.psk), p, dg_body(d)) } else { [] };
     _ = if (got.len() > 0) { eprintln("pylon: pylond is under load and sent a cookie; retrying with mac2") } else { true };
     if (got.len() > 0) { return connect_c(udp, addr, port, b, c, tries - 1, got); }
     List(Secret(UInt(8))) e = [];
-    SessionKeys k = if (d.len() == 6 + resp_len()) { hs_finish(b, c, p, d[6..d.len()]) } else { SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0} };
+    SessionKeys k = if (dg_len(d) == resp_len()) { hs_finish(b, c, p, dg_body(d)) } else { SessionKeys {.ok = false, .tx = e, .rx = e, .my_idx = 0, .their_idx = 0} };
     if (k.ok) { return k; }
     return connect_c(udp, addr, port, b, c, tries - 1, cookie);
-}
-
-// Four decimal bytes, or [] when s is not an IPv4 literal.
-pub List(Int) ipv4(Str s) {
-    List(Str) p = str_split(s, ".");
-    if (p.len() != 4) { return []; }
-    return ipv4_at(p, 0, []);
-}
-
-List(Int) ipv4_at(List(Str) p, Int i, List(Int) acc) {
-    if (i >= 4) { return acc; }
-    if (!str_is_int(p[i]) || str_parse_int(p[i]) < 0 || str_parse_int(p[i]) > 255) { return []; }
-    return ipv4_at(p, i + 1, acc.concat([str_parse_int(p[i])]));
 }
 
 // The forwarding loop over the link. `rebind_after` > 0 (a test hook,
@@ -390,7 +378,7 @@ pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
 List(Int) cookie_in(List(List(Int)) xs, Rk r, Int i) {
     if (i >= xs.len()) { return []; }
     List(Int) d = xs[i];
-    List(Int) c = if (d.len() == 6 + cookie_len() && d[6] == 3) { cookie_open(cookie_key(r.b.s_pub, r.b.psk), r.p, d[6..d.len()]) } else { [] };
+    List(Int) c = if (dg_len(d) == cookie_len() && dg_body(d)[0] == 3) { cookie_open(cookie_key(r.b.s_pub, r.b.psk), r.p, dg_body(d)) } else { [] };
     if (c.len() > 0) { return c; }
     return cookie_in(xs, r, i + 1);
 }
@@ -398,7 +386,7 @@ List(Int) cookie_in(List(List(Int)) xs, Rk r, Int i) {
 List(Int) response(List(List(Int)) xs, Int i) {
     if (i >= xs.len()) { return []; }
     List(Int) d = xs[i];
-    if (d.len() == 6 + resp_len() && d[6] == 2) { return d[6..d.len()]; }
+    if (dg_len(d) == resp_len() && dg_body(d)[0] == 2) { return dg_body(d); }
     return response(xs, i + 1);
 }
 

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../backend/model.dart';
@@ -25,13 +27,18 @@ class _HostEditPageState extends State<HostEditPage> {
 
   Future<void> _save() async {
     final p = int.tryParse(port.text.trim()) ?? 0;
-    final a = addr.text.trim();
+    final typed = addr.text.trim();
+    // An IPv6 address is kept without brackets.
+    final a = typed.startsWith('[') && typed.endsWith(']') ? typed.substring(1, typed.length - 1) : typed;
     if (name.text.trim().isEmpty || user.text.trim().isEmpty || a.isEmpty || p < 1 || p > 65535) {
       setState(() => err = 'Give a name, a user, an address and a port from 1 to 65535.');
       return;
     }
-    if (mode == Mode.pylon && !RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(a)) {
-      setState(() => err = "The Pylon protocol (v1) needs the host's address as an IPv4 address.");
+    // Pylon mode follows the SSH connection to the address it reached, so a
+    // name or an IPv4 or IPv6 address will do; through a jump host it must
+    // be an address, reached directly.
+    if (mode == Mode.pylon && jump.text.trim().isNotEmpty && InternetAddress.tryParse(a) == null) {
+      setState(() => err = "Through a jump host, the Pylon protocol (v1) needs the host's address as an IP address (IPv4 or IPv6).");
       return;
     }
     final h = widget.host ?? Host(name: '', user: '', address: '');

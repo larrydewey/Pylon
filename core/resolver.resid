@@ -4,35 +4,32 @@
 // answers. Nothing here is trusted: the resolver only carries records,
 // whose signatures the walk checks from the root trust anchor down.
 //
-// Resolvers: $PYLON_DNS ("IP[:PORT][,IP[:PORT]...]") or the nameserver
-// lines of /etc/resolv.conf (IPv4 only), at most three, each asked twice
-// with a 1.5 s wait before the next.
+// Resolvers: $PYLON_DNS ("IP[:PORT][,IP[:PORT]...]", an IPv6 address with
+// a port in brackets: "[IP6]:PORT") or the nameserver lines of
+// /etc/resolv.conf (IPv4 or IPv6), at most three, each asked twice with a
+// 1.5 s wait before the next.
 
 import "crypto.resid";
 import "dns.resid";
 import "dnssec.resid";
+import "addr.resid";
 
 pub type Server = { List(Int) addr; Int port; Str host; };
 
-// "IP" or "IP:PORT" (IPv4); port 0 when malformed.
-pub Server server_of(Str s) {
-    List(Str) hp = str_split(str_trim(s), ":");
-    List(Int) a = if (hp.len() >= 1) { ip4(hp[0]) } else { [] };
-    Int port = if (hp.len() == 2 && str_is_int(hp[1])) { str_parse_int(hp[1]) } else { if (hp.len() == 1) { 53 } else { 0 } };
-    if (a.len() != 4 || port < 1 || port > 65535) { return Server {.addr = [], .port = 0, .host = ""}; }
-    return Server {.addr = a, .port = port, .host = hp[0]};
+// "IP", "IP4:PORT" or "[IP6]:PORT" (an IPv6 address alone needs no
+// brackets); port 0 when malformed.
+pub Server server_of(Str s0) {
+    Str s = str_trim(s0);
+    Int close = if (str_starts_with(s, "[")) { index_of(s, "]") } else { -1 };
+    Bool v4port = close < 0 && str_count(s, ":") == 1;
+    Str host = if (close > 0) { str_slice(s, 1, close) } else { if (v4port) { str_split(s, ":")[0] } else { s } };
+    Str ps = if (close > 0) { str_slice(s, close + 1, str_len(s)) } else { if (v4port) { ":" + str_split(s, ":")[1] } else { "" } };
+    Int port = if (str_len(ps) == 0) { 53 } else { if (str_starts_with(ps, ":") && str_is_int(str_slice(ps, 1, str_len(ps)))) { str_parse_int(str_slice(ps, 1, str_len(ps))) } else { 0 } };
+    List(Int) a = ip_literal(host);
+    if (a.len() == 0 || port < 1 || port > 65535) { return Server {.addr = [], .port = 0, .host = ""}; }
+    return Server {.addr = a, .port = port, .host = host};
 }
 
-List(Int) ip4(Str s) {
-    List(Str) p = str_split(s, ".");
-    if (p.len() != 4) { return []; }
-    return ip4_at(p, 0, []);
-}
-List(Int) ip4_at(List(Str) p, Int i, List(Int) acc) {
-    if (i >= 4) { return acc; }
-    if (!str_is_int(p[i]) || str_len(p[i]) > 3 || str_parse_int(p[i]) < 0 || str_parse_int(p[i]) > 255) { return []; }
-    return ip4_at(p, i + 1, acc.concat([str_parse_int(p[i])]));
-}
 
 // The resolvers to ask.
 @requires(filesystem(readonly), environment)
@@ -98,9 +95,9 @@ Msg await_udp(Int u, Server s, Int id, List(Int) qname, Int qtype, Int until) {
     if (left <= 0) { return msg_err("no answer from " + s.host + " within 1.5 s"); }
     _ = resid_tcp_poll([u], [1], left);
     List(Int) d = resid_udp_recv_from(u, 65535);
-    if (d.len() < 6) { return await_udp(u, s, id, qname, qtype, until); }
-    Bool from = hex_encode(d[0..4]) == hex_encode(s.addr) && d[4] * 256 + d[5] == s.port;
-    Msg m = if (from) { parse_response(d[6..d.len()], id, qname, qtype) } else { msg_err("stray") };
+    if (!dg_ok(d)) { return await_udp(u, s, id, qname, qtype, until); }
+    Bool from = hex_encode(dg_addr(d)) == hex_encode(s.addr) && dg_port(d) == s.port;
+    Msg m = if (from) { parse_response(dg_body(d), id, qname, qtype) } else { msg_err("stray") };
     if (!m.ok) { return await_udp(u, s, id, qname, qtype, until); }
     return m;
 }

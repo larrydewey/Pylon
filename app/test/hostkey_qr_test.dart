@@ -38,6 +38,19 @@ void main() {
     expect(hostKeyPayload('h', 2200, [fp1]), 'pylon-hostkey/1 h:2200 $fp1');
   });
 
+  test('the QR payload with an IPv6 host', () {
+    final a = parseHostKeyValue('pylon-hostkey/1 [2001:DB8::7]:2222 $fp1');
+    expect(a.host, '2001:db8::7');
+    expect(a.port, 2222);
+    final b = parseHostKeyValue('pylon-hostkey/1 2001:db8::7 $fp1');
+    expect(b.host, '2001:db8::7');
+    expect(b.port, isNull);
+    expect(hostKeyPayload('2001:db8::7', 2222, [fp1]), 'pylon-hostkey/1 [2001:db8::7]:2222 $fp1');
+    expect(hostKeyPayload('2001:db8::7', 22, [fp1]), 'pylon-hostkey/1 2001:db8::7 $fp1');
+    expect(() => parseHostKeyValue('pylon-hostkey/1 [example.org]:22 $fp1'), refused('HOST:PORT'));
+    expect(() => parseHostKeyValue('pylon-hostkey/1 [::1 $fp1'), refused('HOST:PORT'));
+  });
+
   test('the QR payload is strict', () {
     expect(() => parseHostKeyValue('pylon-hostkey/1 example.org'), refused());
     expect(() => parseHostKeyValue('pylon-hostkey/1 example.org $fp1 (ED25519)'), refused('other than'));

@@ -1,0 +1,105 @@
+// Addresses (core/addr.resid): IPv4 and IPv6 literals, their canonical
+// text, hosts split from what follows them, datagram headers; and where
+// they are used: resolver servers, forward specs, the QR payload.
+
+import "crypto.resid";
+import "../core/addr.resid";
+import "../core/resolver.resid";
+import "../core/forward.resid";
+import "../core/oob.resid";
+
+Str hexs(List(Int) a) { return hex_encode(a); }
+
+test "IPv4 literals" {
+    assert(hexs(ip_literal("192.0.2.7")) == "c0000207", "dotted quad");
+    assert(ip_literal("256.0.0.1").len() == 0, "a part over 255");
+    assert(ip_literal("1.2.3").len() == 0 && ip_literal("1.2.3.4.5").len() == 0, "three or five parts");
+    assert(ip_literal("1.2.3.-4").len() == 0 && ip_literal("1.2.3.+4").len() == 0, "signs");
+    assert(ip_literal("example.org").len() == 0, "a name");
+}
+
+test "IPv6 literals" {
+    assert(hexs(ip_literal("::1")) == "00000000000000000000000000000001", "loopback");
+    assert(hexs(ip_literal("::")) == "00000000000000000000000000000000", "unspecified");
+    assert(hexs(ip_literal("2001:db8::7")) == "20010db8000000000000000000000007", "a gap in the middle");
+    assert(hexs(ip_literal("fe80::")) == "fe800000000000000000000000000000", "a gap at the end");
+    assert(hexs(ip_literal("2001:DB8:0:0:1:0:0:1")) == "20010db8000000000001000000000001", "eight groups, upper case");
+    assert(hexs(ip_literal("::ffff:192.0.2.7")) == "00000000000000000000ffffc0000207", "an IPv4 tail");
+    assert(hexs(ip_literal("[2001:db8::7]")) == "20010db8000000000000000000000007", "in brackets");
+    assert(ip_literal("1::2::3").len() == 0, "two gaps");
+    assert(ip_literal("1:2:3:4:5:6:7:8:9").len() == 0, "nine groups");
+    assert(ip_literal("1:2:3:4:5:6:7").len() == 0, "seven groups, no gap");
+    assert(ip_literal("1:2:3:4::5:6:7:8").len() == 0, "a gap with eight groups");
+    assert(ip_literal("12345::1").len() == 0, "a group of five digits");
+    assert(ip_literal("2001:db8::g").len() == 0, "not hex");
+    assert(ip_literal(":::1").len() == 0, "three colons");
+    assert(ip_literal("fe80::1%eth0").len() == 0, "a zone");
+    assert(ip_literal("[::1").len() == 0, "an open bracket");
+}
+
+test "canonical text (RFC 5952)" {
+    assert(ip_text(ip_literal("2001:0DB8:0000:0000:0000:0000:0000:0007")) == "2001:db8::7", "zeros folded, lower case");
+    assert(ip_text(ip_literal("::1")) == "::1", "loopback");
+    assert(ip_text(ip_literal("::")) == "::", "unspecified");
+    assert(ip_text(ip_literal("2001:db8:0:1:1:1:1:1")) == "2001:db8:0:1:1:1:1:1", "one zero group stays");
+    assert(ip_text(ip_literal("2001:0:0:1:0:0:0:1")) == "2001:0:0:1::1", "the longest run");
+    assert(ip_text(ip_literal("2001:db8:0:0:1:0:0:1")) == "2001:db8::1:0:0:1", "the first of two equal runs");
+    assert(ip_text(ip_literal("192.0.2.7")) == "192.0.2.7", "IPv4");
+}
+
+test "hosts split from a path or port" {
+    HostRest a = split_host("example.org:/tmp/x");
+    assert(a.host == "example.org" && a.rest == ":/tmp/x", "name and path");
+    HostRest b = split_host("[2001:DB8::7]:/tmp/x");
+    assert(b.host == "2001:db8::7" && b.rest == ":/tmp/x", "a bracketed IPv6 address, canonical");
+    HostRest c = split_host("2001:db8:0::7");
+    assert(c.host == "2001:db8::7" && c.rest == "", "a bare IPv6 address is all host");
+    HostRest d = split_host("192.0.2.7:2222");
+    assert(d.host == "192.0.2.7" && d.rest == ":2222", "IPv4 and a port");
+    assert(split_host("[example.org]:22").host == "", "brackets hold only IPv6");
+    assert(split_host("[::1]x").host == "", "junk after the bracket");
+    assert(split_host("host").rest == "", "nothing follows");
+}
+
+test "datagram headers" {
+    List(Int) d4 = [4, 192, 0, 2, 7, 1, 187, 9, 8];
+    assert(dg_ok(d4) && hexs(dg_addr(d4)) == "c0000207" && dg_port(d4) == 443 && dg_len(d4) == 2 && dg_body(d4)[0] == 9, "IPv4 sender");
+    assert(hexs(dg_src(d4)) == "c000020701bb", "the cookie's input: address and port");
+    List(Int) d6 = [16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 22, 5];
+    assert(dg_ok(d6) && dg_addr(d6).len() == 16 && dg_port(d6) == 22 && dg_len(d6) == 1, "IPv6 sender");
+    assert(!dg_ok([]) && !dg_ok([5, 1, 2, 3, 4, 5, 0, 1]) && dg_len([4, 1, 2]) == -1, "malformed");
+    List(Int) peer = [4, 127, 0, 0, 1, 0, 22];
+    assert(dg_ok(peer) && dg_len(peer) == 0, "a TCP peer: a header without a packet");
+}
+
+test "resolver servers" {
+    Server a = server_of("192.0.2.53");
+    assert(a.port == 53 && a.addr.len() == 4 && a.host == "192.0.2.53", "IPv4");
+    Server b = server_of("192.0.2.53:5353");
+    assert(b.port == 5353 && b.host == "192.0.2.53", "IPv4 and a port");
+    Server c = server_of("2001:db8::53");
+    assert(c.port == 53 && c.addr.len() == 16 && c.host == "2001:db8::53", "IPv6");
+    Server d = server_of("[2001:db8::53]:5353");
+    assert(d.port == 5353 && d.addr.len() == 16 && d.host == "2001:db8::53", "IPv6 and a port");
+    assert(server_of("resolver.example").port == 0 && server_of("[2001:db8::53]x").port == 0 && server_of("1.2.3.4:0").port == 0, "refused");
+}
+
+test "forward specs with an IPv6 host" {
+    Fwd f = parse_fwd(0, "8080:[2001:db8::7]:80");
+    assert(f.lport == 8080 && f.host == "2001:db8::7" && f.hport == 80, "-L");
+    Fwd g = parse_fwd(0, "127.0.0.1:8080:[::1]:80");
+    assert(g.lport == 8080 && g.host == "::1", "with a bind address");
+    Fwd h = parse_fwd(0, "8080:db.internal:5432");
+    assert(h.lport == 8080 && h.host == "db.internal" && h.hport == 5432, "a name, as before");
+    assert(parse_fwd(0, "8080:[db]:80").lport == 0 && parse_fwd(0, "8080:[::1:80").lport == 0, "bad brackets refused");
+}
+
+test "the QR payload with an IPv6 host" {
+    Oob a = oob_parse("pylon-hostkey/1 [2001:DB8::7]:2222 SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4Wk");
+    assert(a.err == "" && a.host == "2001:db8::7" && a.port == 2222, a.err);
+    Oob b = oob_parse("pylon-hostkey/1 2001:db8::7 SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4Wk");
+    assert(b.err == "" && b.host == "2001:db8::7" && b.port == 0, b.err);
+    assert(payload_for("2001:db8:0::7", 2222, ["SHA256:x"]) == "pylon-hostkey/1 [2001:db8::7]:2222 SHA256:x", "brackets with a port");
+    assert(payload_for("2001:db8::7", 22, ["SHA256:x"]) == "pylon-hostkey/1 2001:db8::7 SHA256:x", "bare without one");
+    assert(str_len(oob_parse("pylon-hostkey/1 [host]:22 SHA256:MIZwCEPC1dHnGiEluHzU2d3d+fxDOWvqq76It20c4Wk").err) > 0, "brackets hold only IPv6");
+}

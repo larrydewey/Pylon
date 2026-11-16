@@ -1,0 +1,153 @@
+// Addresses and datagrams as the Resid runtime gives them. An address is
+// 4 bytes (IPv4) or 16 (IPv6). A received datagram (resid_udp_recv_from)
+// is [n, address (n bytes), port_hi, port_lo, packet...]; a TCP peer
+// (resid_tcp_peer) is the same header without a packet.
+
+// Whether d is a well-formed datagram (or peer) header.
+pub Bool dg_ok(List(Int) d) { return d.len() >= 7 && (d[0] == 4 || d[0] == 16) && d.len() >= d[0] + 3; }
+
+// The sender's address, its port, and both as the bytes a cookie is made
+// from (SPEC 9.4); then the packet. All of them assume dg_ok(d).
+pub List(Int) dg_addr(List(Int) d) { return d[1..1 + d[0]]; }
+pub Int dg_port(List(Int) d) { return d[d[0] + 1] * 256 + d[d[0] + 2]; }
+pub List(Int) dg_src(List(Int) d) { return d[1..d[0] + 3]; }
+pub List(Int) dg_body(List(Int) d) { return d[d[0] + 3..d.len()]; }
+
+// The packet's length, or -1 when d is no datagram.
+pub Int dg_len(List(Int) d) { return if (dg_ok(d)) { d.len() - d[0] - 3 } else { -1 }; }
+
+// The first index of `t` in s, or -1.
+pub Int index_of(Str s, Str t) { return find_at(s, t, 0); }
+Int find_at(Str s, Str t, Int i) {
+    if (i + str_len(t) > str_len(s)) { return -1; }
+    if (str_slice(s, i, i + str_len(t)) == t) { return i; }
+    return find_at(s, t, i + 1);
+}
+
+// A host as written, split from what follows it (":PATH", ":PORT"): an
+// IPv6 literal is in brackets when something follows, and may stand alone
+// without them. The host comes back without brackets, an IPv6 one in its
+// canonical form (RFC 5952), so one address is always one host; rest is ""
+// or starts with ":". An empty host when the brackets are wrong.
+pub type HostRest = { Str host; Str rest; };
+
+pub HostRest split_host(Str s) {
+    if (str_starts_with(s, "[")) {
+        Int close = index_of(s, "]");
+        Str h = if (close > 0) { str_slice(s, 1, close) } else { "" };
+        Str rest = if (close > 0) { str_slice(s, close + 1, str_len(s)) } else { "" };
+        Bool ok = ipv6(h).len() == 16 && (str_len(rest) == 0 || str_starts_with(rest, ":"));
+        return if (ok) { HostRest {.host = ip_text(ipv6(h)), .rest = rest} } else { HostRest {.host = "", .rest = ""} };
+    }
+    if (ipv6(s).len() == 16) { return HostRest {.host = ip_text(ipv6(s)), .rest = ""}; }
+    Int c = index_of(s, ":");
+    if (c < 0) { return HostRest {.host = s, .rest = ""}; }
+    return HostRest {.host = str_slice(s, 0, c), .rest = str_slice(s, c, str_len(s))};
+}
+
+// An IP address literal: 4 bytes for IPv4 (a.b.c.d), 16 for IPv6 (RFC
+// 4291 2.2: hex groups, one "::", a dotted IPv4 tail; brackets allowed; no
+// zone), [] for anything else, such as a name.
+pub List(Int) ip_literal(Str s) {
+    List(Int) v4 = ipv4(s);
+    if (v4.len() == 4) { return v4; }
+    Bool br = str_starts_with(s, "[") && str_ends_with(s, "]");
+    return ipv6(if (br) { str_slice(s, 1, str_len(s) - 1) } else { s });
+}
+
+// Four decimal bytes, or [] when s is not an IPv4 literal.
+pub List(Int) ipv4(Str s) {
+    List(Str) p = str_split(s, ".");
+    if (p.len() != 4) { return []; }
+    return ipv4_at(p, 0, []);
+}
+
+List(Int) ipv4_at(List(Str) p, Int i, List(Int) acc) {
+    if (i >= 4) { return acc; }
+    if (str_len(p[i]) < 1 || str_len(p[i]) > 3 || !digits(p[i], 0) || str_parse_int(p[i]) > 255) { return []; }
+    return ipv4_at(p, i + 1, acc.concat([str_parse_int(p[i])]));
+}
+
+Bool digits(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && digits(s, i + 1);
+}
+
+// Sixteen bytes, or [] when s is not an IPv6 literal.
+pub List(Int) ipv6(Str s) {
+    if (str_len(s) < 2 || !str_contains(s, ":") || str_count(s, "::") > 1 || str_contains(s, ":::")) { return []; }
+    Bool gap = str_contains(s, "::");
+    List(Str) halves = if (gap) { str_split(s, "::") } else { [s] };
+    Str head = halves[0];
+    Str tail = if (gap && halves.len() == 2) { halves[1] } else { "" };
+    List(Int) hb = if (str_len(head) == 0) { [] } else { groups(str_split(head, ":"), 0, !gap, []) };
+    List(Int) tb = if (str_len(tail) == 0) { [] } else { groups(str_split(tail, ":"), 0, true, []) };
+    if (hb.len() % 2 == 1 || tb.len() % 2 == 1) { return []; }
+    Int n = hb.len() + tb.len();
+    if (!gap) { return if (n == 16) { hb } else { [] }; }
+    if (n > 14) { return []; }
+    return hb.concat(zeros(16 - n, [])).concat(tb);
+}
+
+// The bytes of hex groups (two each); a dotted IPv4 tail (four) may end
+// the address when `last`. [-1] when a group is malformed.
+List(Int) groups(List(Str) ps, Int i, Bool last, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    Str p = ps[i];
+    if (last && i == ps.len() - 1 && str_contains(p, ".")) {
+        List(Int) v4 = ipv4(p);
+        return if (v4.len() == 4) { acc.concat(v4) } else { [-1] };
+    }
+    Int v = hex16(p, 0, 0);
+    if (str_len(p) < 1 || str_len(p) > 4 || v < 0) { return [-1]; }
+    return groups(ps, i + 1, last, acc.concat([v / 256, v % 256]));
+}
+
+Int hex16(Str s, Int i, Int acc) {
+    if (i >= str_len(s)) { return acc; }
+    Int c = str_char_at(s, i);
+    Int d = if (c >= 48 && c <= 57) { c - 48 } else { if (c >= 97 && c <= 102) { c - 87 } else { if (c >= 65 && c <= 70) { c - 55 } else { -1 } } };
+    if (d < 0) { return -1; }
+    return hex16(s, i + 1, acc * 16 + d);
+}
+
+List(Int) zeros(Int n, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    return zeros(n - 1, acc.concat([0]));
+}
+
+// An address as text: dotted for IPv4, RFC 5952 for IPv6 (lower case, the
+// longest run of two or more zero groups as "::").
+pub Str ip_text(List(Int) a) {
+    if (a.len() == 4) { return f"{a[0]}.{a[1]}.{a[2]}.{a[3]}"; }
+    if (a.len() != 16) { return ""; }
+    List(Int) g = g16(a, 0, []);
+    Run r = longest_zero(g, 0, Run {.at = -1, .len = 0}, Run {.at = -1, .len = 0});
+    if (r.len < 2) { return join6(g, 0, 8); }
+    return join6(g, 0, r.at) + "::" + join6(g, r.at + r.len, 8);
+}
+
+// An address and port as text: a.b.c.d:PORT, [IPV6]:PORT.
+pub Str addr_port(List(Int) a, Int port) { return (if (a.len() == 16) { "[" + ip_text(a) + "]" } else { ip_text(a) }) + ":" + f"{port}"; }
+
+type Run = { Int at; Int len; };
+
+List(Int) g16(List(Int) a, Int i, List(Int) acc) {
+    if (i >= 16) { return acc; }
+    return g16(a, i + 2, acc.concat([a[i] * 256 + a[i + 1]]));
+}
+
+// The first longest run of zero groups.
+Run longest_zero(List(Int) g, Int i, Run cur, Run best) {
+    if (i >= 8) { return if (cur.len > best.len) { cur } else { best }; }
+    Run c2 = if (g[i] == 0) { Run {.at = if (cur.len == 0) { i } else { cur.at }, .len = cur.len + 1} } else { Run {.at = -1, .len = 0} };
+    Run b2 = if (g[i] != 0 && cur.len > best.len) { cur } else { best };
+    return longest_zero(g, i + 1, c2, b2);
+}
+
+Str join6(List(Int) g, Int from, Int to) {
+    if (from >= to) { return ""; }
+    Str h = f"{g[from]:hex}";
+    return if (from + 1 >= to) { h } else { h + ":" + join6(g, from + 1, to) };
+}

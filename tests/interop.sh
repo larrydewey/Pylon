@@ -30,12 +30,16 @@ chmod 600 authorized_keys
 mkdir -p /run/sshd 2>/dev/null || true
 export PYLON_HOME="$WORK/pylon"
 USER_NAME="$(id -un)"
+# IPv6 loopback: sshd listens on ::1 too when the system has it.
+HAVE6=0
+python3 -c "import socket; socket.socket(socket.AF_INET6).bind(('::1', 0))" 2>/dev/null && HAVE6=1
 
 start_sshd() {   # extra sshd options...
     kill "$(cat sshd.pid 2>/dev/null)" 2>/dev/null; sleep 0.3
     cat > sshd_config <<EOF
 Port $PORT
 ListenAddress 127.0.0.1
+$([ "$HAVE6" = 1 ] && echo "ListenAddress ::1")
 PidFile $WORK/sshd.pid
 AuthorizedKeysFile $WORK/authorized_keys
 PasswordAuthentication no
@@ -480,6 +484,31 @@ try:
 except socket.timeout:
     print('no reply')"
     kill $PP 2>/dev/null; wait $PP 2>/dev/null
+    # Names and IPv6: the link goes to the address the SSH connection reached.
+    HD6="pylon-interop6-$PORT"; mkdir -p "$HOME/$HD6"
+    "$PYLON" pin -p $PORT localhost "$(fp host_ed25519.pub)" > /dev/null
+    check "pylon protocol: by host name, to the address SSH reached" 0 "session to 127.0.0.1:" \
+        "$PYLON" put -p $PORT $PYF www2/small.txt "$USER_NAME@localhost:$HD6/byname.txt"
+    if [ "$HAVE6" = 1 ]; then
+        # pylond runs one session daemon per server address: the one for
+        # ::1 is stopped after these cases, so later counts see one.
+        D_BEFORE="$(pgrep -f '^[^ ]*pylond-[0-9a-f]+ serve' | sort)"
+        "$PYLON" pin -p $PORT ::1 "$(fp host_ed25519.pub)" > /dev/null
+        check "pylon protocol: over IPv6 (::1)"     0 "session to \[::1\]:" \
+            "$PYLON" put -p $PORT $PYF www2/small.txt "$USER_NAME@[::1]:$HD6/v6.txt"
+        check "pylon protocol: over IPv6, the file arrived" 0 "pylon-proto-ok" cat "$HOME/$HD6/v6.txt"
+        "$PYLON" -p $PORT -N -L $L2:127.0.0.1:$W2 $PYF "$USER_NAME@::1" 2> p6.log & P6=$!
+        for _ in $(seq 100); do grep -q "forwarding" p6.log && break; sleep 0.2; done
+        check "pylon protocol: -L over IPv6, 3 MB intact" 0 "$(sha256sum www2/big.bin | cut -d' ' -f1)" \
+            bash -c "curl -s -m 60 http://127.0.0.1:$L2/big.bin | sha256sum"
+        check "pylon protocol: pylond bound UDP on ::1" 0 "" \
+            bash -c "grep -q ' 00000000000000000000000001000000:' /proc/net/udp6"
+        kill $P6 2>/dev/null; wait $P6 2>/dev/null
+        comm -13 <(echo "$D_BEFORE") <(pgrep -f '^[^ ]*pylond-[0-9a-f]+ serve' | sort) | xargs -r kill 2>/dev/null
+    else
+        echo "note: no IPv6 loopback; the IPv6 cases are skipped"
+    fi
+    rm -rf "$HOME/$HD6"
     # SOCKS5 (-D) over the Pylon protocol: the handshake runs in the client,
     # pylond connects (and resolves names).
     DP=$((PORT + 13))

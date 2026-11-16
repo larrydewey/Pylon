@@ -46,6 +46,7 @@ import "../core/proto.resid";
 import "../core/link.resid";
 import "../core/term.resid";
 import "../core/files.resid";
+import "../core/addr.resid";
 
 @requires(network)
 List(Int) read_stdin(Int n, List(Int) acc) {
@@ -224,25 +225,25 @@ List(Int) recv_n(Int fd, Int n, List(Int) acc) {
 // client's link then uses the new keys (its streams carry on).
 @requires(network, declassify)
 Srv handshake(Srv v, List(Int) d, Int now) {
-    List(Int) pkt = d[6..d.len()];
+    List(Int) pkt = dg_body(d);
     if (pkt.len() != init_len() || pkt[0] != 1) { return v; }
     Int i = mac1_peer(v.peers, pkt, 0);
     if (i < 0) { return v; }
     Peer p = v.peers[i];
     // Under load: no asymmetric work without a cookie for this source.
     Ck c = ck_tick(v.ck, now);
-    List(Int) src = d[0..6];
+    List(Int) src = dg_src(d);
     Bool load = c.always || c.count >= 8;
     Bool ok2 = mac2_ok(cookie_of(c.cur, src), pkt) || mac2_ok(cookie_of(c.prev, src), pkt);
     if (load && !ok2) {
-        _ = resid_udp_send_to(v.udp, d[0..4], d[4] * 256 + d[5], cookie_reply(cookie_key(p.b.s_pub, p.b.psk), pkt, cookie_of(c.cur, src)));
+        _ = resid_udp_send_to(v.udp, dg_addr(d), dg_port(d), cookie_reply(cookie_key(p.b.s_pub, p.b.psk), pkt, cookie_of(c.cur, src)));
         return sv_ck(v, c);
     }
     Answered a = hs_respond(p.b, v.s, pkt);
     if (!a.keys.ok || !newer(a.stamp, p.stamp, 0)) { return sv_ck(v, ck_count(c)); }
-    Int port = d[4] * 256 + d[5];
-    _ = resid_udp_send_to(v.udp, d[0..4], port, a.resp);
-    Peer p2 = Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = true, .l = link_rekeyed(p.l, d[0..4], port, a.keys, now), .stamp = a.stamp, .born = p.born, .lsn = p.lsn};
+    Int port = dg_port(d);
+    _ = resid_udp_send_to(v.udp, dg_addr(d), port, a.resp);
+    Peer p2 = Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = true, .l = link_rekeyed(p.l, dg_addr(d), port, a.keys, now), .stamp = a.stamp, .born = p.born, .lsn = p.lsn};
     return sv_ck(sv_seen(sv_peers(v, put_peer(v.peers, i, p2)), now), ck_count(c));
 }
 
@@ -257,7 +258,8 @@ Int mac1_peer(List(Peer) ps, List(Int) pkt, Int i) {
 Srv datagrams(Srv v, Int now, Int budget) {
     if (budget <= 0) { return v; }
     List(Int) d = resid_udp_recv_from(v.udp, 2048);
-    if (d.len() < 6) { return v; }
+    if (d.len() == 0) { return v; }
+    if (!dg_ok(d)) { return datagrams(v, now, budget - 1); }
     Int i = link_peer(v.peers, d, 0);
     Srv n = if (i >= 0) { sv_seen(sv_peers(v, put_peer(v.peers, i, pr_link(v.peers[i], link_input(v.peers[i].l, d, now)))), now) } else { handshake(v, d, now) };
     return datagrams(n, now, budget - 1);
