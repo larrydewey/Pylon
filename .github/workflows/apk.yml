@@ -139,6 +139,16 @@ jobs:
           ulimit -s unlimited
           bash tools/android-core.sh
 
+      - name: Keep a pylond build that did not reproduce
+        # The rebuilt pylond (and its LLVM IR), to compare with the release's.
+        if: failure() && env.PYLOND_RELEASE_DIR != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylond-reproduced-${{ github.run_id }}
+          path: pylon/build/android/pylond-reproduced/
+          retention-days: 7
+          if-no-files-found: ignore
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
