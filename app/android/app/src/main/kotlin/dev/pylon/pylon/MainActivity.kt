@@ -191,6 +191,16 @@ class MainActivity : FlutterActivity() {
                     )
                 )
                 "resolvConf" -> result.success(resolvConf())
+                "connections" -> {
+                    val n = (call.arguments as? Number)?.toInt() ?: 0
+                    if (n > 0 && Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        // The notification says connections are open; the service runs either way.
+                        requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7)
+                    }
+                    ConnectionService.update(this, n)
+                    result.success(null)
+                }
                 "openSymbolonKeys" -> Thread {
                     val ok = agent.openKeys()
                     runOnUiThread { result.success(ok) }

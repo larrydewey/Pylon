@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../backend/model.dart';
+import '../backend/select.dart';
 
 /// Hosts, pins and live sessions, shared by every page.
 class AppState extends ChangeNotifier {
@@ -62,7 +63,11 @@ class AppState extends ChangeNotifier {
   Session openNew(Host h, int rows, int cols) {
     final s = h.local ? backend.openLocal(rows, cols, shareNet: localShareNet) : backend.open(h, rows, cols);
     sessions.add(s);
-    s.changes.listen((_) => notifyListeners());
+    s.changes.listen((_) {
+      _report();
+      notifyListeners();
+    });
+    _report();
     return s;
   }
 
@@ -70,6 +75,17 @@ class AppState extends ChangeNotifier {
   void end(Session s) {
     s.close();
     sessions.remove(s);
+    _report();
     notifyListeners();
+  }
+
+  // Android ends the network of an app that is not in front: the live
+  // connections, counted, keep Pylon's foreground service up meanwhile.
+  int _reported = 0;
+  void _report() {
+    final n = [for (final s in live) if (!s.local) s].length;
+    if (n == _reported) return;
+    _reported = n;
+    keepConnections(n);
   }
 }

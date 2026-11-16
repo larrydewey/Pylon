@@ -7,6 +7,12 @@
          signed with a certificate Symbolon names, and only when Symbolon was
          installed first. -->
     <uses-permission android:name="dev.symbolon.permission.SSH_SIGN" />
+    <!-- ConnectionService: Android takes the network from an app that is not
+         in front, so open connections need a foreground service, and its
+         notification says they are open. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:label="Pylon"
         android:extractNativeLibs="true"
@@ -48,6 +54,14 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <service
+            android:name=".ConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the user's open SSH and Pylon terminal connections while another app is in front, such as the SSH agent's consent screen" />
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

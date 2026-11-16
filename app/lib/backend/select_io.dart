@@ -71,6 +71,13 @@ Future<bool> openKeyHolder() async {
   return await platform.invokeMethod<bool>('openSymbolonKeys') ?? false;
 }
 
+/// Android: while [live] connections are open, a foreground service keeps
+/// Pylon's network, which the system takes from an app that is not in
+/// front (Symbolon's consent sheet, or any other app). 0 ends it.
+Future<void> keepConnections(int live) async {
+  if (Platform.isAndroid) await platform.invokeMethod('connections', live);
+}
+
 /// Where signatures come from, for the desktop's title bar.
 String get agentNote => Platform.isAndroid ? 'Symbolon' : (Platform.environment['SSH_AUTH_SOCK'] != null ? 'Agent at SSH_AUTH_SOCK' : 'No agent (SSH_AUTH_SOCK unset)');
 
