@@ -71,6 +71,11 @@ class _HostsPageState extends State<HostsPage> {
         onTap: () async {
           if (!pinned) {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => PinPage(st: st, host: h)));
+          } else if (st.openInTab != null) {
+            // The desktop layout: a tab of its own, back in the workspace.
+            st.openInTab!(h);
+            Navigator.popUntil(context, (r) => r.isFirst);
+            return;
           } else {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => TerminalPage(st: st, host: h)));
           }

@@ -1,0 +1,286 @@
+// pylon-local: the local shell (SPEC 13, goal G8).
+//
+//   pylon-local [--share-net] [ROWS COLS]        Linux desktop
+//   pylon-local --android [ROWS COLS]            in Pylon's isolated service
+//
+// A shell on the device itself that cannot reach Pylon's keys, host
+// database, connections or Symbolon. The app starts one per local shell
+// and treats it like `pylon --app`: frames on standard input and output,
+// type (1) | length (4, big-endian) | payload,
+//
+//   app -> local   1 keys          2 size: rows (2) | cols (2)
+//   local -> app   1 the shell's output (to pylon-term, like any host's)
+//                  4 ready (empty): the terminal is open
+//                  5 the shell's exit status (1 byte), last
+//
+// and pylon-local's own exit status is the shell's too, where the runtime
+// keeps it (after resid_sandbox_confine it does not: the confined child's
+// status is lost, so frame 5 is the one to rely on). The shell's output is drawn by the
+// confined emulator (pylon-term) like any session; this launcher only
+// relays bytes and never parses them.
+//
+// Linux: the shell starts with an empty environment (nothing of Pylon's:
+// no SSH_AUTH_SOCK, PYLON_HOME, XDG_RUNTIME_DIR, DISPLAY, ...) under
+// unshare(1), in new user, mount, pid and (unless --share-net) network
+// namespaces, where a small init (written below, run by /bin/sh) builds a
+// root of its own: the system's programs and libraries read-only, a fresh
+// /dev, /proc, /tmp, and the local shell's own home,
+// ~/.local/share/pylon-local/home, mounted at $HOME (the new root is a
+// tmpfs on ~/.local/share/pylon-local/root). The rest of the home
+// directory (Pylon's PYLON_HOME, ~/.ssh, Symbolon's vault), /run (the
+// agent's socket, the session bus) and other users' files are not in that
+// root at all; Pylon's processes are outside its pid namespace (no
+// ptrace, no signals, no /proc/PID/fd); without --share-net it has no
+// network, so no loopback forward of Pylon's and no abstract socket (X11,
+// D-Bus) is reachable. The shell runs as the principal in a nested user
+// namespace, which locks those mounts: it cannot unmount them. Any step
+// that fails stops the init, so the shell never runs unconfined.
+//
+// Android (--android): run by Pylon's isolatedProcess service, under a
+// separate UID with no permissions, no storage and no network (SPEC 13).
+// The shell is /system/bin/sh with an empty environment; its home is /
+// (nothing there is writable to it).
+//
+// This launcher itself forks the PTY broker (the only process that starts
+// the shell) and then confines itself (resid_sandbox_confine: no files,
+// no execution) before it reads a byte from the shell or the app.
+
+import "../core/wire.resid";
+
+List(Int) frame(Int ty, List(Int) p) { return [ty].concat(u32_be(p.len())).concat(p); }
+
+// A word fit to stand in the broker's command line: it is split on
+// spaces and run by execvp, never by a shell.
+Bool plain(Str s) {
+    return str_len(s) > 0 && str_len(s) < 512 && !str_contains(s, " ") && !str_contains(s, "\t") && !str_contains(s, "\n") && !str_contains(s, "\"") && !str_contains(s, "'") && !str_contains(s, "\\");
+}
+
+// Whether path a is b or beneath it.
+Bool within(Str a, Str b) { return a == b || str_starts_with(a, b + "/"); }
+
+@requires(filesystem(readonly))
+Str first_file(List(Str) ps, Int i) {
+    if (i >= ps.len()) { return ""; }
+    if (filesystem.exists(ps[i])) { return ps[i]; }
+    return first_file(ps, i + 1);
+}
+
+// The shell inside the new root: $SHELL when it is a plain path under the
+// system directories that root holds, else /bin/sh.
+@requires(environment)
+Str inner_shell() {
+    Str sh = environment.get("SHELL");
+    Bool sys = str_starts_with(sh, "/bin/") || str_starts_with(sh, "/usr/bin/") || str_starts_with(sh, "/usr/local/bin/");
+    return if (plain(sh) && sys && !str_contains(sh, "/../")) { sh } else { "/bin/sh" };
+}
+
+Str init_script() {
+    List(Str) l = [
+        "# pylon-local init (SPEC 13), written by pylon-local at each start. Run as",
+        "#   unshare --user --map-root-user --mount --pid --fork --kill-child [--net] /bin/sh INIT ROOT_DIR HOME_DIR SHELL",
+        "# as root of a new user namespace (the principal's own uid outside), pid 1 of a",
+        "# new pid namespace, in a new mount namespace. Any failure stops here.",
+        "set -eu",
+        "R=$1",
+        "H=$2",
+        "SH=$3",
+        "read -r _ U _ < /proc/self/uid_map",
+        "read -r _ G _ < /proc/self/gid_map",
+        "mount -t tmpfs -o mode=0755,nosuid,nodev pylon-local \"$R\"",
+        "cd \"$R\"",
+        "for d in usr etc opt nix gnu bin sbin lib lib32 lib64 libx32; do",
+        "  if [ -L \"/$d\" ]; then",
+        "    ln -s \"$(readlink \"/$d\")\" \"$R/$d\"",
+        "  elif [ -d \"/$d\" ]; then",
+        "    mkdir \"$R/$d\"",
+        "    mount --rbind \"/$d\" \"$R/$d\"",
+        "    mount -o remount,bind,ro \"$R/$d\"",
+        "  fi",
+        "done",
+        "mkdir \"$R/dev\" \"$R/proc\" \"$R/tmp\" \"$R/run\" \"$R/var\" \"$R/var/tmp\" \"$R/.old\"",
+        "mount -t tmpfs -o mode=0755,nosuid pylon-dev \"$R/dev\"",
+        "for n in null zero full random urandom tty; do",
+        "  : > \"$R/dev/$n\"",
+        "  mount --bind \"/dev/$n\" \"$R/dev/$n\"",
+        "done",
+        "mkdir \"$R/dev/pts\" \"$R/dev/shm\"",
+        "mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts \"$R/dev/pts\"",
+        "ln -s pts/ptmx \"$R/dev/ptmx\"",
+        "ln -s /proc/self/fd \"$R/dev/fd\"",
+        "ln -s /proc/self/fd/0 \"$R/dev/stdin\"",
+        "ln -s /proc/self/fd/1 \"$R/dev/stdout\"",
+        "ln -s /proc/self/fd/2 \"$R/dev/stderr\"",
+        "mount -t tmpfs -o mode=1777,nosuid,nodev pylon-shm \"$R/dev/shm\"",
+        "mount -t proc -o nosuid,nodev,noexec proc \"$R/proc\"",
+        "mount -t tmpfs -o mode=1777,nosuid,nodev pylon-tmp \"$R/tmp\"",
+        "mount -t tmpfs -o mode=1777,nosuid,nodev pylon-vartmp \"$R/var/tmp\"",
+        "mkdir -p \"$R$HOME\"",
+        "chmod 0700 \"$H\"",
+        "mount --bind \"$H\" \"$R$HOME\"",
+        "pivot_root \"$R\" \"$R/.old\"",
+        "cd /",
+        "umount -l /.old",
+        "rmdir /.old",
+        "mount -o remount,bind,ro /",
+        "cd \"$HOME\"",
+        "# The terminal's session leader is outside this pid namespace, so a shell",
+        "# here cannot see its foreground group (dash then fails at exit); script(1)",
+        "# gives it a terminal of its own, from this root's devpts, and passes the",
+        "# size through.",
+        "if command -v script > /dev/null; then",
+        "  exec unshare --user --map-user=\"$U\" --map-group=\"$G\" -- script -qefc \"$SH -l\" /dev/null",
+        "fi",
+        "exec unshare --user --map-user=\"$U\" --map-group=\"$G\" -- \"$SH\" -l",
+        ""
+    ];
+    return str_join(l, "\n");
+}
+
+type Cmd = { Str cmd; Str err; };
+
+Cmd refuse(Str why) { return Cmd {.cmd = "", .err = why}; }
+
+// The broker's command for a Linux desktop: env -i, unshare, the init.
+@requires(environment, filesystem)
+Cmd linux_cmd(Bool share_net) {
+    Str home = environment.get("HOME");
+    if (!plain(home) || !str_starts_with(home, "/") || home == "/" || str_contains(home, "/../")) { return refuse("HOME must be an absolute path without spaces or quotes"); }
+    Str dir = home + "/.local/share/pylon-local";
+    Str own = dir + "/home";
+    Str ph0 = environment.get("PYLON_HOME");
+    Str ph = if (str_len(ph0) > 0) { ph0 } else { home + "/.config/pylon" };
+    Str sock = environment.get("SSH_AUTH_SOCK");
+    // The local home is the one directory of the principal's the shell
+    // sees: it must not hold Pylon's files or the agent's socket.
+    if (within(ph, own) || (str_len(sock) > 0 && within(sock, own))) { return refuse("the local shell's home " + own + " would contain Pylon's files or the agent's socket"); }
+    Str unshare = first_file(["/usr/bin/unshare", "/bin/unshare"], 0);
+    Str env = first_file(["/usr/bin/env", "/bin/env"], 0);
+    if (str_len(unshare) == 0 || str_len(env) == 0 || !filesystem.exists("/bin/sh")) { return refuse("unshare(1) (util-linux), env and /bin/sh are needed to confine the local shell"); }
+    // The new root is a tmpfs mounted on dir/root, beside the home (a
+    // mount on an ancestor of the home, such as /tmp, would hide it).
+    if (!filesystem.create_dir(own) || !filesystem.create_dir(dir + "/root")) { return refuse("cannot create " + own); }
+    Str init = dir + "/init-v1.sh";
+    if (!filesystem.write_all(init, init_script())) { return refuse("cannot write " + init); }
+    Str lang = environment.get("LANG");
+    Str user = environment.get("USER");
+    Str vars = "HOME=" + home + " TERM=xterm-256color PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin SHELL=" + inner_shell() + " PYLON_LOCAL=1"
+        + (if (plain(lang)) { " LANG=" + lang } else { "" })
+        + (if (plain(user)) { " USER=" + user + " LOGNAME=" + user } else { "" });
+    Str ns = "--user --map-root-user --mount --pid --fork --kill-child" + (if (share_net) { "" } else { " --net" });
+    return Cmd {.cmd = env + " -i " + vars + " " + unshare + " " + ns + " /bin/sh " + init + " " + dir + "/root " + own + " " + inner_shell(), .err = ""};
+}
+
+// Android: the isolated service's UID is the confinement.
+Cmd android_cmd() {
+    Str path = "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin";
+    return Cmd {.cmd = "/system/bin/env -i HOME=/ TERM=xterm-256color PATH=" + path + " PYLON_LOCAL=1 /system/bin/sh -l", .err = ""};
+}
+
+// ---------------------------------------------------------------------------
+// The relay
+// ---------------------------------------------------------------------------
+
+type Io = { Int m; Int pid; Int broker; List(Int) buf; List(Int) pend; Bool in_eof; Int quiet; };
+
+// Keys for the shell and the latest size, from the whole frames in b.
+type In = { List(Int) keys; Int rows; Int cols; List(Int) rest; Bool bad; };
+
+In parse(List(Int) b, List(Int) keys, Int rows, Int cols) {
+    if (b.len() < 5) { return In {.keys = keys, .rows = rows, .cols = cols, .rest = b, .bad = false}; }
+    Int n = be32(b, 1);
+    if (n > 1048576) { return In {.keys = keys, .rows = rows, .cols = cols, .rest = [], .bad = true}; }
+    if (b.len() < 5 + n) { return In {.keys = keys, .rows = rows, .cols = cols, .rest = b, .bad = false}; }
+    List(Int) p = b[5..5 + n];
+    Bool size = b[0] == 2 && n == 4;
+    return parse(b[5 + n..b.len()], if (b[0] == 1) { keys.concat(p) } else { keys },
+        if (size) { p[0] * 256 + p[1] } else { rows }, if (size) { p[2] * 256 + p[3] } else { cols });
+}
+
+// Output and input until the shell has exited and its output is drained;
+// then its exit status. End of the app's input (the app closed the
+// session) hangs the terminal up, which ends the shell.
+@requires(process, network)
+Int relay(Io s) {
+    if (s.in_eof) {
+        _ = resid_pty_close(s.m);
+        return ended(wait_exit(s.broker, s.pid, 100));
+    }
+    // A master that is readable with nothing to read, three times running,
+    // has been hung up (the shell's side closed): from then on it is only
+    // tried every 50 ms, beside the app, until the shell's status is known
+    // (a hung-up master would poll ready without end).
+    Bool slow = s.quiet >= 3;
+    List(Int) fds = if (slow) { [0] } else { [s.m, 0] };
+    List(Int) wants = if (slow) { [1] } else { [if (s.pend.len() > 0) { 3 } else { 1 }, 1] };
+    List(Int) ready = resid_tcp_poll(fds, wants, if (slow) { 50 } else { -1 });
+    Int ki = if (slow) { 0 } else { 1 };
+    Bool rd = slow || (ready.len() > 0 && (ready[0] & 1) != 0);
+    Bool wr = !slow && s.pend.len() > 0 && ready.len() > 0 && (ready[0] & 2) != 0;
+    List(Int) out = if (rd) { resid_pty_read(s.m, 65536) } else { [] };
+    _ = if (out.len() > 0) { print_bytes(frame(1, out)) } else { true };
+    Bool empty = rd && out.len() == 0;
+    Int code = if (empty) { resid_pty_status(s.broker, s.pid) } else { -1 };
+    if (code >= 0) {
+        _ = resid_pty_close(s.m);
+        return ended(code);
+    }
+    Int took = if (wr) { resid_pty_write(s.m, s.pend) } else { 0 };
+    List(Int) pend = if (took > 0) { s.pend[took..s.pend.len()] } else { if (took < 0) { [] } else { s.pend } };
+    Bool key = ready.len() > ki && (ready[ki] & 1) != 0;
+    List(Int) raw = if (key) { resid_read_some(65536) } else { [] };
+    Bool eof = key && raw.len() == 0;
+    In got = parse(s.buf.concat(raw), [], 0, 0);
+    _ = if (got.rows > 0 && got.cols > 0) { resid_pty_resize(s.m, got.rows, got.cols) } else { false };
+    Int quiet = if (empty) { s.quiet + 1 } else { if (out.len() > 0) { 0 } else { s.quiet } };
+    return relay(Io {.m = s.m, .pid = s.pid, .broker = s.broker, .buf = got.rest, .pend = pend.concat(got.keys), .in_eof = eof || got.bad, .quiet = quiet});
+}
+
+Int ended(Int code) {
+    _ = print_bytes(frame(5, [code & 255]));
+    return code;
+}
+
+// The exit status after a hang-up, waiting up to spins x 50 ms.
+@requires(process, network)
+Int wait_exit(Int broker, Int pid, Int spins) {
+    Int code = resid_pty_status(broker, pid);
+    if (code >= 0 || spins <= 0) { return if (code >= 0) { code } else { 129 }; }
+    List(Int) nofd = [];
+    _ = resid_tcp_poll(nofd, nofd, 50);
+    return wait_exit(broker, pid, spins - 1);
+}
+
+type Opts = { Bool android; Bool share_net; List(Int) size; Bool ok; };
+
+@requires(args)
+Opts opts(Int i, Opts o) {
+    if (i >= args.count()) { return o; }
+    Str a = args.get(i);
+    if (a == "--android") { return opts(i + 1, Opts {.android = true, .share_net = o.share_net, .size = o.size, .ok = o.ok}); }
+    if (a == "--share-net") { return opts(i + 1, Opts {.android = o.android, .share_net = true, .size = o.size, .ok = o.ok}); }
+    Bool num = str_is_int(a) && str_parse_int(a) > 0 && str_parse_int(a) < 4096;
+    return opts(i + 1, Opts {.android = o.android, .share_net = o.share_net, .size = if (num) { o.size.concat([str_parse_int(a)]) } else { o.size }, .ok = o.ok && num && o.size.len() < 2});
+}
+
+@requires(args, environment, filesystem, process, network)
+Int main() {
+    Opts o = opts(1, Opts {.android = false, .share_net = false, .size = [], .ok = true});
+    if (!o.ok || o.size.len() == 1) { eprintln("usage: pylon-local [--share-net | --android] [ROWS COLS]"); return 2; }
+    Int rows = if (o.size.len() == 2) { o.size[0] } else { 24 };
+    Int cols = if (o.size.len() == 2) { o.size[1] } else { 80 };
+    Cmd c = if (o.android) { android_cmd() } else { linux_cmd(o.share_net) };
+    if (str_len(c.err) > 0) { eprintln("pylon-local: " + c.err + "; the local shell does not start"); return 1; }
+    Int broker = resid_pty_broker(c.cmd);
+    if (broker < 0) { eprintln("pylon-local: cannot start the terminal broker"); return 1; }
+    // From here the launcher holds no right to files or to execute
+    // anything; the broker alone starts the shell. (A kernel without
+    // Landlock leaves the launcher unconfined: the shell's own
+    // confinement above does not depend on it.)
+    List(Str) none = [];
+    Int conf = resid_sandbox_confine(none, none);
+    if (conf < 0) { eprintln("pylon-local: confinement failed part-way"); return 1; }
+    List(Int) p = resid_pty_open(broker, rows, cols);
+    if (p.len() != 2) { eprintln("pylon-local: cannot open a terminal"); return ended(1); }
+    _ = print_bytes(frame(4, []));
+    return relay(Io {.m = p[0], .pid = p[1], .broker = broker, .buf = [], .pend = [], .in_eof = false, .quiet = 0});
+}

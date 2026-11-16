@@ -37,7 +37,7 @@ class SessionPage extends StatelessWidget {
           OutlinedButton(
             style: OutlinedButton.styleFrom(foregroundColor: P.red, side: const BorderSide(color: P.redLine)),
             onPressed: () {
-              s.close();
+              st.end(s);
               Navigator.pop(context);
             },
             child: const Text('End session'),

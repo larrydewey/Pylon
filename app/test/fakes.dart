@@ -1,0 +1,49 @@
+import 'package:pylon/backend/model.dart';
+
+/// A session that records what the interface did to it.
+class FakeSession extends Session {
+  FakeSession(super.host);
+  final List<List<int>> inputs = [];
+  final List<(int, int)> sizes = [];
+  bool closed = false;
+
+  @override
+  void input(List<int> bytes) => inputs.add(bytes);
+  @override
+  void resize(int rows, int cols) => sizes.add((rows, cols));
+  @override
+  void close() {
+    closed = true;
+    exitCode ??= 0;
+    changed();
+  }
+}
+
+class FakeBackend implements Backend {
+  final List<FakeSession> opened = [];
+  final hosts = [Host(name: 'build-01', user: 'alice', address: '10.0.8.21'), Host(name: 'prod-db', user: 'ops', address: '10.0.4.12', tag: 'production')];
+
+  @override
+  bool get demo => false;
+  @override
+  bool get hasLocalShell => true;
+  @override
+  Future<List<Host>> loadHosts() async => hosts;
+  @override
+  Future<void> saveHosts(List<Host> hosts) async {}
+  @override
+  Future<List<Pin>> pins() async => [Pin('10.0.8.21:22', 'ssh-ed25519', 'SHA256:x', '', ''), Pin('10.0.4.12:22', 'ssh-ed25519', 'SHA256:y', '', '')];
+  @override
+  Future<Outcome> pin(Host h, String fingerprint) async => Outcome(false, '');
+  @override
+  Future<Outcome> trustCa(String pattern, String key) async => Outcome(false, '');
+  @override
+  Session open(Host h, int rows, int cols) => _add(FakeSession(h));
+  @override
+  Session openLocal(int rows, int cols, {bool shareNet = false}) => _add(FakeSession(Host.local()));
+
+  FakeSession _add(FakeSession s) {
+    opened.add(s);
+    return s;
+  }
+}

@@ -37,6 +37,12 @@ class DemoBackend implements Backend {
 
   @override
   Session open(Host h, int rows, int cols) => _DemoSession(h, rows, cols);
+
+  @override
+  bool get hasLocalShell => true;
+
+  @override
+  Session openLocal(int rows, int cols, {bool shareNet = false}) => _DemoSession(Host.local(), rows, cols);
 }
 
 class _DemoSession extends Session {
@@ -44,7 +50,17 @@ class _DemoSession extends Session {
     _draw(rows, cols);
   }
 
-  final _lines = <String>[
+  late final _lines = host.local ? _localLines : _hostLines;
+
+  static const _localLines = <String>[
+    'Demo mode: no shell runs in this preview.',
+    '',
+    '~ local \$ ssh build-01',
+    'ssh: no keys here. Use Pylon to connect.',
+    '~ local \$ ',
+  ];
+
+  static const _hostLines = <String>[
     'Demo mode: no connection is made in this preview.',
     '',
     'alice@build-01:~/src/pylon\$ make test',
@@ -65,6 +81,7 @@ class _DemoSession extends Session {
         cp[y * cols + x] = l.codeUnitAt(x);
         if (l.startsWith('ok') && x < 2) attr[y * cols + x] = 6 | (256 << 9);
         if (l.startsWith('alice') && x < 14) attr[y * cols + x] = 6 | (256 << 9) | (1 << 18);
+        if (l.startsWith('~ local') && x < 7) attr[y * cols + x] = 13 | (256 << 9);
       }
     }
     final last = _lines.length - 1;

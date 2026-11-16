@@ -1,5 +1,5 @@
-# Builds the Android app: the Resid core (libpylon.so, libpylon_term.so and
-# the pylond builds the app installs on servers, tools/android-core.sh),
+# Builds the Android app: the Resid core (libpylon.so, libpylon_term.so,
+# libpylon_local.so and the pylond builds the app installs on servers, tools/android-core.sh),
 # then the APK. Pushes to master and pull requests keep the APK as a
 # short-lived workflow artifact; a published release gets it attached.
 #
