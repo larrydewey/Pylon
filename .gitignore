@@ -1,3 +1,9 @@
 build/
 *.testbin
 *.testbin.ll
+
+# Release ceremony (tools/release/CEREMONY.md): per-release builds and
+# signatures are attached to the GitHub release, never committed; private
+# keys never enter the repository.
+/release/
+*.key
