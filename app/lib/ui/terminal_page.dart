@@ -106,9 +106,22 @@ class _TerminalPageState extends State<TerminalPage> {
         title: _title(),
         actions: [
           IconButton(tooltip: 'Paste', icon: const Icon(Icons.content_paste), onPressed: () => pasteInto(context, s)),
-          if (local && s.exitCode == null)
+          if (s.exitCode == null)
             IconButton(
-              tooltip: 'End the local shell',
+              key: const Key('disconnect'),
+              tooltip: local ? 'End the local shell' : 'Disconnect',
+              icon: Icon(local ? Icons.close : Icons.link_off),
+              onPressed: () async {
+                if (!await confirmDisconnect(context, s) || !mounted) return;
+                widget.st.end(s);
+                if (mounted) Navigator.pop(context);
+              },
+            )
+          else
+            // Ended: nothing to ask, the page and the session go.
+            IconButton(
+              key: const Key('close-ended'),
+              tooltip: 'Close',
               icon: const Icon(Icons.close),
               onPressed: () {
                 widget.st.end(s);

@@ -49,6 +49,40 @@ Future<void> askClipboard(BuildContext context, Session s) async {
   if (ok == true) await Clipboard.setData(ClipboardData(text: text));
 }
 
+/// Asks before disconnecting a live session; true to go ahead. Says what
+/// happens on the other end: an SSH shell ends with its connection, a
+/// session pylond keeps does not, and the local shell ends.
+Future<bool> confirmDisconnect(BuildContext context, Session s) async {
+  final pylon = !s.local && s.host.mode == Mode.pylon;
+  final who = s.local ? 'the local shell' : s.host.name;
+  final what = s.local
+      ? 'The local shell and everything running in it end.'
+      : pylon
+          ? 'pylond keeps the session on ${s.host.name}, running: connect again to resume it. To end it, exit its shell.'
+          : 'The shell on ${s.host.name}, and what runs in it in the foreground, ends with the connection.';
+  final ok = await showModalBottomSheet<bool>(
+    context: context,
+    backgroundColor: P.surface,
+    builder: (c) => Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(s.local ? 'End the local shell?' : 'Disconnect from $who?', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        Text(what, style: const TextStyle(color: Color(0xFFC9D1DB), height: 1.4)),
+        const SizedBox(height: 14),
+        FilledButton(
+          key: const Key('disconnect-ok'),
+          style: FilledButton.styleFrom(backgroundColor: P.redLine, foregroundColor: P.text),
+          onPressed: () => Navigator.pop(c, true),
+          child: Text(s.local ? 'End it' : 'Disconnect'),
+        ),
+        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+      ]),
+    ),
+  );
+  return ok == true;
+}
+
 /// A paste from the clipboard, shown for confirmation first when it holds
 /// lines or control characters and the program did not ask for a
 /// bracketed paste (SPEC 12).

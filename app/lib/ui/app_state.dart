@@ -47,6 +47,20 @@ class AppState extends ChangeNotifier {
 
   List<Session> get live => [for (final s in sessions) if (s.exitCode == null) s];
 
+  /// Sessions that ended (the host hung up, or they failed) and are kept
+  /// to show how, until removed.
+  List<Session> get ended => [for (final s in sessions) if (s.exitCode != null) s];
+
+  /// Forgets every ended session.
+  void clearEnded() {
+    for (final s in ended) {
+      s.close();
+      sessions.remove(s);
+    }
+    _report();
+    notifyListeners();
+  }
+
   /// The live session for a host (the first, when the desktop layout
   /// opened several); for the local shell, the live local shell.
   Session? sessionFor(Host h) {

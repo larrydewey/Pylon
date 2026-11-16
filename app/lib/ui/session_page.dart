@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../backend/model.dart';
 import '../theme.dart';
 import 'app_state.dart';
+import 'prompts.dart';
 import 'widgets.dart';
 
 class SessionPage extends StatelessWidget {
@@ -36,11 +37,13 @@ class SessionPage extends StatelessWidget {
         if (s != null)
           OutlinedButton(
             style: OutlinedButton.styleFrom(foregroundColor: P.red, side: const BorderSide(color: P.redLine)),
-            onPressed: () {
+            onPressed: () async {
+              if (!await confirmDisconnect(context, s) || !context.mounted) return;
               st.end(s);
-              Navigator.pop(context);
+              // Back past the terminal too: its session is gone.
+              Navigator.popUntil(context, (r) => r.isFirst);
             },
-            child: const Text('End session'),
+            child: const Text('Disconnect'),
           ),
       ]),
     );
