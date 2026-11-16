@@ -51,10 +51,18 @@ Every holder needs a checkout of Pylon and the Resid toolchain (`residc`).
 ## Each release
 
 The builds must be reproducible: each signer rebuilds `pylond` and signs only
-if their build matches. Everyone works from the same commit and the same Resid
-compiler (the `BUILDINFO` file names both). The arm64 build needs
-`RESID_AARCH64_BUILTINS` (Resid's `tools/aarch64-builtins.sh` finds it in an
-Android NDK).
+if their build matches, and the APK workflow rebuilds it again before packing
+it. Everyone works from the same commit, the same Resid compiler and the same
+clang and lld (Resid links with them, so the code images depend on their exact
+build as much as on the compiler's). The `BUILDINFO` file names all three.
+
+`tools/release/build-pylond.sh` makes every `pylond` build: it refuses any
+Resid compiler but the one `tools/release/toolchain.env` pins (install that
+Resid commit), and runs clang and lld from the container image in
+`tools/release/toolchain/`, so every builder needs docker. The arm64 build
+needs `RESID_AARCH64_BUILTINS` (Resid's `tools/aarch64-builtins.sh` finds it in
+an Android NDK). Change the pins only between releases: a release built with
+the old ones no longer reproduces.
 
 1. **The maintainer** builds both `pylond` and the manifest. COUNTER is a whole
    number higher than the last release's (1 for the first):
@@ -91,8 +99,8 @@ Android NDK).
 
 ## If something goes wrong
 
-- **`check-sign` says NOT signing:** the build differs. Check the commit and
-  compiler in `BUILDINFO`. Never sign a build you could not reproduce.
+- **`check-sign` says NOT signing:** the build differs. Check the commit,
+  compiler and toolchain image in `BUILDINFO`. Never sign a build you could not reproduce.
 - **A release key is lost:** two remain, and releases continue. Replace it
   soon: new roots, committed, in a new Pylon release.
 - **A release key may be stolen:** one key alone cannot sign a release. Make

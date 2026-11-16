@@ -37,13 +37,11 @@ tool() {   # builds pylon-release from this checkout when it is missing or older
     fi
 }
 
-# Built exactly as tools/android-core.sh builds them (paths relative to the
-# root): the code images are what every builder must reproduce.
+# With the pinned toolchain (build-pylond.sh), as the APK workflow rebuilds
+# them: the code images are what every builder must reproduce, and they
+# depend on clang and lld as much as on the Resid compiler.
 build_pylond() {   # OUTDIR
-    : "${RESID_AARCH64_BUILTINS:?the aarch64 build needs RESID_AARCH64_BUILTINS (Resid tools/aarch64-builtins.sh finds one in an Android NDK)}"
-    local o="$1"; mkdir -p "$o"
-    residc cli/pylond.resid --target aarch64 -o "$o/pylond-aarch64" > /dev/null
-    residc cli/pylond.resid -o "$o/pylond-x86_64" > /dev/null
+    bash tools/release/build-pylond.sh "$1" > /dev/null
 }
 
 compiler_id() {   # the compiler the code images depend on
@@ -98,13 +96,14 @@ build)
     [ $# = 3 ] || die "usage: ceremony.sh build VERSION COUNTER"
     v="$2"; c="$3"; d="$ROOT/release/$v"
     [ ! -e "$d" ] || die "$d exists"
-    git diff --quiet HEAD -- cli core || die "uncommitted changes in cli/ or core/: build from a commit"
+    git diff --quiet HEAD -- cli core tools/release || die "uncommitted changes in cli/, core/ or tools/release/: build from a commit"
     tool
     build_pylond "$d"
     "$ROOT/$TOOL" manifest "$v" "$c" "$d" "$d/pylond.release"
     {
         echo "pylon commit $(git rev-parse HEAD)"
         echo "compiler stage2.bin sha256 $(compiler_id)"
+        echo "toolchain image $(sha256sum tools/release/toolchain/Dockerfile | cut -c1-16)"
     } > "$d/BUILDINFO"
     echo "Built $d:"; ls -1 "$d" | sed 's/^/  /'
     echo

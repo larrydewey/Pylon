@@ -29,6 +29,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      pylond_release:
+        description: "A release tag whose signed pylond to reproduce and pack (the APK is not attached to it)"
+        required: false
+        default: ""
 
 permissions:
   contents: write   # attach the APK to a release
@@ -46,10 +51,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: pylon
+      - name: Release toolchain
+        # Reproducing a signed pylond release needs the Resid compiler it was
+        # built with (tools/release/toolchain.env), not Resid's master; clang
+        # and lld come from tools/release/toolchain (build-pylond.sh).
+        id: pin
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.pylond_release }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then
+            . pylon/tools/release/toolchain.env
+            echo "resid_ref=$RESID_COMMIT" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
         with:
           repository: larrydewey/Resid
           path: resid
+          ref: ${{ steps.pin.outputs.resid_ref }}
 
       - name: Toolchain
         run: |
@@ -94,11 +113,13 @@ jobs:
         # (pylond-x86_64, pylond-aarch64, pylond.release, pylond.proof) to
         # the GitHub release; android-core.sh packs it once this build
         # reproduces its code images. Without it the APK carries unsigned
-        # pylond builds, which its pylon refuses to push.
-        if: github.event_name == 'release'
+        # pylond builds, which its pylon refuses to push. A manual run with
+        # pylond_release checks that a release reproduces, without
+        # attaching anything.
+        if: steps.pin.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.pin.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           d="$RUNNER_TEMP/pylond-release"
