@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The Pylon launcher icon: the gateway mark (app/lib/theme.dart, PylonMark)
+     on the ink ground. tools/app-icons.sh renders the legacy launcher PNGs
+     from it; the adaptive icon (res/drawable/ic_launcher_foreground.xml) draws
+     the same paths. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512">
+  <rect width="64" height="64" rx="14" fill="#0E1116"/>
+  <g transform="translate(8 8) scale(0.75)">
+    <path d="M6 56 L13 8 L26 8 L26 56 Z" fill="#E6EDF3"/>
+    <path d="M38 56 L38 8 L51 8 L58 56 Z" fill="#E6EDF3"/>
+    <path d="M29 42 H35 V56 H29 Z" fill="#4FD1C5"/>
+  </g>
+</svg>

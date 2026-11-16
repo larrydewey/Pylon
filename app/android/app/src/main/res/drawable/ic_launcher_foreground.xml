@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The gateway mark (app/lib/theme.dart, PylonMark), drawn in its 64-unit
+     grid and placed in the middle of the 108dp adaptive-icon canvas, well
+     inside the 66dp safe zone every launcher mask keeps. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.75"
+        android:scaleY="0.75"
+        android:translateX="30"
+        android:translateY="30">
+        <path android:fillColor="#E6EDF3" android:pathData="M6,56 L13,8 L26,8 L26,56 Z" />
+        <path android:fillColor="#E6EDF3" android:pathData="M38,56 L38,8 L51,8 L58,56 Z" />
+        <path android:fillColor="#4FD1C5" android:pathData="M29,42 H35 V56 H29 Z" />
+    </group>
+</vector>
