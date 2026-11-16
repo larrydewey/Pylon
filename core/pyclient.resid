@@ -466,7 +466,10 @@ pub Fx pylon_file(Fx x0) {
     if (x2.done) { return x2; }
     if (gone && !ended) { return fx_end(x2, "pylond reset the transfer"); }
     // What is due to pylond, within the stream's window.
-    Int n = min(min(room(x2.l, x2.sid), 65536), x2.out.len() - x2.sent);
+    // Under the test hook a put sends nothing past its limit, so the stop
+    // below waits only for acknowledgments (else a fast link sends it all).
+    Bool held = x2.op == 1 && x2.stop > 0 && x2.sent >= x2.stop;
+    Int n = if (held) { 0 } else { min(min(room(x2.l, x2.sid), 65536), x2.out.len() - x2.sent) };
     Link l3 = if (n > 0) { push_bytes(x2.l, x2.sid, x2.out[x2.sent..x2.sent + n], now) } else { x2.l };
     Bool last = x2.op == 1 && x2.stage == 1 && x2.sent + n >= x2.out.len();
     Link l4 = if (last) { push_eof(l3, x2.sid, -1, now) } else { l3 };
