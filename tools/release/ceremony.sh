@@ -29,6 +29,9 @@ abs() { case "$1" in /*) echo "$1" ;; *) echo "$CALLER/$1" ;; esac; }
 cd "$ROOT"
 
 die() { echo "ceremony: $*" >&2; exit 1; }
+# What to do next, for a person running the steps by hand (release.sh,
+# which runs them all, sets CEREMONY_QUIET).
+hint() { [ -n "${CEREMONY_QUIET:-}" ] || echo "$@"; }
 
 tool() {   # builds pylon-release from this checkout when it is missing or older
     if [ ! -x "$TOOL" ] || [ tools/release/release.resid -nt "$TOOL" ] || [ core/release.resid -nt "$TOOL" ]; then
@@ -50,7 +53,16 @@ compiler_id() {   # the compiler the code images depend on
     if [ -f "$s" ]; then sha256sum "$s" | cut -d' ' -f1; else echo "unknown ($w)"; fi
 }
 
+# The roots core/release_roots.resid pins, as pylon-release reads them.
+pinned_roots() {
+    python3 -c "import re,sys; s=open('core/release_roots.resid').read(); m=re.search(r'pinned_roots\(\) \{ return \"(.*)\"; \}', s); sys.stdout.write(m.group(1).encode().decode('unicode_escape') if m else '')"
+}
+
 case "${1:-}" in
+pinned-roots)
+    pinned_roots
+    ;;
+
 keygen)
     [ $# = 2 ] || die "usage: ceremony.sh keygen NAME"
     case "$2" in */*) die "NAME is a name, not a path: run keygen in the directory that keeps the key" ;; esac
@@ -105,12 +117,12 @@ build)
         echo "compiler stage2.bin sha256 $(compiler_id)"
         echo "toolchain image $(sha256sum tools/release/toolchain/Dockerfile | cut -c1-16)"
     } > "$d/BUILDINFO"
-    echo "Built $d:"; ls -1 "$d" | sed 's/^/  /'
-    echo
-    echo "Each signer now runs, on their own machine, at commit $(git rev-parse --short HEAD)"
-    echo "and with the same compiler (BUILDINFO):"
-    echo "  tools/release/ceremony.sh check-sign $d NAME.key"
-    echo "passing $d/pylond.release around (signatures are appended to it)."
+    echo "Built $d"
+    hint
+    hint "Each signer now runs, on their own machine, at commit $(git rev-parse --short HEAD)"
+    hint "and with the same compiler (BUILDINFO):"
+    hint "  tools/release/ceremony.sh check-sign $d NAME.key"
+    hint "passing $d/pylond.release around (signatures are appended to it)."
     ;;
 
 check-sign)
@@ -136,7 +148,7 @@ check-sign)
         [ -n "$want" ] && [ "$mine" = "$want" ] && [ "$theirs" = "$want" ] || die "pylond-$arch is not what this checkout builds: NOT signing"
     done
     "$ROOT/$TOOL" sign "$d/pylond.release" "$key"
-    echo "Signed. Pass $d/pylond.release on to the next signer, or to the log key holder."
+    hint "Signed. Pass $d/pylond.release on to the next signer, or to the log key holder."
     ;;
 
 publish)
@@ -147,19 +159,17 @@ publish)
     "$ROOT/$TOOL" log-append "$log" "$d/pylond.release"
     "$ROOT/$TOOL" sign "$log/head" "$key"
     "$ROOT/$TOOL" proof "$log" "$d/pylond.release" "$d/pylond.proof"
-    roots="build/ceremony/roots"
-    if [ ! -f "$roots" ]; then
-        python3 -c "import re,sys; s=open('core/release_roots.resid').read(); m=re.search(r'pinned_roots\(\) \{ return \"(.*)\"; \}', s); sys.stdout.write(m.group(1).encode().decode('unicode_escape') if m else '')" > "$d/.roots"
-        roots="$d/.roots"
-    fi
-    [ -s "$roots" ] || die "no roots pinned in core/release_roots.resid: run the roots step first"
-    "$ROOT/$TOOL" verify "$roots" "$d" "$d/pylond.proof"
+    # Against the roots this commit pins: what every client built from it trusts.
+    pinned_roots > "$d/.roots"
+    [ -s "$d/.roots" ] || die "no roots pinned in core/release_roots.resid: run the roots step first"
+    "$ROOT/$TOOL" verify "$d/.roots" "$d" "$d/pylond.proof"
     rm -f "$d/.roots"
-    echo
-    echo "Verified against the pinned roots. Attach to the GitHub release (as a"
-    echo "draft, before publishing it, so the APK build finds them):"
-    for f in pylond-x86_64 pylond-aarch64 pylond.release pylond.proof; do echo "  $d/$f"; done
-    echo "and commit $log to the pylond-log branch (append-only)."
+    echo "Verified against the pinned roots."
+    hint
+    hint "Attach to the GitHub release (as a draft, before publishing it, so the"
+    hint "APK build finds them):"
+    for f in pylond-x86_64 pylond-aarch64 pylond.release pylond.proof; do hint "  $d/$f"; done
+    hint "and commit $log to the pylond-log branch (append-only)."
     ;;
 
 *)

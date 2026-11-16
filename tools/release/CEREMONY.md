@@ -4,7 +4,8 @@ Pylon pushes `pylond` to a server only when that build is signed by enough
 release keys, recorded in the transparency log, and not older than one it
 has already accepted (SPEC 8.2.1). Until keys are pinned, every build of
 Pylon refuses to push `pylond`. This is how the keys are made and how each
-release is signed. `tools/release/ceremony.sh` runs every step.
+release is signed. `tools/release/ceremony.sh` runs every step, and
+`tools/release/release.sh` runs all of them at once on one machine.
 
 ## The keys
 
@@ -48,7 +49,84 @@ Every holder needs a checkout of Pylon and the Resid toolchain (`residc`).
    key id against what its holder read out, then commit and push. Every Pylon
    built from that commit on trusts these keys and no others.
 
-## Each release
+## A release in one command
+
+When one person holds the keys, `tools/release/release.sh` runs every step
+below on one machine:
+
+```sh
+tools/release/release.sh 0.1.4             # asks once, then does everything
+tools/release/release.sh 0.1.4 --no-push   # prepare and verify only, to look first
+```
+
+It checks the machine first (a clean `master` equal to origin's, docker, `gh`
+logged in, the pinned Resid compiler, the keys), then: sets the app's version
+(version code one higher) and commits it; builds both `pylond` with the
+pinned toolchain; rebuilds them independently and signs only if the code
+images match, with every release key it finds; appends the release to a copy
+of the log, signs the head, writes the proof and verifies all of it against
+the keys this commit pins. Only then does it push `master`, the `pylond-log`
+branch and the tag `v0.1.4`, create the GitHub release with the four `pylond`
+files, publish it, and follow the APK workflow until the APK is attached.
+
+Nothing leaves the machine before everything verifies. If a run stops (a
+network error, a closed laptop), run the same command again: finished steps
+are recognized and skipped. `--notes FILE` gives the release notes (the
+default lists the commits since the last tag), `--yes` skips the question,
+`--no-wait` does not wait for the APK.
+
+### The release machine and its keys
+
+The release machine is the one you run `release.sh` on. It needs docker,
+`gh` (`gh auth login`), push access over SSH, and the Resid compiler that
+`tools/release/toolchain.env` pins (`./install.sh` in a Resid checkout at
+that commit; `release.sh` says so when the installed one differs).
+
+To put the keys on it:
+
+1. Make a directory for them **outside any repository**, on an encrypted
+   volume. Best is an encrypted USB drive that is plugged in only for a
+   release; an encrypted home directory will do:
+
+   ```sh
+   mkdir -m 700 /run/media/$USER/pylon-keys/release   # or: mkdir -m 700 ~/.local/share/pylon-release-keys
+   ```
+
+2. Copy into it the release keys (`rel1.key`, `rel2.key`, and `rel3.key` if
+   you have it: at least two) and the log key (`log1.key`), from wherever
+   `ceremony.sh keygen` made them. Keep the names: `release.sh` takes every
+   `rel*.key` as a release key and the one `log*.key` as the log key.
+
+3. Make them readable only by you; `release.sh` refuses keys that others can
+   read:
+
+   ```sh
+   chmod 600 /run/media/$USER/pylon-keys/release/*.key
+   ```
+
+4. Tell `release.sh` where they are, each time with `--keys DIR`, or once in
+   your shell's profile:
+
+   ```sh
+   export PYLON_RELEASE_KEYS=/run/media/$USER/pylon-keys/release
+   ```
+
+5. Keep a second copy of every key offline, elsewhere (a second drive in a
+   different place). A lost release key can be replaced only by new roots in
+   a new Pylon release; a lost log key means a new log.
+
+A key that is not one of the keys the commit pins is caught when the release
+is verified, before anything is pushed (`ceremony.sh pinned-roots` prints the
+pinned key ids; `ceremony.sh keygen` printed each key's id when it was made).
+
+What this gives up: with two release keys and the log key on one machine,
+that machine can sign a release alone. Two of three still protects against
+losing one key, but not against that machine being compromised while the
+keys are on it. Keep the drive unplugged except while `release.sh` runs, and
+never put a key in CI or in a repository. When the keys are held by
+different people, use the steps below instead.
+
+## Each release, step by step
 
 The builds must be reproducible: each signer rebuilds `pylond` and signs only
 if their build matches, and the APK workflow rebuilds it again before packing

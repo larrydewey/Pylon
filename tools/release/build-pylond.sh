@@ -5,6 +5,7 @@
 # and the APK workflow (tools/android-core.sh) alike.
 #
 #   tools/release/build-pylond.sh OUTDIR
+#   tools/release/build-pylond.sh --check   only: is the compiler the pinned one?
 #
 # The Resid compiler is RESID_HOME's (else the installed residc's), and must
 # be the one toolchain.env pins. clang, lld and the aarch64 compiler-rt
@@ -16,9 +17,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$ROOT/tools/release"
 die() { echo "build-pylond: $*" >&2; exit 1; }
 
-[ $# = 1 ] || die "usage: build-pylond.sh OUTDIR"
-mkdir -p "$1"
-out="$(cd "$1" && pwd)"
+[ $# = 1 ] || die "usage: build-pylond.sh OUTDIR | --check"
+CHECK=0; [ "$1" = --check ] && CHECK=1
 command -v docker > /dev/null || die "docker is not on PATH: release builds run in the pinned toolchain (tools/release/toolchain)"
 
 # The compiler: RESID_HOME, else the installed residc wrapper's.
@@ -37,7 +37,10 @@ else
 fi
 . "$HERE/toolchain.env"
 have="$(sha256sum "$stage2" | cut -d' ' -f1)"
-[ "$have" = "$RESID_STAGE2_SHA256" ] || die "$stage2 is not the pinned compiler (sha256 $have, toolchain.env wants $RESID_STAGE2_SHA256: Resid commit $RESID_COMMIT)"
+[ "$have" = "$RESID_STAGE2_SHA256" ] || die "$stage2 is not the pinned compiler (sha256 $have, toolchain.env wants $RESID_STAGE2_SHA256: run ./install.sh in a Resid checkout at commit $RESID_COMMIT)"
+[ "$CHECK" = 0 ] || exit 0
+mkdir -p "$1"
+out="$(cd "$1" && pwd)"
 
 # The image, tagged by its Dockerfile, built once per machine.
 img="pylon-release-toolchain:$(sha256sum "$HERE/toolchain/Dockerfile" | cut -c1-16)"
