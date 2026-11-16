@@ -8,9 +8,6 @@
 //   log-key HEX                (the transparency log's keys)
 //
 // Public keys only; the private keys never enter this repository
-// (SPEC 8.2.1). Empty until the first release ceremony: until
-// then no pylond verifies against this build, and pylon refuses to push
-// one unless told to trust other roots (--pylond-roots FILE) or none
-// (--pylond-unverified), both developer options that say so.
+// (SPEC 8.2.1). Pinned at a release ceremony (tools/release/CEREMONY.md).
 
-pub Str pinned_roots() { return ""; }
+pub Str pinned_roots() { return "pylond-roots v1\nrelease-threshold 2\nrelease-key 7b4d468285e47007bbf60abf7f855b486f2ac1c29e42027aee1cb148df8fb0ce\nrelease-key a4f2fdab4c42f9ad3bf1866fefb7843983ccc4549d0bcc2ecf6f7f0e6096d0e1\nrelease-key a55f2a1f08126874523ef2a86eb93be94460f9ec7d01c10b625a4da4ec5b2a92\nlog-threshold 1\nlog-key b1526816f3eb656bc36c949abeec384512ca3ceb6ef3c98403dba542001c11fb\n"; }
