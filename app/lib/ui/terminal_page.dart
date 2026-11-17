@@ -8,6 +8,7 @@ import '../term/term_view.dart';
 import '../theme.dart';
 import 'app_state.dart';
 import 'prompts.dart';
+import 'session_note.dart';
 import 'session_page.dart';
 import 'widgets.dart';
 
@@ -132,14 +133,7 @@ class _TerminalPageState extends State<TerminalPage> {
       ),
       body: Column(children: [
         if (s.agentKeys == AgentKeys.none || s.agentKeys == AgentKeys.unreachable) _KeysCard(session: s),
-        if (s.status.trim().isNotEmpty)
-          Container(
-            width: double.infinity,
-            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(color: s.exitCode != null ? P.redDeep : P.surface, borderRadius: BorderRadius.circular(12), border: Border.all(color: s.exitCode != null ? P.redLine : P.line)),
-            child: Text(visible(s.status.trim()), style: const TextStyle(fontSize: 13, color: Color(0xFFE6CFCF))),
-          ),
+        SessionNote(session: s),
         Expanded(
           child: TermView(
             key: view,

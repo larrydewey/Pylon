@@ -11,6 +11,7 @@ import '../ui/app_state.dart';
 import '../ui/home.dart';
 import '../ui/pin_page.dart';
 import '../ui/prompts.dart';
+import '../ui/session_note.dart';
 import '../ui/widgets.dart';
 import 'layout.dart';
 
@@ -278,14 +279,7 @@ class DesktopShellState extends State<DesktopShell> {
             ),
           ]),
         ),
-        if (s.status.trim().isNotEmpty)
-          Container(
-            width: double.infinity,
-            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(color: ended ? P.redDeep : P.surface, borderRadius: BorderRadius.circular(10), border: Border.all(color: ended ? P.redLine : P.line)),
-            child: Text(visible(s.status.trim()), style: const TextStyle(fontSize: 13, color: Color(0xFFE6CFCF))),
-          ),
+        SessionNote(session: s, padding: 10),
         Expanded(
           child: TermView(
             key: _viewKey(p),

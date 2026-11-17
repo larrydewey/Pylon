@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pylon/backend/model.dart';
 import 'package:pylon/theme.dart';
 import 'package:pylon/ui/app_state.dart';
+import 'package:pylon/ui/session_note.dart';
 import 'package:pylon/ui/sessions_page.dart';
 import 'package:pylon/ui/terminal_page.dart';
 
@@ -109,5 +110,32 @@ void main() {
     await tester.pumpAndSettle();
     expect(st.sessions, isEmpty);
     expect(find.byType(TerminalPage), findsNothing);
+  });
+
+  testWidgets("a live session's connection details fold to one line; an ended one's show whole", (tester) async {
+    final s = FakeSession(Host(name: 'roam', user: 'u', address: '10.0.0.9', mode: Mode.pylon));
+    s.status = 'pylon: pylond 0.2.1 (release 9): signed by 3 release keys, entry 8 of the log\'s 9\n'
+        'pylon: Pylon protocol session to 10.0.0.9:51000 (experimental); SSH closed\n';
+    await tester.pumpWidget(MaterialApp(theme: pylonTheme(), home: Scaffold(body: SessionNote(session: s))));
+    String shown() => tester.widget<Text>(find.byKey(const Key('session-note'))).data!;
+    expect(shown(), startsWith('pylon: pylond 0.2.1'));
+    expect(shown(), isNot(contains('SSH closed')));
+    expect(find.text('+1'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('session-note-toggle')));
+    await tester.pump();
+    expect(shown(), contains('SSH closed'));
+    expect(find.text('+1'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('session-note-toggle')));
+    await tester.pump();
+    expect(shown(), isNot(contains('SSH closed')));
+
+    // Ended: the reason is the point, whole and not foldable.
+    s.status = 'pylon: the connection closed while sending\npylon: (more)';
+    s.exitCode = 1;
+    await tester.pumpWidget(MaterialApp(theme: pylonTheme(), home: Scaffold(body: SessionNote(key: const Key('ended'), session: s))));
+    expect(shown(), contains('(more)'));
+    expect(find.byKey(const Key('session-note-toggle')), findsNothing);
   });
 }
