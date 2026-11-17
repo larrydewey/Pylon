@@ -1,6 +1,7 @@
 // Touch as mouse: reports in the encoding the program asked for, and the
-// gestures that make them (a tap clicks, a drag holds the button, a long
-// press right-clicks, two fingers turn the wheel), only while it asks.
+// gestures that make them (a tap clicks, a drag after a rest holds the
+// button, a long press right-clicks, a swipe or two fingers turn the
+// wheel), only while it asks.
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -78,9 +79,10 @@ void main() {
     expect(sent, ['\x1b[<0;6;4M', '\x1b[<0;6;4m']);
   });
 
-  testWidgets('a drag holds the button: press, motion over the cells, release', (tester) async {
+  testWidgets('a drag after a rest holds the button: press, motion over the cells, release', (tester) async {
     final (sent, view, asked) = await pump(tester, drag | sgr);
     final g = await tester.startGesture(cellAt(tester, 0, 0));
+    await tester.pump(TermViewState.armHold + const Duration(milliseconds: 50));
     await g.moveBy(const Offset(0, 40));
     await g.moveBy(const Offset(0, 40));
     await g.up();
@@ -97,6 +99,7 @@ void main() {
   testWidgets('clicks only (1000): a drag is a press and a release, no motion', (tester) async {
     final (sent, _, _) = await pump(tester, click);
     final g = await tester.startGesture(cellAt(tester, 0, 0));
+    await tester.pump(TermViewState.armHold + const Duration(milliseconds: 50));
     await g.moveBy(const Offset(0, 60));
     await g.up();
     await tester.pump();
@@ -108,10 +111,26 @@ void main() {
   testWidgets('a long press is a right click', (tester) async {
     final (sent, _, _) = await pump(tester, click | sgr);
     final g = await tester.startGesture(cellAt(tester, 0, 0));
-    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pump(TermViewState.armHold);
+    expect(sent, isEmpty, reason: 'armed for a drag, not yet a right click');
+    await tester.pump(TermViewState.longHold - TermViewState.armHold + const Duration(milliseconds: 50));
     await g.up();
     await tester.pump();
     expect(sent, ['\x1b[<2;1;1M', '\x1b[<2;1;1m']);
+  });
+
+  testWidgets('a swipe before the rest turns the wheel: no press, nothing selected', (tester) async {
+    final (sent, view, _) = await pump(tester, drag | sgr);
+    final g = await tester.startGesture(cellAt(tester, 2, 2));
+    for (var i = 0; i < 6; i++) {
+      await g.moveBy(const Offset(0, 20));
+    }
+    await tester.pump(TermViewState.longHold);
+    await g.up();
+    await tester.pump();
+    expect(sent, isNotEmpty);
+    expect(sent.every((s) => s.startsWith('\x1b[<64;')), true, reason: 'fingers down: wheel up, never a button');
+    expect(view.currentState!.offset, 0);
   });
 
   testWidgets('two fingers turn the wheel', (tester) async {

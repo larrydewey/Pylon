@@ -41,8 +41,9 @@ class Palette {
 ///
 /// While the program asks for mouse reports ([Screen.mouseTrack]) and
 /// [mouse] is on, touches and the mouse go to it instead: a tap is a
-/// click, a long press a right click, a one-finger drag a drag with the
-/// button held, a two-finger drag (or the wheel) the wheel. Turning
+/// click, a long press a right click, a one-finger drag after a short
+/// rest a drag with the button held (selecting, in most programs), and a
+/// swipe, a two-finger drag or the wheel the wheel. Turning
 /// [mouse] off gives touch back to scrolling.
 ///
 /// Focus sits on a hidden text field, so a soft keyboard or an input
@@ -92,16 +93,22 @@ class TermViewState extends State<TermView> {
 
   int get offset => _offset;
 
+  /// How long a finger rests before a drag holds the mouse button, and
+  /// before a press is a right click.
+  static const armHold = Duration(milliseconds: 300), longHold = Duration(milliseconds: 700);
+
   // Touch as mouse. The touches down and where each is; where the first
   // one went down (position and cell); whether its button press has been
-  // sent; the cell last reported; the long press's timer; whether this
-  // touch is spent (a long press, or a second finger came); the part of
-  // a line the two-finger drag has moved; and the mouse's button held.
+  // sent; the cell last reported; the timers of the hold that arms a drag
+  // and of the long press; whether the hold armed a drag; whether this
+  // touch is a swipe (it moved before the hold armed a drag: the wheel);
+  // whether it is spent (a long press, or a second finger came); the part
+  // of a line the wheel has moved; and the mouse's button held.
   final _touches = <int, Offset>{};
   Offset _downAt = Offset.zero;
   (int, int) _downCell = (0, 0), _last = (0, 0);
-  bool _pressed = false, _spent = false;
-  Timer? _long;
+  bool _pressed = false, _spent = false, _armed = false, _swiping = false;
+  Timer? _arm, _long;
   double _wheel = 0;
   int _button = MouseEncoder.left;
   Size _cellSize = const Size(8, 16);
@@ -116,6 +123,7 @@ class TermViewState extends State<TermView> {
 
   @override
   void dispose() {
+    _arm?.cancel();
     _long?.cancel();
     _focus.dispose();
     _textFocus.dispose();
@@ -243,18 +251,27 @@ class TermViewState extends State<TermView> {
     if (_touches.length == 1) {
       _downAt = e.localPosition;
       _downCell = _last = at;
-      _pressed = _spent = false;
+      _pressed = _spent = _armed = _swiping = false;
       _wheel = 0;
+      _arm?.cancel();
       _long?.cancel();
-      _long = Timer(const Duration(milliseconds: 500), () {
-        if (!mounted || _pressed || _spent || _touches.length != 1) return;
-        _spent = true;
+      // A drag holds the button (and selects, in most programs) only after
+      // the finger has rested a moment; a swipe before that scrolls.
+      _arm = Timer(armHold, () {
+        if (!mounted || _pressed || _spent || _swiping || _touches.length != 1) return;
+        _armed = true;
         HapticFeedback.selectionClick();
+      });
+      _long = Timer(longHold, () {
+        if (!mounted || _pressed || _spent || _swiping || _touches.length != 1) return;
+        _spent = true;
+        HapticFeedback.mediumImpact();
         _click(MouseEncoder.right, _downCell);
       });
       return;
     }
     // A second finger: the wheel from here on, the first touch let go.
+    _arm?.cancel();
     _long?.cancel();
     if (_pressed) _report(MouseEncoder.left, _last, release: true);
     _pressed = false;
@@ -274,24 +291,39 @@ class TermViewState extends State<TermView> {
     _touches[e.pointer] = e.localPosition;
     if (!_mouseOn) return;
     if (_touches.length >= 2) {
-      // Fingers down the screen bring older lines into view: wheel up.
-      _wheel += e.delta.dy / _touches.length;
-      final lines = _wheel ~/ _cellSize.height;
-      if (lines != 0) {
-        _wheel -= lines * _cellSize.height;
-        _wheelBy(lines, at);
-      }
+      _wheelDrag(e.delta.dy / _touches.length, at);
       return;
     }
     if (_spent) return;
+    if (_swiping) {
+      _wheelDrag(e.delta.dy, at);
+      return;
+    }
     if (!_pressed) {
       if ((e.localPosition - _downAt).distance < kTouchSlop) return;
+      _arm?.cancel();
       _long?.cancel();
+      if (!_armed) {
+        // Moved before the hold armed a drag: a swipe, the wheel.
+        _swiping = true;
+        _wheelDrag(e.localPosition.dy - _downAt.dy, at);
+        return;
+      }
       _pressed = true;
       _report(MouseEncoder.left, _downCell);
     }
     if (at != _last && widget.screen.mouseTrack >= 1002) _report(MouseEncoder.left + MouseEncoder.motion, at);
     _last = at;
+  }
+
+  // Fingers down the screen bring older lines into view: wheel up.
+  void _wheelDrag(double dy, (int, int) at) {
+    _wheel += dy;
+    final lines = _wheel ~/ _cellSize.height;
+    if (lines != 0) {
+      _wheel -= lines * _cellSize.height;
+      _wheelBy(lines, at);
+    }
   }
 
   void _up(PointerEvent e, {bool cancel = false}) {
@@ -301,8 +333,9 @@ class TermViewState extends State<TermView> {
       return;
     }
     if (_touches.remove(e.pointer) == null || _touches.isNotEmpty) return;
+    _arm?.cancel();
     _long?.cancel();
-    final pressed = _pressed, spent = _spent;
+    final pressed = _pressed, spent = _spent || _swiping;
     _pressed = false;
     _spent = true;
     if (!_mouseOn) return;
