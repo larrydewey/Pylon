@@ -26,7 +26,9 @@
 //        modes (4) | rows x cols cells (code point (4) | attributes (4));
 //        modes are core/term.resid's bits, and 128 while the alternate
 //        screen is shown (a full-screen program: the app scrolls it with
-//        arrow keys, not through the scrollback)
+//        arrow keys, not through the scrollback); the mouse bits (256,
+//        512, 1024, 2048) say which mouse reports the program asked for,
+//        which the app encodes from touches
 //     2  reply bytes for the host (fixed-format answers only)
 //     3  title (printable ASCII)
 //     4  clipboard write request (the OSC 52 payload, base64): the app
@@ -47,8 +49,8 @@ List(Int) frame(Int ty, List(Int) p) { return [ty].concat(u32_be(p.len())).conca
 
 List(Int) u16b(Int v) { return [(v >> 8) & 255, v & 255]; }
 
-// The screen frame's mode bit for the alternate screen: above every bit of
-// core/term.resid's modes, which it never sets.
+// The screen frame's mode bit for the alternate screen: a bit
+// core/term.resid's modes leave free.
 Int m_alt_shown() { return 128; }
 
 List(Int) cells_out(List(List(Int)) rows, Int i, List(Int) acc) {

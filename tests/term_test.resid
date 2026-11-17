@@ -91,6 +91,26 @@ test "line drawing charset" {
     expect(cell_ch(t.scr[0][3])).toEqual(113);
 }
 
+test "mouse reporting: one tracking mode at a time, SGR apart" {
+    Term t = fed(2, 5, "\x1b[?1000h\x1b[?1006h");
+    expect(t.modes & m_mouse_track()).toEqual(m_mouse_click());
+    expect(t.modes & m_mouse_sgr()).toEqual(m_mouse_sgr());
+    Term u = term_feed(t, bytes_of("\x1b[?1002h"));
+    expect(u.modes & m_mouse_track()).toEqual(m_mouse_drag());
+    Term v = term_feed(u, bytes_of("\x1b[?1003h"));
+    expect(v.modes & m_mouse_track()).toEqual(m_mouse_any());
+    Term w = term_feed(v, bytes_of("\x1b[?1000l"));
+    expect(w.modes & m_mouse_track()).toEqual(0);
+    expect(w.modes & m_mouse_sgr()).toEqual(m_mouse_sgr());
+    Term x = term_feed(w, bytes_of("\x1b[?1006l"));
+    expect(x.modes & m_mouse_sgr()).toEqual(0);
+    expect(x.modes & 128).toEqual(0);
+    // A re-attached viewer gets the program's mouse modes back.
+    Term r = term_feed(term_new(2, 5), repaint(term_feed(u, bytes_of("x")), 0));
+    expect(r.modes & m_mouse_track()).toEqual(m_mouse_drag());
+    expect(r.modes & m_mouse_sgr()).toEqual(m_mouse_sgr());
+}
+
 test "repaint reproduces the screen on a fresh terminal" {
     Term t = term_feed(term_new(3, 8), bytes_of("\x1b[1;32mgreen\x1b[0m\r\nplain ").concat([228, 184, 173]).concat(bytes_of("\r\n\x1b[7minv\x1b[2;3H")));
     Term u = term_feed(term_new(3, 8), repaint(t, 0));

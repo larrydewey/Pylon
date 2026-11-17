@@ -69,3 +69,29 @@ class KeyEncoder {
     return t.codeUnits.any((c) => c < 0x20 && c != 0x09);
   }
 }
+
+/// Mouse reports for a program that asked for them (DECSET 1000, 1002,
+/// 1003), in the encoding it asked for: SGR (1006) or X10 bytes.
+class MouseEncoder {
+  static const left = 0, middle = 1, right = 2, wheelUp = 64, wheelDown = 65;
+
+  /// Added to a button for motion (a drag, or a move with none held).
+  static const motion = 32;
+
+  /// The button code of motion with no button held.
+  static const none = 3;
+
+  /// Modifier bits.
+  static const shift = 4, meta = 8, ctrl = 16;
+
+  /// A report of [button] (with [motion] and modifier bits) at the cell
+  /// [x], [y] (from 0): a press or motion, or with [release] a release.
+  /// Null where X10 bytes cannot hold the position (beyond 223).
+  static List<int>? report(int button, int x, int y, {required bool sgr, bool release = false}) {
+    if (sgr) return utf8.encode('\x1b[<$button;${x + 1};${y + 1}${release ? 'm' : 'M'}');
+    if (x > 222 || y > 222) return null;
+    // X10 has no button in a release: button 3, the modifiers kept.
+    final b = release ? (none | (button & (shift | meta | ctrl))) : button;
+    return [27, 91, 77, 32 + b, 33 + x, 33 + y];
+  }
+}

@@ -30,6 +30,9 @@ class _TerminalPageState extends State<TerminalPage> {
   final view = GlobalKey<TermViewState>();
   bool ctrl = false, alt = false;
 
+  // Touch goes to a program that asks for the mouse; off, it scrolls.
+  bool mouse = true;
+
   bool get local => widget.host.local;
 
   @override
@@ -49,7 +52,7 @@ class _TerminalPageState extends State<TerminalPage> {
     super.dispose();
   }
 
-  Widget _key(String label, List<int> bytes, {bool latched = false, VoidCallback? onTap}) => Expanded(
+  Widget _key(String label, List<int> bytes, {bool latched = false, VoidCallback? onTap, IconData? icon}) => Expanded(
         child: Padding(
           padding: const EdgeInsets.all(3),
           child: SizedBox(
@@ -67,7 +70,9 @@ class _TerminalPageState extends State<TerminalPage> {
                     s.input(bytes);
                     view.currentState?.focus();
                   },
-              child: Text(label, style: TextStyle(fontFamily: mono, fontSize: 13, color: latched ? (local ? P.purple : P.tealText) : (local ? P.localText : P.text))),
+              child: icon != null
+                  ? Icon(icon, size: 20, semanticLabel: label, color: latched ? (local ? P.purple : P.tealText) : (local ? P.localText : P.text))
+                  : Text(label, style: TextStyle(fontFamily: mono, fontSize: 13, color: latched ? (local ? P.purple : P.tealText) : (local ? P.localText : P.text))),
             ),
           ),
         ),
@@ -141,6 +146,7 @@ class _TerminalPageState extends State<TerminalPage> {
             scrollback: s.scrollback,
             ctrl: ctrl,
             alt: alt,
+            mouse: mouse,
             cursor: local ? P.purple : P.teal,
             onModsUsed: () => setState(() => ctrl = alt = false),
             onInput: s.input,
@@ -160,6 +166,8 @@ class _TerminalPageState extends State<TerminalPage> {
             _key('↑', s.screen.appCursor ? [27, 79, 65] : [27, 91, 65]),
             _key('↓', s.screen.appCursor ? [27, 79, 66] : [27, 91, 66]),
             _key('→', s.screen.appCursor ? [27, 79, 67] : [27, 91, 67]),
+            // Only while the program asks for the mouse: lit, touch is its.
+            if (s.screen.mouseTrack != 0) _key('Touch as mouse', [], icon: Icons.mouse_outlined, latched: mouse, onTap: () => setState(() => mouse = !mouse)),
           ]),
         ),
       ]),

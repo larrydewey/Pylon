@@ -23,6 +23,20 @@ class Screen {
   /// bit 128): scrolling sends it arrow keys; the scrollback is not its.
   bool get altScreen => modes & 128 != 0;
 
+  /// The mouse reports the program asked for (core/term.resid's bits): 0
+  /// none, 1000 presses and releases, 1002 also drags, 1003 also motion
+  /// with no button held.
+  int get mouseTrack => modes & 1024 != 0
+      ? 1003
+      : modes & 512 != 0
+          ? 1002
+          : modes & 256 != 0
+              ? 1000
+              : 0;
+
+  /// Mouse reports in the SGR encoding (1006) rather than X10 bytes.
+  bool get mouseSgr => modes & 2048 != 0;
+
   /// What is seen [offset] lines up from the live screen: the scrollback's
   /// lines from `total - offset` on (from [sb], blank where it has not
   /// fetched them yet), then the screen's top rows. No cursor.

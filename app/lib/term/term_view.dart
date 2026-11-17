@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -38,16 +39,25 @@ class Palette {
 /// screen up. Typing, or the button that appears while scrolled back,
 /// returns to the live screen.
 ///
+/// While the program asks for mouse reports ([Screen.mouseTrack]) and
+/// [mouse] is on, touches and the mouse go to it instead: a tap is a
+/// click, a long press a right click, a one-finger drag a drag with the
+/// button held, a two-finger drag (or the wheel) the wheel. Turning
+/// [mouse] off gives touch back to scrolling.
+///
 /// Focus sits on a hidden text field, so a soft keyboard or an input
 /// method has somewhere to type into; keys it does not turn into text
 /// (Enter, arrows, Ctrl and Alt chords) bubble up to this view first.
 class TermView extends StatefulWidget {
-  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed, this.autofocus = false, this.onFocused, this.cursor = P.teal, this.reserved, this.scrollback});
+  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed, this.autofocus = false, this.onFocused, this.cursor = P.teal, this.reserved, this.scrollback, this.mouse = true});
 
   final Screen screen;
 
   /// The session's scrollback (null: no scrolling back).
   final Scrollback? scrollback;
+
+  /// Touches and the mouse go to a program that asks for mouse reports.
+  final bool mouse;
   final void Function(List<int> bytes) onInput;
   final void Function(int rows, int cols) onResize;
   final double fontSize;
@@ -82,6 +92,22 @@ class TermViewState extends State<TermView> {
 
   int get offset => _offset;
 
+  // Touch as mouse. The touches down and where each is; where the first
+  // one went down (position and cell); whether its button press has been
+  // sent; the cell last reported; the long press's timer; whether this
+  // touch is spent (a long press, or a second finger came); the part of
+  // a line the two-finger drag has moved; and the mouse's button held.
+  final _touches = <int, Offset>{};
+  Offset _downAt = Offset.zero;
+  (int, int) _downCell = (0, 0), _last = (0, 0);
+  bool _pressed = false, _spent = false;
+  Timer? _long;
+  double _wheel = 0;
+  int _button = MouseEncoder.left;
+  Size _cellSize = const Size(8, 16);
+
+  bool get _mouseOn => widget.mouse && widget.screen.mouseTrack != 0;
+
   @override
   void initState() {
     super.initState();
@@ -90,6 +116,7 @@ class TermViewState extends State<TermView> {
 
   @override
   void dispose() {
+    _long?.cancel();
     _focus.dispose();
     _textFocus.dispose();
     _text.dispose();
@@ -159,6 +186,131 @@ class TermViewState extends State<TermView> {
     }
   }
 
+  (int, int) _cellAt(Offset p) {
+    final s = widget.screen;
+    final x = ((p.dx - 8) / _cellSize.width).floor().clamp(0, s.cols - 1);
+    final y = ((p.dy - 4) / _cellSize.height).floor().clamp(0, s.rows - 1);
+    return (x, y);
+  }
+
+  // A report to the program, with the modifiers held or latched.
+  void _report(int button, (int, int) at, {bool release = false}) {
+    final hk = HardwareKeyboard.instance;
+    final ctrl = hk.isControlPressed || widget.ctrl, alt = hk.isAltPressed || widget.alt;
+    final mods = (hk.isShiftPressed ? MouseEncoder.shift : 0) | (alt ? MouseEncoder.meta : 0) | (ctrl ? MouseEncoder.ctrl : 0);
+    final b = MouseEncoder.report(button | mods, at.$1, at.$2, sgr: widget.screen.mouseSgr, release: release);
+    if (b == null) return;
+    _send(b);
+    if (widget.ctrl || widget.alt) widget.onModsUsed?.call();
+  }
+
+  void _click(int button, (int, int) at) {
+    _report(button, at);
+    _report(button, at, release: true);
+  }
+
+  void _wheelBy(int lines, (int, int) at) {
+    for (var i = 0; i < lines.abs(); i++) {
+      _report(lines > 0 ? MouseEncoder.wheelUp : MouseEncoder.wheelDown, at);
+    }
+  }
+
+  void _down(PointerDownEvent e) {
+    if (!_mouseOn) return;
+    final at = _cellAt(e.localPosition);
+    if (e.kind == PointerDeviceKind.mouse) {
+      _button = e.buttons & kSecondaryMouseButton != 0
+          ? MouseEncoder.right
+          : e.buttons & kMiddleMouseButton != 0
+              ? MouseEncoder.middle
+              : MouseEncoder.left;
+      _pressed = true;
+      _last = at;
+      _report(_button, at);
+      return;
+    }
+    _touches[e.pointer] = e.localPosition;
+    if (_touches.length == 1) {
+      _downAt = e.localPosition;
+      _downCell = _last = at;
+      _pressed = _spent = false;
+      _wheel = 0;
+      _long?.cancel();
+      _long = Timer(const Duration(milliseconds: 500), () {
+        if (!mounted || _pressed || _spent || _touches.length != 1) return;
+        _spent = true;
+        HapticFeedback.selectionClick();
+        _click(MouseEncoder.right, _downCell);
+      });
+      return;
+    }
+    // A second finger: the wheel from here on, the first touch let go.
+    _long?.cancel();
+    if (_pressed) _report(MouseEncoder.left, _last, release: true);
+    _pressed = false;
+    _spent = true;
+    _wheel = 0;
+  }
+
+  void _move(PointerMoveEvent e) {
+    final at = _cellAt(e.localPosition);
+    if (e.kind == PointerDeviceKind.mouse) {
+      if (!_pressed || !_mouseOn) return;
+      if (at != _last && widget.screen.mouseTrack >= 1002) _report(_button + MouseEncoder.motion, at);
+      _last = at;
+      return;
+    }
+    if (!_touches.containsKey(e.pointer)) return;
+    _touches[e.pointer] = e.localPosition;
+    if (!_mouseOn) return;
+    if (_touches.length >= 2) {
+      // Fingers down the screen bring older lines into view: wheel up.
+      _wheel += e.delta.dy / _touches.length;
+      final lines = _wheel ~/ _cellSize.height;
+      if (lines != 0) {
+        _wheel -= lines * _cellSize.height;
+        _wheelBy(lines, at);
+      }
+      return;
+    }
+    if (_spent) return;
+    if (!_pressed) {
+      if ((e.localPosition - _downAt).distance < kTouchSlop) return;
+      _long?.cancel();
+      _pressed = true;
+      _report(MouseEncoder.left, _downCell);
+    }
+    if (at != _last && widget.screen.mouseTrack >= 1002) _report(MouseEncoder.left + MouseEncoder.motion, at);
+    _last = at;
+  }
+
+  void _up(PointerEvent e, {bool cancel = false}) {
+    if (e.kind == PointerDeviceKind.mouse) {
+      if (_pressed && _mouseOn) _report(_button, _cellAt(e.localPosition), release: true);
+      _pressed = false;
+      return;
+    }
+    if (_touches.remove(e.pointer) == null || _touches.isNotEmpty) return;
+    _long?.cancel();
+    final pressed = _pressed, spent = _spent;
+    _pressed = false;
+    _spent = true;
+    if (!_mouseOn) return;
+    if (pressed) {
+      _report(MouseEncoder.left, _last, release: true);
+    } else if (!spent && !cancel) {
+      _click(MouseEncoder.left, _downCell);
+    }
+  }
+
+  void _hover(PointerHoverEvent e) {
+    if (!_mouseOn || widget.screen.mouseTrack != 1003) return;
+    final at = _cellAt(e.localPosition);
+    if (at == _last) return;
+    _last = at;
+    _report(MouseEncoder.none + MouseEncoder.motion, at);
+  }
+
   KeyEventResult _onKey(FocusNode node, KeyEvent e) {
     if (e is KeyUpEvent) return KeyEventResult.ignored;
     if (widget.reserved?.call(e) ?? false) return KeyEventResult.handled;
@@ -184,6 +336,7 @@ class TermViewState extends State<TermView> {
   @override
   Widget build(BuildContext context) {
     final cell = _cell();
+    _cellSize = cell;
     return LayoutBuilder(builder: (context, c) {
       final cols = math.max(10, (c.maxWidth - 16) ~/ cell.width);
       final rows = math.max(4, (c.maxHeight - 8) ~/ cell.height);
@@ -196,17 +349,32 @@ class TermViewState extends State<TermView> {
       // The scrollback was cleared under a view scrolled back past it.
       if (sb != null && sb.total >= 0 && _offset > sb.total) _offset = sb.total;
       final shown = _offset > 0 && sb != null && !widget.screen.altScreen ? widget.screen.scrolledBack(sb, _offset) : widget.screen;
+      final mouse = _mouseOn;
       return Listener(
         onPointerSignal: (e) {
-          if (e is PointerScrollEvent) _dragBy(-e.scrollDelta.dy, cell.height);
+          if (e is! PointerScrollEvent) return;
+          if (mouse) {
+            // One report a notch, as xterm sends.
+            if (e.scrollDelta.dy != 0) _wheelBy(e.scrollDelta.dy < 0 ? 1 : -1, _cellAt(e.localPosition));
+          } else {
+            _dragBy(-e.scrollDelta.dy, cell.height);
+          }
         },
+        onPointerDown: _down,
+        onPointerMove: _move,
+        onPointerUp: _up,
+        onPointerCancel: (e) => _up(e, cancel: true),
+        onPointerHover: _hover,
         child: GestureDetector(
         onTap: focus,
-        onVerticalDragStart: (_) {
-          _drag = 0;
-          if (sb != null && sb.total < 0 && !widget.screen.altScreen) sb.request?.call(0, 0);
-        },
-        onVerticalDragUpdate: (d) => _dragBy(d.delta.dy, cell.height),
+        // While the program takes the mouse, drags are its (the Listener's).
+        onVerticalDragStart: mouse
+            ? null
+            : (_) {
+                _drag = 0;
+                if (sb != null && sb.total < 0 && !widget.screen.altScreen) sb.request?.call(0, 0);
+              },
+        onVerticalDragUpdate: mouse ? null : (d) => _dragBy(d.delta.dy, cell.height),
         child: Focus(
           focusNode: _focus,
           onKeyEvent: _onKey,

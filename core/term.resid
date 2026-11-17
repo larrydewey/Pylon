@@ -48,6 +48,14 @@ pub Int m_appcursor() { return 8; }
 pub Int m_origin() { return 16; }
 pub Int m_insert() { return 32; }
 pub Int m_graphics() { return 64; }   // G0 is DEC special graphics (line drawing)
+// Mouse reporting the program asked for (DECSET 1000, 1002, 1003: at most
+// one of the three is set), and the SGR encoding of reports (1006). 128 is
+// left free: pylon-term marks the alternate screen with it.
+pub Int m_mouse_click() { return 256; }   // 1000: button presses and releases
+pub Int m_mouse_drag() { return 512; }    // 1002: also motion while a button is held
+pub Int m_mouse_any() { return 1024; }    // 1003: also motion with no button held
+pub Int m_mouse_sgr() { return 2048; }    // 1006: reports as CSI < b ; x ; y M/m
+pub Int m_mouse_track() { return m_mouse_click() | m_mouse_drag() | m_mouse_any(); }
 
 // Parser states.
 Int s_ground() { return 0; }
@@ -461,8 +469,18 @@ Term dec_modes(Term t, List(Int) ps, Int i, Bool on) {
         if (m == 7) { t_modes(t, set_bit(t.modes, m_autowrap(), on)) } else {
         if (m == 25) { t_modes(t, set_bit(t.modes, m_cursor(), on)) } else {
         if (m == 2004) { t_modes(t, set_bit(t.modes, m_paste(), on)) } else {
-        if (m == 47 || m == 1047 || m == 1049) { alt_screen(t, on, m == 1049) } else { t } } } } } };
+        if (m == 1000 || m == 1002 || m == 1003) { t_modes(t, mouse_track(t.modes, m, on)) } else {
+        if (m == 1006) { t_modes(t, set_bit(t.modes, m_mouse_sgr(), on)) } else {
+        if (m == 47 || m == 1047 || m == 1049) { alt_screen(t, on, m == 1049) } else { t } } } } } } } };
     return dec_modes(u, ps, i + 1, on);
+}
+
+// One mouse tracking mode at a time, as in xterm: setting 1000, 1002 or
+// 1003 replaces whichever was set, and resetting any of them stops reports.
+Int mouse_track(Int modes, Int m, Bool on) {
+    Int off = modes & (0 - 1 - m_mouse_track());
+    if (!on) { return off; }
+    return off | (if (m == 1000) { m_mouse_click() } else { if (m == 1002) { m_mouse_drag() } else { m_mouse_any() } });
 }
 
 Int set_bit(Int v, Int b, Bool on) { return if (on) { v | b } else { v & (0 - 1 - b) }; }
@@ -713,8 +731,17 @@ pub List(Int) repaint(Term t, Int sb_lines) {
     List(Int) modes = bytes_of(if ((t.modes & m_cursor()) != 0) { "\x1b[?25h" } else { "\x1b[?25l" })
         .concat(bytes_of(if ((t.modes & m_paste()) != 0) { "\x1b[?2004h" } else { "\x1b[?2004l" }))
         .concat(bytes_of(if ((t.modes & m_appcursor()) != 0) { "\x1b[?1h" } else { "\x1b[?1l" }))
+        .concat(bytes_of(mouse_out(t.modes)))
+        .concat(bytes_of(if ((t.modes & m_mouse_sgr()) != 0) { "\x1b[?1006h" } else { "\x1b[?1006l" }))
         .concat(bytes_of(if (t.top != 0 || t.bot != t.rows - 1) { "\x1b[" + f"{t.top + 1};{t.bot + 1}" + "r" } else { "" }));
     return hist.concat(clear).concat(body).concat(cur).concat(modes);
+}
+
+Str mouse_out(Int modes) {
+    if ((modes & m_mouse_any()) != 0) { return "\x1b[?1003h"; }
+    if ((modes & m_mouse_drag()) != 0) { return "\x1b[?1002h"; }
+    if ((modes & m_mouse_click()) != 0) { return "\x1b[?1000h"; }
+    return "\x1b[?1000l";
 }
 
 List(Int) rows_out(List(List(Int)) rs, Int i, Bool nl, List(Int) acc) {

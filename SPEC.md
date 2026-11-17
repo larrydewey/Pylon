@@ -1030,6 +1030,12 @@ the emulator:
 - **Paste.** Bracketed paste is always used when the program enabled it;
   a paste containing a newline or control characters into a program
   that did not is shown for confirmation.
+- **Mouse.** Reports (DECSET 1000, 1002, 1003, in the SGR encoding of
+  1006 or X10 bytes) are sent only while the program has asked for them,
+  and only for the principal's own touches, clicks and wheel. On a touch
+  screen a tap is a click, a long press a right click, a drag a drag with
+  the button held and two fingers the wheel; a key turns touch back to
+  scrolling while the program keeps asking.
 - **Hyperlinks** (OSC 8) show their real target before opening.
 - **No spoofing of Pylon.** Pylon's own prompts (host trust, consent
   hand-off, errors) are drawn outside the terminal area, never inside it.
