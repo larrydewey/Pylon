@@ -81,6 +81,74 @@ class Screen {
     return Screen(rows, cols, cx, cy, modes, cp, attr);
   }
 
+  int at(int x, int y) => cp[y * cols + x];
+
+  // Line drawing that splits panes (tmux, screen): what stops a pane
+  // across (a vertical line, or a corner or junction on one) and down.
+  static bool _stopsAcross(int c) => const {0x2502, 0x2503, 0x2551, 0x251C, 0x2524, 0x253C, 0x252C, 0x2534, 0x250C, 0x2510, 0x2514, 0x2518, 0x2523, 0x252B, 0x254B}.contains(c);
+  static bool _stopsDown(int c) => const {0x2500, 0x2501, 0x2550, 0x251C, 0x2524, 0x253C, 0x252C, 0x2534, 0x250C, 0x2510, 0x2514, 0x2518, 0x2523, 0x252B, 0x254B}.contains(c);
+
+  /// The pane around the cell at [x], [y]: left, top, right and bottom
+  /// (inclusive), bounded by the line drawing that splits a terminal
+  /// into panes, or the screen's edges. A cell on a border is its own pane.
+  (int, int, int, int) paneAt(int x, int y) {
+    if (_stopsAcross(at(x, y)) || _stopsDown(at(x, y))) return (x, y, x, y);
+    var l = x, r = x, t = y, b = y;
+    while (l > 0 && !_stopsAcross(at(l - 1, y))) {
+      l--;
+    }
+    while (r < cols - 1 && !_stopsAcross(at(r + 1, y))) {
+      r++;
+    }
+    while (t > 0 && !_stopsDown(at(x, t - 1))) {
+      t--;
+    }
+    while (b < rows - 1 && !_stopsDown(at(x, b + 1))) {
+      b++;
+    }
+    return (l, t, r, b);
+  }
+
+  /// The word at [x], [y] (a run of non-blank cells, within [lo]..[hi]):
+  /// its first and last column. A blank cell is a word of its own.
+  (int, int) wordAt(int x, int y, {int lo = 0, int? hi}) {
+    final h = hi ?? cols - 1;
+    bool word(int c) => c > 32 && !_stopsAcross(c);
+    if (!word(at(x, y))) return (x, x);
+    var s = x, e = x;
+    while (s > lo && word(at(s - 1, y))) {
+      s--;
+    }
+    while (e < h && word(at(e + 1, y))) {
+      e++;
+    }
+    return (s, e);
+  }
+
+  /// The text from cell [a] to cell [b] (either order), inclusive, a line
+  /// a row with trailing blanks dropped. Within [pane] (left, top, right,
+  /// bottom) when given: each row only its columns, rows outside it none.
+  String textBetween((int, int) a, (int, int) b, {(int, int, int, int)? pane}) {
+    final (s, e) = ordered(a, b);
+    final (pl, pt, pr, pb) = pane ?? (0, 0, cols - 1, rows - 1);
+    final lines = <String>[];
+    for (var y = s.$2; y <= e.$2; y++) {
+      if (y < pt || y > pb) continue;
+      final from = y == s.$2 ? s.$1 : 0, to = y == e.$2 ? e.$1 : cols - 1;
+      final sb = StringBuffer();
+      for (var x = from < pl ? pl : from; x <= (to > pr ? pr : to); x++) {
+        final c = at(x, y);
+        if (c != 0) sb.writeCharCode(c);
+      }
+      lines.add(sb.toString().trimRight());
+    }
+    return lines.join('\n');
+  }
+
+  /// [a] and [b] in reading order.
+  static ((int, int), (int, int)) ordered((int, int) a, (int, int) b) =>
+      a.$2 < b.$2 || (a.$2 == b.$2 && a.$1 <= b.$1) ? (a, b) : (b, a);
+
   String rowText(int y) {
     final sb = StringBuffer();
     for (var x = 0; x < cols; x++) {

@@ -1,7 +1,7 @@
 // Touch as mouse: reports in the encoding the program asked for, and the
 // gestures that make them (a tap clicks, a drag after a rest holds the
-// button, a long press right-clicks, a swipe or two fingers turn the
-// wheel), only while it asks.
+// button, a swipe or two fingers turn the wheel), only while it asks; a
+// long press is Pylon's own selection (selection_test.dart).
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -108,15 +108,16 @@ void main() {
     expect(sent.last.codeUnitAt(3), 32 + 3);
   });
 
-  testWidgets('a long press is a right click', (tester) async {
-    final (sent, _, _) = await pump(tester, click | sgr);
+  testWidgets('a long press selects, sending nothing: no right click', (tester) async {
+    final (sent, view, _) = await pump(tester, click | sgr);
     final g = await tester.startGesture(cellAt(tester, 0, 0));
     await tester.pump(TermViewState.armHold);
-    expect(sent, isEmpty, reason: 'armed for a drag, not yet a right click');
+    expect(sent, isEmpty, reason: 'armed for a drag');
     await tester.pump(TermViewState.longHold - TermViewState.armHold + const Duration(milliseconds: 50));
     await g.up();
     await tester.pump();
-    expect(sent, ['\x1b[<2;1;1M', '\x1b[<2;1;1m']);
+    expect(sent, isEmpty);
+    expect(view.currentState!.selecting, true);
   });
 
   testWidgets('a swipe before the rest turns the wheel: no press, nothing selected', (tester) async {

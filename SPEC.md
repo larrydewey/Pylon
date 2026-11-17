@@ -1023,7 +1023,15 @@ yields a process that can draw one terminal and nothing else. Within
 the emulator:
 
 - **Clipboard** (OSC 52): writes require a per-host grant; reads are not
-  implemented.
+  implemented. One prompt a session at a time: writes that arrive while
+  it is up replace what it offers, so a program copying again and again
+  cannot stack prompts.
+- **Selection.** A long press selects what is on screen, in Pylon itself:
+  the word under the finger, extended by a drag before letting go, its
+  ends moved by handles. Copy puts it on the clipboard with no prompt
+  (the principal copies it). It keeps to the pane it began in, bounded
+  by the line drawing a multiplexer splits panes with, unless that is
+  turned off.
 - **No read-back.** DECRQSS, title reporting (`CSI 21 t`), font and
   color queries that echo attacker-controlled strings back as input are
   not implemented or answer fixed values.
@@ -1033,10 +1041,11 @@ the emulator:
 - **Mouse.** Reports (DECSET 1000, 1002, 1003, in the SGR encoding of
   1006 or X10 bytes) are sent only while the program has asked for them,
   and only for the principal's own touches, clicks and wheel. On a touch
-  screen a tap is a click, a long press a right click, a drag after a
-  short rest a drag with the button held (so text is selected only on
-  purpose), and a quick swipe or two fingers the wheel; a key turns touch
-  back to scrolling while the program keeps asking.
+  screen a tap is a click, a drag after a short rest a drag with the
+  button held (so text is selected only on purpose), and a quick swipe
+  or two fingers the wheel; a long press is Pylon's own selection, never
+  sent. A key turns touch back to scrolling while the program keeps
+  asking.
 - **Hyperlinks** (OSC 8) show their real target before opening.
 - **No spoofing of Pylon.** Pylon's own prompts (host trust, consent
   hand-off, errors) are drawn outside the terminal area, never inside it.

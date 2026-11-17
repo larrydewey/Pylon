@@ -9,45 +9,72 @@ import '../theme.dart';
 import 'widgets.dart';
 
 /// OSC 52: a program wants to write to the clipboard. Asked every time
-/// (SPEC 12); never the other way round. Takes the oldest request.
+/// (SPEC 12); never the other way round. One sheet a session at a time:
+/// it offers the latest write, and writes that arrive while it is up
+/// (tmux copies again on every drag) replace what it offers rather than
+/// stacking sheets.
 Future<void> askClipboard(BuildContext context, Session s) async {
-  if (s.clipboardRequests.isEmpty) return;
-  final req = s.clipboardRequests.removeAt(0);
-  String text;
-  try {
-    text = utf8.decode(base64.decode(String.fromCharCodes(req)), allowMalformed: true);
-  } catch (_) {
+  String? latest() {
+    String? text;
+    for (final req in s.clipboardRequests) {
+      try {
+        text = utf8.decode(base64.decode(String.fromCharCodes(req)), allowMalformed: true);
+      } catch (_) {}
+    }
+    s.clipboardRequests.clear();
+    return text;
+  }
+
+  final open = _asking[s];
+  if (open != null) {
+    final t = latest();
+    if (t != null) open.value = t;
     return;
   }
+  final first = latest();
+  if (first == null) return;
+  final offer = ValueNotifier(first);
+  _asking[s] = offer;
   final who = s.local ? 'The local shell' : s.host.name;
-  final ok = await showModalBottomSheet<bool>(
-    context: context,
-    backgroundColor: P.surface,
-    builder: (c) => Padding(
-      padding: const EdgeInsets.all(20),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(s.local ? 'Let the local shell copy to your clipboard?' : 'Let $who copy to your clipboard?', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
-        const SizedBox(height: 8),
-        Text(
-            s.local
-                ? 'A program in the local shell wants to put ${text.length} characters on this device\'s clipboard. It can never read your clipboard.'
-                : 'A program on the server wants to put ${text.length} characters on this device\'s clipboard. Programs on a server can never read your clipboard.',
-            style: const TextStyle(color: Color(0xFFC9D1DB))),
-        const SizedBox(height: 12),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(color: P.ink2, borderRadius: BorderRadius.circular(10), border: Border.all(color: P.line)),
-          child: Text(visible(text.length > 300 ? '${text.substring(0, 300)}…' : text), style: const TextStyle(fontFamily: mono, fontSize: 12)),
+  bool? ok;
+  try {
+    ok = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: P.surface,
+      builder: (c) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: ValueListenableBuilder<String>(
+          valueListenable: offer,
+          builder: (c, text, _) => Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(s.local ? 'Let the local shell copy to your clipboard?' : 'Let $who copy to your clipboard?', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Text(
+                s.local
+                    ? 'A program in the local shell wants to put ${text.length} characters on this device\'s clipboard. It can never read your clipboard.'
+                    : 'A program on the server wants to put ${text.length} characters on this device\'s clipboard. Programs on a server can never read your clipboard.',
+                style: const TextStyle(color: Color(0xFFC9D1DB))),
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: P.ink2, borderRadius: BorderRadius.circular(10), border: Border.all(color: P.line)),
+              child: Text(visible(text.length > 300 ? '${text.substring(0, 300)}…' : text), key: const Key('clip-offer'), style: const TextStyle(fontFamily: mono, fontSize: 12)),
+            ),
+            const SizedBox(height: 14),
+            FilledButton(key: const Key('clip-allow'), onPressed: () => Navigator.pop(c, true), child: const Text('Allow this once')),
+            TextButton(key: const Key('clip-deny'), onPressed: () => Navigator.pop(c, false), child: const Text("Don't allow")),
+          ]),
         ),
-        const SizedBox(height: 14),
-        FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Allow this once')),
-        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text("Don't allow")),
-      ]),
-    ),
-  );
-  if (ok == true) await Clipboard.setData(ClipboardData(text: text));
+      ),
+    );
+  } finally {
+    _asking.remove(s);
+  }
+  if (ok == true) await Clipboard.setData(ClipboardData(text: offer.value));
+  offer.dispose();
 }
+
+final _asking = <Session, ValueNotifier<String>>{};
 
 /// Asks before disconnecting a live session; true to go ahead. Says what
 /// happens on the other end: an SSH shell ends with its connection, a
