@@ -130,7 +130,17 @@ class TermViewState extends State<TermView> {
     return Size(tp.width, tp.height);
   }
 
-  void focus() => _textFocus.requestFocus();
+  /// Takes the keyboard focus and shows the soft keyboard. When the hidden
+  /// field already has the focus but the keyboard was put away (Back, or
+  /// its own hide key), asking for the focus again does nothing, so the
+  /// keyboard is asked for directly.
+  void focus() {
+    if (_textFocus.hasFocus) {
+      SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+    } else {
+      _textFocus.requestFocus();
+    }
+  }
 
   // Input goes to the host, and the view back to the live screen.
   void _send(List<int> bytes) {
