@@ -138,6 +138,7 @@ class _TerminalPageState extends State<TerminalPage> {
           child: TermView(
             key: view,
             screen: s.screen,
+            scrollback: s.scrollback,
             ctrl: ctrl,
             alt: alt,
             cursor: local ? P.purple : P.teal,

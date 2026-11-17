@@ -284,6 +284,7 @@ class DesktopShellState extends State<DesktopShell> {
           child: TermView(
             key: _viewKey(p),
             screen: s.screen,
+            scrollback: s.scrollback,
             fontSize: 14,
             cursor: accent,
             autofocus: focused,

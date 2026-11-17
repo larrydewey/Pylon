@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -31,13 +32,22 @@ class Palette {
 /// Draws a [Screen] and turns keys into bytes for the host. Ctrl and Alt
 /// may be latched by the extra-keys row ([ctrl], [alt]).
 ///
+/// A vertical drag (or the mouse wheel) scrolls: back through the
+/// [scrollback] on the normal screen, fetching it from the emulator as it
+/// goes; with arrow keys while a full-screen program has the alternate
+/// screen up. Typing, or the button that appears while scrolled back,
+/// returns to the live screen.
+///
 /// Focus sits on a hidden text field, so a soft keyboard or an input
 /// method has somewhere to type into; keys it does not turn into text
 /// (Enter, arrows, Ctrl and Alt chords) bubble up to this view first.
 class TermView extends StatefulWidget {
-  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed, this.autofocus = false, this.onFocused, this.cursor = P.teal, this.reserved});
+  const TermView({super.key, required this.screen, required this.onInput, required this.onResize, this.fontSize = 13, this.ctrl = false, this.alt = false, this.onModsUsed, this.autofocus = false, this.onFocused, this.cursor = P.teal, this.reserved, this.scrollback});
 
   final Screen screen;
+
+  /// The session's scrollback (null: no scrolling back).
+  final Scrollback? scrollback;
   final void Function(List<int> bytes) onInput;
   final void Function(int rows, int cols) onResize;
   final double fontSize;
@@ -65,6 +75,13 @@ class TermViewState extends State<TermView> {
   final _text = TextEditingController();
   int _rows = 0, _cols = 0;
 
+  // Lines scrolled back from the live screen (0: live), and the part of a
+  // line a drag or wheel has moved and not yet turned into one.
+  int _offset = 0;
+  double _drag = 0;
+
+  int get offset => _offset;
+
   @override
   void initState() {
     super.initState();
@@ -88,6 +105,60 @@ class TermViewState extends State<TermView> {
 
   void focus() => _textFocus.requestFocus();
 
+  // Input goes to the host, and the view back to the live screen.
+  void _send(List<int> bytes) {
+    if (_offset != 0) {
+      setState(() => _offset = 0);
+    }
+    widget.onInput(bytes);
+  }
+
+  void toLive() => setState(() => _offset = 0);
+
+  // Moves by [lines] (positive: back, toward older output).
+  void _scrollBy(int lines) {
+    if (lines == 0) return;
+    if (widget.screen.altScreen) {
+      // A full-screen program: what a wheel does there in other terminals.
+      final key = lines > 0 ? LogicalKeyboardKey.arrowUp : LogicalKeyboardKey.arrowDown;
+      final b = KeyEncoder.encode(key, ctrl: false, alt: false, shift: false, appCursor: widget.screen.appCursor);
+      if (b == null) return;
+      for (var i = 0; i < lines.abs(); i++) {
+        widget.onInput(b);
+      }
+      return;
+    }
+    final sb = widget.scrollback;
+    if (sb == null) return;
+    if (sb.total < 0) {
+      sb.request?.call(0, 0); // how much there is; the next move scrolls
+      return;
+    }
+    final next = (_offset + lines).clamp(0, sb.total);
+    if (next != _offset) {
+      setState(() => _offset = next);
+    }
+    _fetch();
+  }
+
+  // The scrollback lines in view (and a margin) that are not here yet.
+  void _fetch() {
+    final sb = widget.scrollback;
+    if (sb == null || _offset == 0 || sb.total <= 0) return;
+    final top = sb.total - _offset;
+    final need = math.min(_rows, sb.total - top);
+    if (need > 0 && !sb.has(top, need)) sb.request?.call(math.max(0, top - 200), 500);
+  }
+
+  void _dragBy(double dy, double lineHeight) {
+    _drag += dy;
+    final lines = _drag ~/ lineHeight;
+    if (lines != 0) {
+      _drag -= lines * lineHeight;
+      _scrollBy(lines);
+    }
+  }
+
   KeyEventResult _onKey(FocusNode node, KeyEvent e) {
     if (e is KeyUpEvent) return KeyEventResult.ignored;
     if (widget.reserved?.call(e) ?? false) return KeyEventResult.handled;
@@ -97,13 +168,13 @@ class TermViewState extends State<TermView> {
     final shift = hk.isShiftPressed;
     final special = KeyEncoder.encode(e.logicalKey, ctrl: ctrl, alt: alt, shift: shift, appCursor: widget.screen.appCursor);
     if (special != null) {
-      widget.onInput(special);
+      _send(special);
       widget.onModsUsed?.call();
       return KeyEventResult.handled;
     }
     final ch = e.character;
     if (ch != null && ch.isNotEmpty && (ctrl || alt)) {
-      widget.onInput(KeyEncoder.text(ch, ctrl: ctrl, alt: alt));
+      _send(KeyEncoder.text(ch, ctrl: ctrl, alt: alt));
       widget.onModsUsed?.call();
       return KeyEventResult.handled;
     }
@@ -121,8 +192,21 @@ class TermViewState extends State<TermView> {
         _cols = cols;
         WidgetsBinding.instance.addPostFrameCallback((_) => widget.onResize(rows, cols));
       }
-      return GestureDetector(
+      final sb = widget.scrollback;
+      // The scrollback was cleared under a view scrolled back past it.
+      if (sb != null && sb.total >= 0 && _offset > sb.total) _offset = sb.total;
+      final shown = _offset > 0 && sb != null && !widget.screen.altScreen ? widget.screen.scrolledBack(sb, _offset) : widget.screen;
+      return Listener(
+        onPointerSignal: (e) {
+          if (e is PointerScrollEvent) _dragBy(-e.scrollDelta.dy, cell.height);
+        },
+        child: GestureDetector(
         onTap: focus,
+        onVerticalDragStart: (_) {
+          _drag = 0;
+          if (sb != null && sb.total < 0 && !widget.screen.altScreen) sb.request?.call(0, 0);
+        },
+        onVerticalDragUpdate: (d) => _dragBy(d.delta.dy, cell.height),
         child: Focus(
           focusNode: _focus,
           onKeyEvent: _onKey,
@@ -130,7 +214,33 @@ class TermViewState extends State<TermView> {
             if (has) widget.onFocused?.call();
           },
           child: Stack(children: [
-            Positioned.fill(child: Container(color: P.ink2, padding: const EdgeInsets.fromLTRB(8, 4, 8, 4), child: CustomPaint(painter: _ScreenPainter(widget.screen, cell, widget.fontSize, widget.cursor)))),
+            Positioned.fill(child: Container(color: P.ink2, padding: const EdgeInsets.fromLTRB(8, 4, 8, 4), child: CustomPaint(painter: _ScreenPainter(shown, cell, widget.fontSize, widget.cursor)))),
+            if (_offset > 0)
+              Positioned(
+                right: 12,
+                bottom: 12,
+                child: Semantics(
+                  label: 'Back to the live screen',
+                  button: true,
+                  child: Material(
+                    color: P.surface,
+                    shape: const StadiumBorder(side: BorderSide(color: P.tealLine)),
+                    child: InkWell(
+                      key: const Key('to-live'),
+                      customBorder: const StadiumBorder(),
+                      onTap: toLive,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Text('$_offset ↑', style: const TextStyle(fontFamily: mono, fontSize: 12, color: P.muted)),
+                          const SizedBox(width: 6),
+                          const Icon(Icons.arrow_downward, size: 16, color: P.tealText),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             // Typed text arrives here (soft keyboards): sent at once and
             // cleared, with suggestions and learning off (SPEC 15).
             Positioned(
@@ -149,15 +259,16 @@ class TermViewState extends State<TermView> {
                   keyboardType: TextInputType.visiblePassword,
                   onChanged: (v) {
                     if (v.isEmpty) return;
-                    widget.onInput(KeyEncoder.text(v, ctrl: widget.ctrl, alt: widget.alt));
+                    _send(KeyEncoder.text(v, ctrl: widget.ctrl, alt: widget.alt));
                     widget.onModsUsed?.call();
                     _text.clear();
                   },
-                  onSubmitted: (_) => widget.onInput([13]),
+                  onSubmitted: (_) => _send([13]),
                 ),
               ),
             ),
           ]),
+        ),
         ),
       );
     });

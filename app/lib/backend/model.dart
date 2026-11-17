@@ -63,6 +63,10 @@ abstract class Session {
   final Host host;
   bool get local => host.local;
   Screen screen = Screen.blank(24, 80);
+
+  /// The emulator's scrollback as far as fetched; its `request` is set by
+  /// a session that has an emulator to ask.
+  final Scrollback scrollback = Scrollback();
   String title = '';
   int? exitCode;
   String status = '';

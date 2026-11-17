@@ -265,6 +265,7 @@ class ProcSession extends Session {
       return;
     }
     _term!.output.listen(_onTerm);
+    scrollback.request = (from, count) => _term?.add(frame(3, [(from >> 24) & 255, (from >> 16) & 255, (from >> 8) & 255, from & 255, (count >> 8) & 255, count & 255]));
     // The emulator ending before the session (it refused to run, or failed)
     // ends the session: there is nothing to draw its output with.
     final termSaid = StringBuffer();
@@ -337,6 +338,8 @@ class ProcSession extends Session {
         title = String.fromCharCodes(p);
       } else if (t == 4) {
         clipboardRequests.add(Uint8List.fromList(p));
+      } else if (t == 6) {
+        scrollback.take(Uint8List.fromList(p));
       }
     }
     changed();
