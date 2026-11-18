@@ -682,6 +682,10 @@ class TermViewState extends State<TermView> {
                     widget.onModsUsed?.call();
                     _text.clear();
                   },
+                  // Enter is a carriage return, not the end of editing:
+                  // without this, the field gives up its focus on the
+                  // keyboard's action key and the keyboard goes away.
+                  onEditingComplete: () {},
                   onSubmitted: (_) => _send([13]),
                 ),
               ),
