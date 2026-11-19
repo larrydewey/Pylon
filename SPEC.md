@@ -686,16 +686,90 @@ and ends the host's sessions.
 
 `pylond` runs as the principal, never as root. It declares only the Resid
 capabilities it needs (`network`, `terminal`, `process` for the PTY
-child, `filesystem` scoped to file transfers). Before it opens its UDP
-socket it applies a seccomp filter (the system calls of its event loop,
-PTY and transfer paths only) and Landlock (no filesystem access outside
-`$HOME` and its cache). The PTY's shell is a separate process outside
-this confinement, as the principal expects of a login shell.
+child; `filesystem` only in a separate file-transfer helper). Before it
+reads its UDP socket it applies a seccomp filter (the system calls of
+its event loop and PTY paths only) and Landlock (no file it can write or
+create anywhere; the helper is confined beneath `$HOME` and refuses
+hidden names). The PTY's shell is a separate process outside this
+confinement, as the principal expects of a login shell. Confinement
+limits what a `pylond` bug yields; it does not make it nothing (8.4.1
+lists what remains).
 
 Confinement is not best-effort: on a kernel without Landlock or seccomp
 filters, `pylond` refuses to listen and Pylon stays on SSH for that host
 (with a note on the host saying why), unless the host entry explicitly
 allows an unconfined `pylond`.
+
+#### 8.4.1 As implemented
+
+`pylond` is split into processes by what each may do. Only the first
+reads the network.
+
+| Process | Reads | Can | Confinement |
+|---|---|---|---|
+| the daemon | UDP datagrams, the control socket, `-L`/`-D`/`-R` sockets, PTY output | hold the link keys, the PTY masters and the sockets it was given; ask the broker for a terminal and the file helper for a transfer | Landlock: **no** file writable or creatable anywhere, nothing readable but beneath `/etc` (the resolver's files), never execute; the runtime's seccomp allowlist (no `execve`) |
+| the PTY broker | 16-byte requests from the daemon | start one fixed command, `env TERM=xterm-256color $SHELL -l`, on a new terminal (the daemon chooses only rows and columns); report a child's exit status | none (it starts the login shell); forked before the daemon reads anything |
+| the file helper (`pylond xfer`) | framed requests from the daemon over a Unix socket | read and write files that are beneath `$HOME` and have no hidden name (no path component starting with a dot) and no `.` or `..` component | Landlock: every right but execute beneath `$HOME` only; the same seccomp allowlist |
+| the login shells | the terminal | everything the principal can | none, as a login shell expects |
+
+The file helper is started by the daemon before it confines itself
+(through `/proc/self/exe` on a pseudo-terminal, the one way the runtime
+starts a process), connects back to a 0700 socket that the daemon removes
+again at once, and the daemon accepts only the connection from that
+process id. The helper resolves every path itself, so a compromised
+daemon cannot make it write `~/.ssh/authorized_keys`, `~/.ssh/rc`,
+`~/.bashrc`, `~/.profile`, `~/.config/...`, `~/.local/bin/...` or any
+`.git/hooks`, nor read `~/.ssh/id_*` or `~/.gnupg`; a principal who
+wants such a file moves it over SSH (without `--pylond`), whose SFTP is
+not reachable from `pylond`. Files the helper creates get mode 0666 less
+the umask, so never an execute bit.
+
+`pylond check-confinement FILE` applies the daemon's exact confinement
+(the same function) to itself and reports whether FILE can be read,
+appended to or created beside; the interop suite checks that all three
+are refused for a file beneath `$HOME`, and that the helper refuses
+hidden names and `..` while transfers, `--resume` included, work.
+
+**What a compromised daemon still has (residual risk).** Confinement
+removes direct writes to the principal's files; it does not make a
+compromised daemon harmless:
+
+- **Terminals are code execution by design.** The daemon decrypts the
+  principal's keystrokes and writes them to the PTY masters it holds, so
+  it can type into any live or kept terminal; and the broker starts a
+  login shell whenever the daemon asks (the broker cannot tell an
+  authenticated request from a forged one: authentication ends in the
+  daemon). Code execution in the daemon is therefore code execution as
+  the principal, persistence included, whenever it chooses to use a
+  terminal. Closing this needs the terminal stream authenticated end to
+  end between the client and a process that holds the masters (keys the
+  daemon never has), or a broker that spawns only against a grant from
+  a fresh SSH login (the unconfined `pylond serve` of that login) and a
+  daemon that holds no master; neither is built.
+- **Unix sockets.** Landlock as the runtime applies it does not cover
+  connecting to a Unix socket, and the seccomp allowlist has `socket`
+  and `connect` for forwards, so the daemon can still connect to the
+  principal's own sockets: the D-Bus session bus and the systemd user
+  manager (which start programs), `ssh-agent`, and other daemons'
+  control sockets (checked: a confined `pylond check-confinement`
+  connects to a socket in `$HOME`). Closing this needs the runtime's
+  filter to refuse `socket(AF_UNIX, ...)` after confinement (the daemon
+  only uses Unix sockets it opened before), or Landlock's scoping of
+  pathname sockets; Resid offers neither yet.
+- **Within the helper's reach.** The daemon can still have the helper
+  read or replace any non-hidden file beneath `$HOME`: documents, source
+  trees, `~/bin/...` (an existing executable keeps its mode when its
+  contents are replaced), and anything reached through a symbolic link
+  the principal made from a visible name (the runtime offers no
+  `lstat` or `O_NOFOLLOW`; the daemon itself cannot make links).
+- **Network reach** as the principal's forwards have it: TCP to any
+  address, loopback services included.
+
+So the confinement narrows a `pylond` bug from "every file in `$HOME`"
+to the terminals it serves, the principal's Unix sockets and visible
+files through the helper; the pre-authentication surface (9.4) remains
+the main defence, and the protocol's formal model and review (16) the
+condition for enabling it by default.
 
 ## 9. The Pylon protocol
 
@@ -866,8 +940,10 @@ Files (v1, `core/files.resid`): `pylon get/put --pylond FILE [--resume]`
 opens `FILE 16 | sid | op (1: 0 get, 1 put) | flags (1: bit 0 resume) |
 path`, confirmed as OPEN is, on an external stream. The path is the one
 the principal typed (printable ASCII in v1; a relative one is taken under
-`$HOME`, and Landlock confines pylond beneath `$HOME` and its runtime
-directory, reading beneath `/etc`). Files are cut into 64 KiB chunks;
+`$HOME`). The daemon touches no file: its file helper (8.4.1) does every
+read and write, only beneath `$HOME`, never through a hidden name or a
+`.` or `..` component, and refuses others with a message (`pylond does
+not touch hidden files...`). Files are cut into 64 KiB chunks;
 the side holding part of the file sends the SHA-256 of each whole chunk
 it has, and the transfer starts after the leading run of chunks both
 sides share:
@@ -919,15 +995,16 @@ Limits of v1: files of up to 64 MiB (held in
 memory whole) with printable-ASCII remote paths, no resume over UDP alone with a ticket (re-attach always takes
 a new SSH login, which is stricter than 10.4 requires).
 
-Confinement (8.4) as built: the daemon forks a PTY broker (the only
-process that can start the login shell; masters come back over a socket),
-then confines itself before reading any datagram: Landlock (all rights
-beneath `$HOME` and the runtime directory, reading beneath `/etc`, never
-execute) and a seccomp allowlist of its event loop's system calls. Both
-are per thread, so the runtime continues the daemon in a forked,
-single-threaded child; the original process only waits on it. Without
-Landlock pylond refuses to serve unless the client passes
-`--allow-unconfined` for that host.
+Confinement (8.4.1) as built: the daemon forks a PTY broker (the only
+process that can start the login shell; masters come back over a socket)
+and starts the file helper, then confines itself before reading any
+datagram: Landlock (no right beneath any directory but reading beneath
+`/etc`; never execute) and a seccomp allowlist of its event loop's system
+calls. Both are per thread, so the runtime continues the daemon in a
+forked, single-threaded child; the original process only waits on it.
+The helper confines itself the same way to `$HOME`. Without Landlock
+pylond refuses to serve unless the client passes `--allow-unconfined`
+for that host.
 
 ## 10. Sessions, screen sync and re-attach
 
@@ -1295,7 +1372,7 @@ adversary, what Draft 1 allowed, and the change.
 | # | Adversary | Finding in Draft 1 | Change |
 |---|---|---|---|
 | H1 | A3 | A session ticket alone let a device resume a session, so an unlocked stolen phone could re-attach to a live shell without any signature; revocation depended on another of the principal's devices being online to tell `pylond`. | Tickets continue connections, never resume them; re-attach needs a fresh signature verified by `pylond` against `authorized_keys`; 12-hour ticket lifetime; G10 (10.4). |
-| H2 | A1 | `pylond` is a new network listener running as the principal; a pre-authentication bug would be remote code execution without SSH. | Pre-authentication surface reduced to one MAC check keyed by bootstrap-only values; bind the reported address only; confinement mandatory or no `pylond`; G11 (8.4, 9.4). |
+| H2 | A1 | `pylond` is a new network listener running as the principal; a pre-authentication bug would be remote code execution without SSH. | Pre-authentication surface reduced to one MAC check keyed by bootstrap-only values; bind the reported address only; confinement mandatory or no `pylond`; G11 (8.4, 9.4). *Implemented (8.4.1):* the network-facing daemon can write no file (it once had every right but execute beneath `$HOME`, so a bug could rewrite `authorized_keys` or `.bashrc`); transfers go through a helper confined to `$HOME` that refuses hidden names. Open: terminals (the daemon types into them and the broker spawns shells on its word) and the principal's Unix sockets still turn a daemon compromise into code execution as the principal. |
 | H3 | A2 | The terminal emulator parsed hostile output in the process that holds the Symbolon binding. | Emulator in an isolated process with no network, storage or binder access (12). |
 | H4 | A4 | Local forwards on Android bind the loopback shared by every app. | In-app consumption without sockets; per-connection UID check; warning; close in background (11). |
 | H5 | A4 | Third-party keyboards see passwords typed into the terminal; the clipboard leaks to other apps and devices. | Input-method flags, in-app keyboard for password prompts, sensitive and expiring clipboard (15). |

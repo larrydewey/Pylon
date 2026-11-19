@@ -6,6 +6,7 @@ import "word.resid";
 import "../core/wire.resid";
 import "../core/cipher.resid";
 import "../core/proto.resid";
+import "../core/files.resid";
 
 @requires(declassify)
 List(Int) shown(List(Secret(UInt(8))) b) { return ints_of(declassify(secret_join(b), "test compares derived keys")); }
@@ -137,4 +138,57 @@ test "cookie: sealed to the client, then mac2 binds the init to it" {
     expect(mac2_ok(cookie_of(secret, [127, 0, 0, 2, 200, 10]), p1.pkt)).toEqual(false);
     expect(mac1_ok(mac1_key(b.sb.s_pub, b.sb.psk), p1.pkt)).toEqual(true);
     expect(hs_respond(b.sb, b.s, p1.pkt).keys.ok).toEqual(true);
+}
+
+// pylond's file helper (SPEC 8.4): whatever the daemon asks, the helper
+// touches only non-hidden paths beneath $HOME.
+test "file helper: paths beneath $HOME, never hidden, never . or .." {
+    expect(xfer_path("/home/u", "docs/a.txt").path).toEqual("/home/u/docs/a.txt");
+    expect(xfer_path("/home/u", "~/a").path).toEqual("/home/u/a");
+    expect(xfer_path("/home/u/", "/home/u//x/y").path).toEqual("/home/u/x/y");
+    expect(xfer_path("/home/first.last", "a.b").path).toEqual("/home/first.last/a.b");
+    expect(xfer_path("/home/u", "~").path).toEqual("/home/u");
+    expect(xfer_path("/home/u", ".ssh/authorized_keys").path).toEqual("");
+    expect(str_contains(xfer_path("/home/u", ".ssh/authorized_keys").why, "hidden")).toEqual(true);
+    expect(xfer_path("/home/u", "~/.bashrc").path).toEqual("");
+    expect(xfer_path("/home/u", "/home/u/.profile").path).toEqual("");
+    expect(xfer_path("/home/u", "proj/.git/hooks/pre-commit").path).toEqual("");
+    expect(xfer_path("/home/u", "a/../.ssh/rc").path).toEqual("");
+    expect(xfer_path("/home/u", "a/./b").path).toEqual("");
+    expect(xfer_path("/home/u", "/etc/passwd").why).toEqual("it is outside $HOME");
+    expect(xfer_path("/home/u", "/home/u2/x").path).toEqual("");
+    expect(xfer_path("/home/u", "/home").path).toEqual("");
+    expect(xfer_path("", "a").path).toEqual("");
+    expect(xfer_path("relative", "a").path).toEqual("");
+}
+
+@requires(filesystem, declassify)
+test "file helper: a put, a resume, a get, and refusals" {
+    Str home = "/tmp/pylon-proto-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(home);
+    _ = filesystem.create_dir(home + "/.ssh");
+    List(Int) data = bytes_of("hello, pylond");
+    List(Int) o = xfer_answer(home, xfer_req(2, "f.txt", [0]));
+    expect(hex_encode(o)).toEqual("00" + "0000000000000000" + "00000000");
+    expect(hex_encode(xfer_answer(home, xfer_req(3, "f.txt", u64_be(0))))).toEqual("00");
+    expect(hex_encode(xfer_answer(home, xfer_req(4, "f.txt", data)))).toEqual("00");
+    expect(hex_encode(xfer_answer(home, xfer_req(5, "f.txt", u64_be(data.len()).concat(sha256_bytes(data)))))).toEqual("00");
+    expect(xfer_answer(home, xfer_req(5, "f.txt", u64_be(1).concat(sha256_bytes(data))))[0]).toEqual(1);
+    // Resume: what is there is reported, and a start past it refused.
+    expect(be64_at(xfer_answer(home, xfer_req(2, "~/f.txt", [1])), 1)).toEqual(data.len());
+    expect(xfer_answer(home, xfer_req(3, "f.txt", u64_be(65536)))[0]).toEqual(1);
+    List(Int) g = xfer_answer(home, xfer_req(1, home + "/f.txt", []));
+    expect(g[0]).toEqual(0);
+    expect(ascii_text(g[49..g.len()])).toEqual("hello, pylond");
+    // Hidden names, paths outside $HOME, and malformed requests.
+    List(Int) h = xfer_answer(home, xfer_req(2, ".ssh/authorized_keys", [0]));
+    expect(h[0]).toEqual(1);
+    expect(str_contains(ascii_text(h[1..h.len()]), "cannot write the file: pylond does not touch hidden")).toEqual(true);
+    expect(xfer_answer(home, xfer_req(3, ".ssh/authorized_keys", u64_be(0)))[0]).toEqual(1);
+    expect(xfer_answer(home, xfer_req(4, ".ssh/rc", data))[0]).toEqual(1);
+    expect(filesystem.exists(home + "/.ssh/authorized_keys") || filesystem.exists(home + "/.ssh/rc")).toEqual(false);
+    expect(xfer_answer(home, xfer_req(1, "/etc/hostname", []))[0]).toEqual(1);
+    expect(xfer_answer(home, xfer_req(9, "f.txt", []))[0]).toEqual(1);
+    expect(xfer_answer(home, [2, 0, 200, 65])[0]).toEqual(1);
+    expect(xfer_answer(home, xfer_req(4, "a" + str_from_code(27) + "b", data))[0]).toEqual(1);
 }
