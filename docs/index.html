@@ -164,7 +164,8 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <article>
       <h3>A changed key is a hard stop</h3>
       <p>The screen names the old pin and when it was made. The only ways forward are to disconnect or to re-verify
-        from scratch; every re-pin is kept in <code>pylon history</code>.</p>
+        from scratch; every re-pin is kept in <code>pylon history</code>. (Today a CA you trust for the name can still
+        vouch for a new key on a pinned host: a known gap.)</p>
     </article>
   </div>
 </section>
@@ -304,9 +305,9 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <p class="eyebrow">The Pylon protocol <span class="tag">experimental</span></p>
     <h2>Log in with SSH. Stay connected without it.</h2>
     <p class="lede narrow">Once logged in, Pylon can push a small, signed <code>pylond</code> to the server over the same
-      SSH connection (no root, nothing installed beforehand) and move the session onto its own UDP protocol. The new
-      keys are derived inside the already-verified SSH channel, so the Pylon session inherits SSH's host check and your
-      authentication, then adds what TCP can't give.</p>
+      SSH connection (no root, nothing installed beforehand) and move the session onto its own UDP protocol. The
+      session's keys are exchanged inside the already-verified SSH channel, so only the host you verified, reached after
+      your authentication, can complete it; then it adds what TCP can't give.</p>
 
     <figure class="diagram wide">
       <svg viewBox="0 0 960 284" role="img" aria-labelledby="t-roam">
@@ -338,7 +339,7 @@ alice@build:~$ <span class="cursor"> </span></pre>
         <text x="328" y="174" class="lbl">no new handshake: the</text>
         <text x="328" y="192" class="lbl">server follows the address</text>
         <text x="752" y="174" class="lbl" text-anchor="end">re-attach needs a</text>
-        <text x="752" y="192" class="lbl" text-anchor="end">fresh signature</text>
+        <text x="752" y="192" class="lbl" text-anchor="end">fresh SSH login</text>
         <!-- time axis -->
         <line x1="60" y1="240" x2="920" y2="240" class="axis"/>
         <g class="tick"><circle cx="60" cy="240" r="5"/><text x="60" y="266">09:00 login</text></g>
@@ -351,9 +352,10 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <div class="cards three">
       <article><h3>Post-quantum, forward-secret</h3><p>X25519 + ML-KEM-768, new keys every two minutes, so traffic recorded today stays sealed even against a future quantum computer.</p></article>
       <article><h3>Silent to scanners</h3><p>An unauthenticated datagram gets one constant-time MAC check and no reply. Under load, a cookie is required before any asymmetric work.</p></article>
-      <article><h3>Re-attach needs you</h3><p>A stolen, unlocked phone can't resume your shell: re-attaching after a long gap or from another device needs a fresh signature, verified against <code>authorized_keys</code> at that moment.</p></article>
+      <article><h3>Re-attach needs you</h3><p>A stolen, unlocked phone can't resume your shell: re-attaching from another device or after the app closed goes through a fresh SSH login, which needs a new signature from your key's custodian.</p></article>
     </div>
-    <p class="note">The v1 handshake is not yet a verified Noise pattern. It is off unless you pass <code>--pylond</code>,
+    <p class="note">The v1 handshake is not yet a verified Noise pattern, and its keys are not yet cryptographically bound
+      to the SSH exchange hash (the specification's target). It is off unless you pass <code>--pylond</code>,
       and the specification requires a formal model and an external review before it becomes the default.</p>
   </div>
 </section>
@@ -371,8 +373,8 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <li><b>No rollback</b><span>a release counter that only goes up</span></li>
     <li><b>Hash checked on the host</b><span>content-addressed, mode 0500 in a 0700 cache, run as you, never root</span></li>
   </ol>
-  <p class="note">No release keys are pinned yet: until the first signing ceremony, only developer options (announced
-    as such) push a <code>pylond</code>.</p>
+  <p class="note">Three release keys are pinned, any two of which must sign. No signed release is bundled yet, so for
+    now only developer options (announced as such on every use) push a <code>pylond</code>.</p>
 </section>
 
 <!-- ───────────────────────── hostile output ───────────────────────── -->
@@ -382,14 +384,15 @@ alice@build:~$ <span class="cursor"> </span></pre>
       <p class="eyebrow">The terminal</p>
       <h2>Output from a server is treated as an attack until proven otherwise.</h2>
       <p>The terminal emulator is the largest parser of attacker-controlled bytes in any SSH client. Pylon's runs in its
-        own confined process that can draw one terminal and nothing else, written in
+        own confined process, away from the keys and connections (on the desktop, one sandbox per terminal; on Android
+        today, one isolated process shared by all terminals), written in
         <a href="https://github.com/larrydewey/Resid">Resid</a>: total parsers, checked arithmetic, and secrets typed as
         <code>Secret</code> so they can't be logged or compared in variable time.</p>
     </div>
     <ul class="checks">
       <li><b>Clipboard writes</b> need a per-host grant; clipboard reads don't exist.</li>
       <li><b>No read-back</b>: title reports and setting queries that echo attacker text as input are not implemented.</li>
-      <li><b>Pastes</b> with newlines or control characters are shown before they're sent.</li>
+      <li><b>Pastes</b> with newlines or control characters are shown before they're sent, and pasted text can't end a bracketed paste early (known issue: a nested-marker bypass found in review).</li>
       <li><b>Links</b> show their real target before opening.</li>
       <li><b>Pylon's own prompts</b> are drawn outside the terminal, so output can't imitate them.</li>
       <li><b>Keystroke timing</b> is hidden in fixed 20 ms frames with chaff.</li>
@@ -440,7 +443,7 @@ alice@build:~$ <span class="cursor"> </span></pre>
       <div class="col exp"><h3>Experimental</h3>
         <ul><li>The Pylon UDP protocol and <code>pylond</code></li><li>Persistent sessions and re-attach</li><li>The isolated local shell (Android not yet verified on a device)</li></ul></div>
       <div class="col todo"><h3>Not yet</h3>
-        <ul><li>Pinned release keys and the first signing ceremony</li><li>Formal model and external review of the protocol</li><li>Live DNSSEC against the real root in CI</li><li>Windows, macOS, iOS</li></ul></div>
+        <ul><li>The first signed, logged <code>pylond</code> release</li><li>Formal model and external review of the protocol</li><li>Live DNSSEC against the real root in CI</li><li>Windows, macOS, iOS</li></ul></div>
     </div>
   </div>
 </section>
