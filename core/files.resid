@@ -75,3 +75,118 @@ pub List(Int) put_body(List(Int) data, List(Int) hashes) {
     Int start = matching(data, hashes, 0) * file_chunk();
     return u64_be(start).concat(u64_be(data.len())).concat(sha256_bytes(data)).concat(data[start..data.len()]);
 }
+
+// ============================================================================
+// pylond's file helper (SPEC 8.4)
+// ============================================================================
+//
+// pylond's network-facing daemon has no filesystem access of its own: a
+// helper process, started before the daemon confines itself, does every
+// read and write of a transfer, on the daemon's request over a Unix
+// socket. The helper decides for itself which paths a transfer may touch,
+// so a compromised daemon can ask it for no more than this:
+//
+//   - only beneath $HOME (and the helper's Landlock domain is $HOME alone);
+//   - no hidden name anywhere beneath $HOME (a component starting with a
+//     dot: ~/.ssh, ~/.bashrc, ~/.profile, ~/.config, ~/.local, .git, ...),
+//     where the files that log in, start or configure programs live;
+//   - no "." or ".." component.
+//
+// Requests, each framed as length (4) | body, answered the same way:
+//
+//   op (1) | path length (2) | path | arguments
+//   1 get        hashes of the client's chunks   -> get_reply's answer
+//   2 put-open   resume (1)                     -> 0 | size (8) | count (4) | count x hash, or 1 | message
+//   3 put-start  start (8)                      -> 0, or 1 | message (the file cut back to start)
+//   4 append     bytes                          -> 0, or 1 | message
+//   5 check      size (8) | sha256 (32)         -> 0, or 1 | message
+//
+// The path is the one the principal typed (path_ok); a relative one, or
+// one starting with "~/", is taken under $HOME.
+
+// A path a transfer may use, or why not (path "").
+pub type XPath = { Str path; Str why; };
+
+pub XPath xfer_path(Str home, Str typed) {
+    List(Str) hc = path_parts(str_split(home, "/"), 0, []);
+    Bool home_ok = str_starts_with(home, "/") && hc.len() > 0 && !odd_part(hc, 0);
+    if (!home_ok) { return XPath {.path = "", .why = "the principal has no usable $HOME"}; }
+    Str full = if (str_starts_with(typed, "/")) { typed } else { if (typed == "~") { home } else { if (str_starts_with(typed, "~/")) { home + str_slice(typed, 1, str_len(typed)) } else { home + "/" + typed } } };
+    List(Str) pc = path_parts(str_split(full, "/"), 0, []);
+    if (odd_part(pc, 0)) { return XPath {.path = "", .why = "the path has a . or .. in it"}; }
+    if (pc.len() < hc.len() || !same_parts(pc, hc, 0)) { return XPath {.path = "", .why = "it is outside $HOME"}; }
+    if (hidden_part(pc, hc.len())) { return XPath {.path = "", .why = "pylond does not touch hidden files or directories (names starting with a dot); use SSH (without --pylond) for those"}; }
+    return XPath {.path = "/" + str_join(pc, "/"), .why = ""};
+}
+
+// The non-empty components of a split path.
+List(Str) path_parts(List(Str) p, Int i, List(Str) acc) {
+    if (i >= p.len()) { return acc; }
+    return path_parts(p, i + 1, if (str_len(p[i]) == 0) { acc } else { acc.concat([p[i]]) });
+}
+
+Bool odd_part(List(Str) p, Int i) {
+    if (i >= p.len()) { return false; }
+    return p[i] == "." || p[i] == ".." || odd_part(p, i + 1);
+}
+
+Bool same_parts(List(Str) p, List(Str) prefix, Int i) {
+    if (i >= prefix.len()) { return true; }
+    return p[i] == prefix[i] && same_parts(p, prefix, i + 1);
+}
+
+Bool hidden_part(List(Str) p, Int i) {
+    if (i >= p.len()) { return false; }
+    return str_starts_with(p[i], ".") || hidden_part(p, i + 1);
+}
+
+// A request to the helper (its body, unframed).
+pub List(Int) xfer_req(Int op, Str path, List(Int) args) {
+    List(Int) pb = bytes_of(path);
+    return [op, (pb.len() >> 8) & 255, pb.len() & 255].concat(pb).concat(args);
+}
+
+// The helper's answer to one request (the body, unframed): the whole of
+// what the helper does for the daemon.
+@requires(filesystem)
+pub List(Int) xfer_answer(Str home, List(Int) req) {
+    if (req.len() < 3) { return refusal("malformed request"); }
+    Int op = req[0];
+    Int n = (req[1] << 8) | req[2];
+    if (op < 1 || op > 5 || req.len() < 3 + n || !path_ok(req[3..3 + n])) { return refusal("malformed request"); }
+    List(Int) a = req[3 + n..req.len()];
+    XPath p = xfer_path(home, ascii_text(req[3..3 + n]));
+    if (str_len(p.path) == 0) { return refusal(if (op == 1) { "cannot read the file: " + p.why } else { "cannot write the file: " + p.why }); }
+    if (op == 1) { return if (a.len() % 32 == 0 && a.len() <= 65536) { get_reply(p.path, a) } else { refusal("malformed request") }; }
+    if (op == 2) { return if (a.len() == 1) { put_open(p.path, a[0] == 1) } else { refusal("malformed request") }; }
+    if (op == 3) { return if (a.len() == 8) { put_start(p.path, be64_at(a, 0)) } else { refusal("malformed request") }; }
+    if (op == 4) { return if (a.len() == 0 || filesystem.append_bytes(p.path, a)) { [0] } else { refusal("cannot write the file") }; }
+    return if (a.len() == 40) { put_check(p.path, be64_at(a, 0), a[8..40]) } else { refusal("malformed request") };
+}
+
+// put-open: the size of what is there and (to resume) its chunk hashes.
+@requires(filesystem(readonly))
+List(Int) put_open(Str path, Bool resume) {
+    if (filesystem.is_dir(path)) { return refusal("is a directory"); }
+    Bool keep = resume && filesystem.exists(path);
+    List(Int) old = if (keep) { filesystem.read_bytes(path) } else { [] };
+    List(Int) hs = if (old.len() <= file_max()) { chunk_hashes(old, 0, []) } else { [] };
+    return [0].concat(u64_be(old.len())).concat(u32_be(hs.len() / 32)).concat(hs);
+}
+
+// put-start: the file cut back to the chunks both sides share (or emptied).
+@requires(filesystem)
+List(Int) put_start(Str path, Int start) {
+    if (start == 0) { return if (filesystem.write_bytes(path, [])) { [0] } else { refusal("cannot write the file") }; }
+    List(Int) old = if (filesystem.exists(path) && !filesystem.is_dir(path)) { filesystem.read_bytes(path) } else { [] };
+    if (old.len() < start) { return refusal("the file changed during the transfer"); }
+    if (old.len() == start) { return [0]; }
+    return if (filesystem.write_bytes(path, old[0..start])) { [0] } else { refusal("cannot write the file") };
+}
+
+// check: the whole file against the size and hash the client promised.
+@requires(filesystem(readonly))
+List(Int) put_check(Str path, Int size, List(Int) hash) {
+    List(Int) got = filesystem.read_bytes(path);
+    return if (got.len() == size && same_bytes(sha256_bytes(got), hash)) { [0] } else { refusal("the file does not match what was sent") };
+}

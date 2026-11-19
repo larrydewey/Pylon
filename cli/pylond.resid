@@ -31,13 +31,21 @@
 // when none do; with --ephemeral, 60 seconds after its last client went.
 //
 // Confinement (SPEC 8.4): before it reads a single datagram the daemon
-// forks a PTY broker (the only process that can start the login shell;
-// it hands back masters) and confines itself: Landlock leaves only $HOME
-// and DIR writable and /etc readable, and a seccomp filter leaves only the
-// system calls of its event loop, so it can execute nothing. On a kernel
-// without Landlock it refuses to serve unless --allow-unconfined (the
-// client's per-host exception) is given. The shells themselves run outside
-// the confinement, as a login shell should.
+// forks a PTY broker (the only process that can start the login shell, a
+// fixed command; it hands back masters), starts the file helper
+// (`pylond xfer`, the only process that touches files: beneath $HOME,
+// never a hidden name, on the daemon's request over a socket) and
+// confines itself: Landlock leaves no file writable or creatable anywhere
+// and only /etc readable, and a seccomp filter leaves only the system
+// calls of its event loop, so it can execute nothing. On a kernel without
+// Landlock it refuses to serve unless --allow-unconfined (the client's
+// per-host exception) is given. The shells themselves run outside the
+// confinement, as a login shell should; what that leaves a compromised
+// daemon is in SPEC 8.4.
+//
+//   pylond xfer SOCKET                 the file helper (started by serve)
+//   pylond check-confinement FILE      applies the daemon's confinement to
+//                                      itself, then tries FILE (tests)
 
 import "crypto.resid";
 import "../core/wire.resid";
@@ -93,11 +101,11 @@ type Peer = { Int id; Boot b; List(Int) mk; Bool linked; Link l; List(Int) stamp
 type Tty = { Int id; Int peer; Int sid; Int fd; Int pid; Term t; Int seen; };
 
 // A file transfer (core/files.resid): the client and stream, get (0) or
-// put (1), the file, the stage (0 starting, 1 moving bytes, 2 ending), the
-// bytes to send and how many are sent; for a put, the file as it was (for
-// --resume), where the new bytes start, the size and hash promised, how
+// put (1), the path as the client named it, the stage (0 starting, 1 moving bytes, 2 ending), the
+// bytes to send and how many are sent; for a put, the size of the file as
+// it was (for --resume), where the new bytes start, the size and hash promised, how
 // many bytes were written, and the first error.
-type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(Int) out; Int sent; List(Int) old; Int start; Int size; List(Int) hash; Int wrote; Str err; };
+type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(Int) out; Int sent; Int have; Int start; Int size; List(Int) hash; Int wrote; Str err; };
 
 // Load (SPEC 9.4): the cookie secret and the one before it (replaced
 // every two minutes), and how many handshakes were answered in the
@@ -119,36 +127,36 @@ Ck ck_tick(Ck c, Int now) {
 Ck ck_count(Ck c) { return Ck {.cur = c.cur, .prev = c.prev, .rotated = c.rotated, .win = c.win, .count = c.count + 1, .always = c.always}; }
 
 type Srv = { Static s; Int udp; Int port; Int ctl; List(Peer) peers; List(Tty) ttys; Int next_id; Int broker;
-    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; Str home; List(Xf) xfs; Ck ck; };
+    Int idle_ns; Int keep_ns; Bool ephemeral; Int last_client; Int xfer; List(Xf) xfs; Ck ck; };
 
 Srv sv_peers(Srv v, List(Peer) ps) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = ps, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = v.xfer, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_ttys(Srv v, List(Tty) ts) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = ts, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = v.xfer, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_next(Srv v, Int next_id) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = v.ck};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = v.xfer, .xfs = v.xfs, .ck = v.ck};
 }
 
 Srv sv_xfs(Srv v, List(Xf) xs) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = xs, .ck = v.ck};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = v.xfer, .xfs = xs, .ck = v.ck};
 }
 
 Srv sv_ck(Srv v, Ck c) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .home = v.home, .xfs = v.xfs, .ck = c};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = v.xfer, .xfs = v.xfs, .ck = c};
 }
 
 Srv sv_seen(Srv v, Int t) {
     return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
-        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t, .home = v.home, .xfs = v.xfs, .ck = v.ck};
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = t, .xfer = v.xfer, .xfs = v.xfs, .ck = v.ck};
 }
 
 Peer pr_link(Peer p, Link l) { return Peer {.id = p.id, .b = p.b, .mk = p.mk, .linked = p.linked, .l = l, .stamp = p.stamp, .born = p.born, .lsn = p.lsn}; }
@@ -276,7 +284,7 @@ Int link_peer(List(Peer) ps, List(Int) d, Int i) {
 // ============================================================================
 
 // Each client's events: terminals asked for, attaches, resizes, lists.
-@requires(network, declassify, process, clock(readonly), filesystem)
+@requires(network, declassify, process, clock(readonly))
 Srv on_events(Srv v, Int i, Int now) {
     if (i >= v.peers.len()) { return v; }
     Peer p = v.peers[i];
@@ -295,10 +303,11 @@ Srv on_events(Srv v, Int i, Int now) {
 // Files (core/files.resid)
 // ============================================================================
 
-// FILE: a get or put of a path the principal named (a relative one under
-// their home). Landlock keeps every path pylond can touch beneath $HOME
-// and its runtime directory (reading beneath /etc).
-@requires(network, declassify, filesystem)
+// FILE: a get or put of a path the principal named. The daemon touches no
+// file itself (its Landlock domain has none): the file helper (xfer_main)
+// resolves the path, refuses one outside $HOME or hidden, and does the
+// reads and writes. A put asks it at once for what is there (to resume).
+@requires(network, declassify)
 Srv files(Srv v, Int pi, List(List(Int)) req, Int i, Int now) {
     if (i >= req.len()) { return v; }
     Peer p = v.peers[pi];
@@ -306,95 +315,211 @@ Srv files(Srv v, Int pi, List(List(Int)) req, Int i, Int now) {
     List(Int) pb = req[i][3..req[i].len()];
     Bool ok = (req[i][1] == 0 || req[i][1] == 1) && path_ok(pb);
     if (!ok) { return files(sv_peers(v, put_peer(v.peers, pi, pr_link(p, refuse(p.l, sid, now)))), pi, req, i + 1, now); }
-    Str path = under_home(v.home, ascii_text(pb));
-    Bool resume = (req[i][2] & 1) == 1;
+    Str path = ascii_text(pb);
     Bool put = req[i][1] == 1;
-    Bool dir = put && filesystem.is_dir(path);
-    Bool keep = put && resume && filesystem.exists(path) && !dir;
-    List(Int) old = if (keep) { filesystem.read_bytes(path) } else { [] };
-    List(Int) hs = if (keep && old.len() <= file_max()) { chunk_hashes(old, 0, []) } else { [] };
-    List(Int) out = if (!put) { [] } else { if (dir) { refusal("is a directory") } else { [0].concat(u32_be(hs.len() / 32)).concat(hs) } };
-    Xf x = Xf {.peer = p.id, .sid = sid, .op = req[i][1], .path = path, .stage = if (dir) { 2 } else { 0 }, .out = out, .sent = 0, .old = old, .start = 0, .size = 0, .hash = [], .wrote = 0, .err = ""};
-    Srv v1 = sv_peers(v, put_peer(v.peers, pi, pr_link(p, confirm(p.l, sid, now))));
+    List(Int) r = if (put) { xcall(v.xfer, xfer_req(2, path, [req[i][2] & 1])) } else { [0] };
+    Bool lost = r.len() == 0;
+    // A put-open answer: 0 | size (8) | count (4) | hashes; the client gets 0 | count | hashes.
+    Bool good = !lost && r[0] == 0 && r.len() >= 13;
+    List(Int) out = if (!put) { [] } else { if (good) { [0].concat(r[9..r.len()]) } else { if (lost) { refusal("the file helper is gone") } else { r } } };
+    Xf x = Xf {.peer = p.id, .sid = sid, .op = req[i][1], .path = path, .stage = if (put && !good) { 2 } else { 0 }, .out = out, .sent = 0,
+        .have = if (good) { be64_at(r, 1) } else { 0 }, .start = 0, .size = 0, .hash = [], .wrote = 0, .err = ""};
+    Srv v0 = if (lost) { xfer_lost(v) } else { v };
+    Srv v1 = sv_peers(v0, put_peer(v0.peers, pi, pr_link(p, confirm(p.l, sid, now))));
     return files(sv_xfs(v1, v1.xfs.concat([x])), pi, req, i + 1, now);
 }
 
-Str under_home(Str home, Str path) {
-    if (str_starts_with(path, "/")) { return path; }
-    if (str_starts_with(path, "~/")) { return home + str_slice(path, 1, str_len(path)); }
-    return home + "/" + path;
+// The helper went away or stopped answering: its socket is closed, and
+// every later transfer is refused.
+@requires(network)
+Srv xfer_lost(Srv v) {
+    _ = if (v.xfer >= 0) { resid_unix_close(v.xfer) } else { false };
+    return Srv {.s = v.s, .udp = v.udp, .port = v.port, .ctl = v.ctl, .peers = v.peers, .ttys = v.ttys, .next_id = v.next_id, .broker = v.broker,
+        .idle_ns = v.idle_ns, .keep_ns = v.keep_ns, .ephemeral = v.ephemeral, .last_client = v.last_client, .xfer = -1, .xfs = v.xfs, .ck = v.ck};
+}
+
+// One request to the file helper and its answer; empty when the helper
+// is gone or silent for two minutes (the caller then drops it).
+@requires(network)
+List(Int) xcall(Int fd, List(Int) req) {
+    if (fd < 0) { return []; }
+    if (!send_all(fd, u32_be(req.len()).concat(req), 0)) { return []; }
+    List(Int) h = recv_full(fd, 4, [], 120000);
+    if (h.len() != 4) { return []; }
+    Int n = be32(h, 0);
+    if (n < 1 || n > file_max() + 65536) { return []; }
+    List(Int) b = recv_full(fd, n, [], 120000);
+    return if (b.len() == n) { b } else { [] };
+}
+
+// All of b on a Unix socket, a megabyte at a time.
+@requires(network)
+Bool send_all(Int fd, List(Int) b, Int at) {
+    if (at >= b.len()) { return true; }
+    Int n = min(b.len() - at, 1048576);
+    if (!resid_unix_send(fd, b[at..at + n])) { return false; }
+    return send_all(fd, b, at + n);
+}
+
+// n bytes from a Unix socket, waiting at most ms for each piece; fewer at
+// the end of the connection or on silence.
+@requires(network)
+List(Int) recv_full(Int fd, Int n, List(Int) acc, Int ms) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) r = resid_tcp_poll([fd], [1], ms);
+    if (r.len() == 0 || (r[0] & 1) == 0) { return acc; }
+    List(Int) more = resid_unix_recv_some(fd, min(n - acc.len(), 1048576));
+    if (more.len() == 0) { return acc; }
+    return recv_full(fd, n, acc.concat(more), ms);
+}
+
+// An answer's message: "" for 0, else the refusal's text.
+Str answer_err(List(Int) r) {
+    if (r.len() == 0) { return "the file helper is gone"; }
+    return if (r[0] == 0) { "" } else { ascii_text(r[1..r.len()]) };
 }
 
 Xf xf_out(Xf x, Int stage, List(Int) out, Int sent) {
-    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = stage, .out = out, .sent = sent, .old = x.old, .start = x.start, .size = x.size, .hash = x.hash, .wrote = x.wrote, .err = x.err};
+    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = stage, .out = out, .sent = sent, .have = x.have, .start = x.start, .size = x.size, .hash = x.hash, .wrote = x.wrote, .err = x.err};
 }
 
 Xf xf_put(Xf x, Int start, Int size, List(Int) hash, Int wrote, Str err) {
-    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = x.stage, .out = x.out, .sent = x.sent, .old = [], .start = start, .size = size, .hash = hash, .wrote = wrote, .err = err};
+    return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = x.stage, .out = x.out, .sent = x.sent, .have = x.have, .start = start, .size = size, .hash = hash, .wrote = wrote, .err = err};
 }
 
 // Every transfer one step: requests read, bytes written or sent, ends
 // sent. A transfer whose client or stream is gone is forgotten (a put
 // leaves what it wrote: --resume continues it).
-@requires(network, declassify, filesystem)
+@requires(network, declassify)
 Srv xfers(Srv v, Int i, Int now) {
     if (i >= v.xfs.len()) { return v; }
     Xf x = v.xfs[i];
     Int pi = peer_at(v.peers, x.peer, 0);
     if (pi < 0 || !open_sid(v.peers[pi].l, x.sid) || x.stage == 3) { return xfers(sv_xfs(v, v.xfs[0..i].concat(v.xfs[i + 1..v.xfs.len()])), i, now); }
-    XL a = if (x.op == 0) { get_step(v.peers[pi].l, x, now) } else { put_step(v.peers[pi].l, x, now) };
+    XL a = if (x.op == 0) { get_step(v.peers[pi].l, x, v.xfer, now) } else { put_step(v.peers[pi].l, x, v.xfer, false, now) };
     // What is due to the client, within the stream's window.
     Int n = min(min(room(a.l, x.sid), 65536), a.x.out.len() - a.x.sent);
     Link l1 = if (n > 0) { push_bytes(a.l, x.sid, a.x.out[a.x.sent..a.x.sent + n], now) } else { a.l };
     Bool end = a.x.stage == 2 && a.x.sent + n >= a.x.out.len();
     Link l2 = if (end) { push_eof(l1, x.sid, -1, now) } else { l1 };
     Xf x2 = xf_out(a.x, if (end) { 3 } else { a.x.stage }, a.x.out, a.x.sent + n);
-    Srv v1 = sv_peers(v, put_peer(v.peers, pi, pr_link(v.peers[pi], l2)));
+    Srv v0 = if (a.lost) { xfer_lost(v) } else { v };
+    Srv v1 = sv_peers(v0, put_peer(v0.peers, pi, pr_link(v0.peers[pi], l2)));
     return xfers(sv_xfs(v1, v1.xfs[0..i].concat([x2]).concat(v1.xfs[i + 1..v1.xfs.len()])), i + 1, now);
 }
 
-type XL = { Link l; Xf x; };
+type XL = { Link l; Xf x; Bool lost; };
 
-// get: once the client's hashes have all come (its FIN), the answer.
-@requires(network, filesystem(readonly))
-XL get_step(Link l, Xf x, Int now) {
-    if (x.stage != 0 || !peer_ended(l, x.sid)) { return XL {.l = l, .x = x}; }
+// get: once the client's hashes have all come (its FIN), the helper's answer.
+@requires(network)
+XL get_step(Link l, Xf x, Int fd, Int now) {
+    if (x.stage != 0 || !peer_ended(l, x.sid)) { return XL {.l = l, .x = x, .lost = false}; }
     List(Int) hs = inbox(l, x.sid);
-    List(Int) out = if (hs.len() % 32 == 0 && hs.len() <= 65536) { get_reply(x.path, hs) } else { refusal("malformed request") };
-    return XL {.l = take_inbox(l, x.sid, hs.len()), .x = xf_out(x, 2, out, 0)};
+    Bool well = hs.len() % 32 == 0 && hs.len() <= 65536;
+    List(Int) r = if (well) { xcall(fd, xfer_req(1, x.path, hs)) } else { refusal("malformed request") };
+    List(Int) out = if (r.len() == 0) { refusal("the file helper is gone") } else { r };
+    return XL {.l = take_inbox(l, x.sid, hs.len()), .x = xf_out(x, 2, out, 0), .lost = r.len() == 0};
 }
 
 // put: the client's header (start, size, hash), then its bytes appended
-// to the file, then the check of the whole file against the hash.
-@requires(network, filesystem)
-XL put_step(Link l, Xf x, Int now) {
+// to the file, then the check of the whole file against the hash (each
+// done by the helper).
+@requires(network)
+XL put_step(Link l, Xf x, Int fd, Bool lost, Int now) {
     List(Int) in = inbox(l, x.sid);
     Bool ended = peer_ended(l, x.sid);
-    if (x.stage == 2) { return XL {.l = take_inbox(l, x.sid, in.len()), .x = x}; }
+    if (x.stage == 2) { return XL {.l = take_inbox(l, x.sid, in.len()), .x = x, .lost = lost}; }
     if (x.stage == 0 && in.len() < 48) {
-        return if (ended) { XL {.l = l, .x = xf_out(x, 2, x.out.concat(refusal("malformed request")), x.sent)} } else { XL {.l = l, .x = x} };
+        return if (ended) { XL {.l = l, .x = xf_out(x, 2, x.out.concat(refusal("malformed request")), x.sent), .lost = lost} } else { XL {.l = l, .x = x, .lost = lost} };
     }
     if (x.stage == 0) {
         Int start = be64_at(in, 0);
         Int size = be64_at(in, 8);
-        Bool fits = start % file_chunk() == 0 && start <= x.old.len() && start <= size && size <= file_max();
-        // The file cut back to the chunks both sides share (or emptied).
-        Bool ready = fits && (if (x.old.len() == start && start > 0) { true } else { filesystem.write_bytes(x.path, x.old[0..start]) });
-        Str err = if (!fits) { "malformed request" } else { if (!ready) { "cannot write the file" } else { "" } };
-        XL taken = XL {.l = take_inbox(l, x.sid, 48), .x = xf_out(xf_put(x, start, size, in[16..48], 0, err), 1, x.out, x.sent)};
-        return put_step(taken.l, taken.x, now);
+        Bool fits = start % file_chunk() == 0 && start <= x.have && start <= size && size <= file_max();
+        List(Int) r = if (fits) { xcall(fd, xfer_req(3, x.path, u64_be(start))) } else { [0] };
+        Str err = if (!fits) { "malformed request" } else { answer_err(r) };
+        Xf x1 = xf_out(xf_put(x, start, size, in[16..48], 0, err), 1, x.out, x.sent);
+        return put_step(take_inbox(l, x.sid, 48), x1, if (r.len() == 0) { -1 } else { fd }, lost || r.len() == 0, now);
     }
-    // Stage 1: bytes to the file (none past the size promised).
+    // Stage 1: bytes to the file (none past the size promised), 64 KiB or
+    // the rest at a time (a quarter of the stream's window), so the helper
+    // is asked once per chunk, not once per datagram.
+    if (!ended && in.len() < 65536) { return XL {.l = l, .x = x, .lost = lost}; }
     Bool over = x.start + x.wrote + in.len() > x.size;
-    Bool wrote = in.len() == 0 || str_len(x.err) > 0 || over || filesystem.append_bytes(x.path, in);
-    Str err = if (str_len(x.err) > 0) { x.err } else { if (over) { "more bytes than promised" } else { if (!wrote) { "cannot write the file" } else { "" } } };
+    List(Int) r = if (in.len() == 0 || str_len(x.err) > 0 || over) { [0] } else { xcall(fd, xfer_req(4, x.path, in)) };
+    Str err = if (str_len(x.err) > 0) { x.err } else { if (over) { "more bytes than promised" } else { answer_err(r) } };
+    Bool lost1 = lost || r.len() == 0;
     Xf x1 = xf_put(x, x.start, x.size, x.hash, x.wrote + in.len(), err);
     Link l1 = take_inbox(l, x.sid, in.len());
-    if (!ended || inbox(l1, x.sid).len() > 0) { return XL {.l = l1, .x = x1}; }
-    List(Int) got = if (str_len(err) == 0) { filesystem.read_bytes(x.path) } else { [] };
-    Bool good = str_len(err) == 0 && got.len() == x.size && same_bytes(sha256_bytes(got), x.hash);
-    Str why = if (str_len(err) > 0) { err } else { "the file does not match what was sent" };
-    return XL {.l = l1, .x = xf_out(x1, 2, x1.out.concat(if (good) { [0] } else { refusal(why) }), x1.sent)};
+    if (!ended || inbox(l1, x.sid).len() > 0) { return XL {.l = l1, .x = x1, .lost = lost1}; }
+    List(Int) c = if (str_len(err) == 0) { xcall(fd, xfer_req(5, x.path, u64_be(x.size).concat(x.hash))) } else { refusal(err) };
+    List(Int) verdict = if (c.len() == 0) { refusal("the file helper is gone") } else { c };
+    return XL {.l = l1, .x = xf_out(x1, 2, x1.out.concat(verdict), x1.sent), .lost = lost1 || c.len() == 0};
+}
+
+// ============================================================================
+// The file helper: `pylond xfer SOCKET`
+// ============================================================================
+
+// Started by the daemon (on a pseudo-terminal from resid_pty_spawn, the
+// one way the runtime offers to start a process) before the daemon
+// confines itself; it connects back to SOCKET, confines itself to $HOME
+// (Landlock, every right but execute, and the same seccomp filter), and
+// answers the daemon's requests (core/files.resid, xfer_answer) until the
+// daemon goes. It never reads the network.
+@requires(args, network, environment, filesystem)
+Int xfer_main() {
+    if (args.count() != 3) { return 2; }
+    Int c = resid_unix_connect(args.get(2));
+    if (c < 0) { return 1; }
+    Str home = environment.get("HOME");
+    List(Str) none = [];
+    Int conf = resid_sandbox_confine(if (str_len(home) > 1) { [home] } else { none }, none);
+    if (conf < 0) { return 1; }
+    return xfer_loop(c, home);
+}
+
+@requires(network, filesystem)
+Int xfer_loop(Int c, Str home) {
+    // Wait for a request however long the daemon is quiet; then all of it.
+    List(Int) r = resid_tcp_poll([c], [1], 3600000);
+    if (r.len() == 0 || (r[0] & 1) == 0) { return xfer_loop(c, home); }
+    List(Int) h = recv_full(c, 4, [], 30000);
+    if (h.len() != 4) { return 0; }
+    Int n = be32(h, 0);
+    if (n < 3 || n > file_max() + 65536) { return 1; }
+    List(Int) req = recv_full(c, n, [], 30000);
+    if (req.len() != n) { return 0; }
+    List(Int) a = xfer_answer(home, req);
+    if (!send_all(c, u32_be(a.len()).concat(a), 0)) { return 0; }
+    return xfer_loop(c, home);
+}
+
+// The helper, started and connected; -1 when it could not be. The daemon
+// listens at path, starts `pylond xfer path` (the running binary, through
+// /proc/self/exe), and takes the one connection that comes from that
+// process; the socket file is gone again before the daemon confines itself.
+@requires(network, process)
+Int start_xfer(Str path) {
+    Int l = resid_unix_listen(path);
+    if (l < 0) { return -1; }
+    List(Int) sp = resid_pty_spawn("/proc/self/exe xfer " + path, 24, 80);
+    Int c = if (sp.len() == 2) { accept_from(l, sp[1], 50) } else { -1 };
+    _ = resid_unix_close(l);
+    return c;
+}
+
+// A connection on l from process pid, waiting up to n tenths of a second.
+@requires(network)
+Int accept_from(Int l, Int pid, Int n) {
+    if (n <= 0) { return -1; }
+    List(Int) r = resid_tcp_poll([l], [1], 100);
+    Int c = if (r.len() == 1 && (r[0] & 1) != 0) { resid_unix_accept_now(l) } else { -2 };
+    if (c < 0) { return accept_from(l, pid, n - 1); }
+    List(Int) who = resid_unix_peer(c);
+    if (who.len() == 3 && who[0] == pid) { return c; }
+    _ = resid_unix_close(c);
+    return accept_from(l, pid, n - 1);
 }
 
 // ============================================================================
@@ -628,7 +753,7 @@ Bool any_linked(List(Peer) ps, Int i, Int now) {
     return (ps[i].linked && now - ps[i].l.last_rx < 30000000000) || any_linked(ps, i + 1, now);
 }
 
-@requires(network, declassify, clock(readonly), process, filesystem)
+@requires(network, declassify, clock(readonly), process)
 Int serve_loop(Srv v0) {
     Int now = clock.monotonic_ns();
     Srv v = if (any_linked(v0.peers, 0, now)) { sv_seen(v0, now) } else { v0 };
@@ -691,6 +816,40 @@ Args parse(Int i, Args a) {
 
 @requires(args, network, environment, declassify, clock(readonly), process, filesystem)
 Int main() {
+    if (args.count() >= 2 && args.get(1) == "xfer") { return xfer_main(); }
+    if (args.count() == 3 && args.get(1) == "check-confinement") { return check_confinement(args.get(2)); }
+    return serve_main();
+}
+
+// The daemon's confinement (SPEC 8.4): Landlock with no file writable or
+// creatable anywhere and nothing readable but beneath /etc (the
+// resolver's files), and the runtime's seccomp filter. Sockets and
+// terminals already open stay usable. 1 confined, 0 no Landlock, -1 failed.
+Int daemon_confine() {
+    List(Str) nowhere = [];
+    return resid_sandbox_confine(nowhere, ["/etc"]);
+}
+
+// `pylond check-confinement FILE`: the daemon's confinement applied to
+// this process, which then tries to read FILE, append to it and create a
+// file beside it, and says what happened (the test suite's view of what a
+// compromised daemon could do; it only ever takes rights away).
+@requires(filesystem)
+Int check_confinement(Str file) {
+    Int conf = daemon_confine();
+    if (conf != 1) { println("not confined (" + f"{conf}" + ")"); return 1; }
+    Bool read = filesystem.read_bytes(file).len() > 0;
+    Bool append = filesystem.append_bytes(file, bytes_of("pylond was here\n"));
+    Bool create = filesystem.write_bytes(file + ".new", bytes_of("pylond was here\n"));
+    Bool etc = filesystem.read_bytes("/etc/hosts").len() > 0 || filesystem.read_bytes("/etc/resolv.conf").len() > 0;
+    println("read " + allowed(read) + ", append " + allowed(append) + ", create " + allowed(create) + ", /etc " + allowed(etc));
+    return 0;
+}
+
+Str allowed(Bool b) { return if (b) { "allowed" } else { "refused" }; }
+
+@requires(args, network, environment, declassify, clock(readonly), process)
+Int serve_main() {
     if (args.count() < 2 || args.get(1) != "serve") { eprintln("usage: pylond serve --run DIR [--idle SECONDS] [--keep SECONDS] [--ephemeral]"); return 2; }
     Args a = parse(2, Args {.run = "", .idle = 600, .keep = 604800, .ephemeral = false, .unconfined = false, .ok = true, .busy = false});
     if (!a.ok || str_len(a.run) == 0) { eprintln("usage: pylond serve --run DIR [--idle SECONDS] [--keep SECONDS] [--ephemeral]"); return 2; }
@@ -711,17 +870,21 @@ Int main() {
     }
     Int broker = resid_pty_broker("env TERM=xterm-256color " + login_shell() + " -l");
     if (broker < 0) { eprintln("pylond: cannot start the terminal broker"); return 1; }
+    // The file helper, the only process of pylond's that can touch a file
+    // (without it, terminals and forwards work and transfers are refused).
+    Int xfer = start_xfer(a.run + "/xfer-v1-" + str_replace(addr, ":", "_") + ".sock");
+    _ = if (xfer < 0) { eprintln("pylond: cannot start the file helper; file transfers are refused") } else { true };
     Int ctl = resid_unix_listen(path);
     if (ctl < 0) { eprintln("pylond: cannot listen on " + path); return 1; }
     Int udp = resid_udp_bind_at(addr, 0);
     if (udp < 0) { _ = resid_unix_close(ctl); eprintln("pylond: cannot bind UDP on " + addr); return 1; }
     // Confined before any datagram or control message is read.
-    Int conf = resid_sandbox_confine([environment.get("HOME"), a.run], ["/etc"]);
+    Int conf = daemon_confine();
     if (conf < 0) { _ = resid_unix_close(ctl); eprintln("pylond: confinement failed part-way; exiting"); return 1; }
     if (conf == 0 && !a.unconfined) { _ = resid_unix_close(ctl); eprintln("pylond: this kernel cannot confine pylond (no Landlock), so it will not serve; Pylon stays on SSH for this host (or allow an unconfined pylond for it)"); return 3; }
     Int now = clock.monotonic_ns();
     Srv v0 = Srv {.s = static_new(), .udp = udp, .port = resid_udp_port(udp), .ctl = ctl, .peers = [], .ttys = [], .next_id = 1, .broker = broker,
-        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now, .home = environment.get("HOME"), .xfs = [], .ck = ck_new(a.busy, now)};
+        .idle_ns = a.idle * 1000000000, .keep_ns = a.keep * 1000000000, .ephemeral = a.ephemeral, .last_client = now, .xfer = xfer, .xfs = [], .ck = ck_new(a.busy, now)};
     BootS served = boot_serve(hello, v0.s, v0.port);
     if (!served.boot.ok) { _ = resid_unix_close(ctl); eprintln("pylond: malformed bootstrap"); return 1; }
     _ = print_bytes(served.reply);

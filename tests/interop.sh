@@ -659,8 +659,8 @@ except socket.timeout:
     check "pylon protocol: -R, a new client takes the port over" 0 "pylon-proto-ok" \
         curl -s -m 10 "http://127.0.0.1:$RP/small.txt"
     kill $PRR 2>/dev/null; wait $PRR 2>/dev/null
-    # Files over the Pylon protocol: resumable get and put (pylond's
-    # Landlock keeps it beneath \$HOME, so the remote side lives there).
+    # Files over the Pylon protocol: resumable get and put (pylond's file
+    # helper works only beneath \$HOME, so the remote side lives there).
     HD="pylon-interop-$PORT"; mkdir -p "$HOME/$HD"; head -c 3000000 /dev/urandom > pf.bin
     PFSUM="$(sha256sum pf.bin | cut -d' ' -f1)"
     check "pylon protocol: put 3 MB (a path under \$HOME)" 0 "3000000 bytes" \
@@ -686,6 +686,22 @@ except socket.timeout:
         "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:$HD/$(printf '\033[31mred')" red2.bin
     check "pylon protocol: a put outside \$HOME is refused (Landlock)" 1 "cannot write the file" \
         "$PYLON" put -p $PORT $PYF pf.bin "$USER_NAME@127.0.0.1:$WORK/outside.bin"
+    # SPEC 8.4: the daemon touches no file; its file helper stays beneath
+    # \$HOME and away from hidden names (~/.ssh, ~/.bashrc, ...), whatever
+    # the daemon asks of it.
+    check "pylon protocol: a put to a hidden name is refused" 1 "does not touch hidden files" \
+        "$PYLON" put -p $PORT $PYF www2/small.txt "$USER_NAME@127.0.0.1:$HD/.hidden.txt"
+    check "pylon protocol: the hidden file was not made" 0 "absent" \
+        bash -c "test -e \$HOME/$HD/.hidden.txt && echo present || echo absent"
+    check "pylon protocol: ~/.ssh is out of the file helper's reach" 1 "cannot read the file: pylond does not touch hidden" \
+        "$PYLON" get -p $PORT $PYF "$USER_NAME@127.0.0.1:.ssh/authorized_keys" ak.bin
+    check "pylon protocol: a path with .. is refused" 1 "has a . or .. in it" \
+        "$PYLON" put -p $PORT $PYF www2/small.txt "$USER_NAME@127.0.0.1:$HD/../$HD/dd.txt"
+    echo original > "$HOME/$HD/probe"
+    check "pylond: the daemon's confinement leaves it no file to read, write or make" 0 "read refused, append refused, create refused, /etc allowed" \
+        "$PYLOND" check-confinement "$HOME/$HD/probe"
+    check "pylond: the probe file is untouched" 0 "original" \
+        bash -c "cat \$HOME/$HD/probe; test ! -e \$HOME/$HD/probe.new"
     rm -rf "$HOME/$HD"
     # Roaming: the client moves to a new UDP socket mid-transfer.
     PYLON_TEST_REBIND_AFTER=300 "$PYLON" -p $PORT -N -L $L3:127.0.0.1:$W2 $PYF "$USER_NAME@127.0.0.1" 2> pr.log & PR=$!
@@ -713,6 +729,8 @@ except socket.timeout:
         bash -c "pgrep -fc 'pylond-.* serve'"
     check "pylond: confined (seccomp filter, no new privileges)" 0 "NoNewPrivs:	1 Seccomp:	2" \
         bash -c "for p in \$(pgrep -f 'pylond-[0-9a-f]* serve'); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
+    check "pylond: its file helper is confined too" 0 "NoNewPrivs:	1 Seccomp:	2" \
+        bash -c "for p in \$(pgrep -f '^/proc/self/exe xfer '); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
     check "pylon protocol: app mode over the Pylon protocol" 0 "app ok" \
         python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
