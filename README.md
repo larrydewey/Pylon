@@ -54,7 +54,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 Tested against OpenSSH 9.6, against OpenSSH 10.2 in CI (`openssh10`
 workflow: built from source, the post-quantum hybrid negotiated with
 OpenSSH itself), and the handshake against Dropbear 2022.83:
-153 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
+230 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
 ProxyJump, Pylon protocol (terminals, re-attach, roaming, rekeying,
 -L/-D/-R forwards, resumable files, cookies under load, padding),
 `pylond` release (tampered builds and manifests, k-1 signatures,
