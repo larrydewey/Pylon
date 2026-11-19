@@ -70,10 +70,18 @@ pub List(Int) get_reply(Str path, List(Int) hashes) {
     return [0].concat(u64_be(data.len())).concat(u64_be(start)).concat(sha256_bytes(data)).concat(data[start..data.len()]);
 }
 
-// The bytes a put sends: start, size, hash, and the file from start.
-pub List(Int) put_body(List(Int) data, List(Int) hashes) {
+// The bytes a put sends: put_head (start, size, hash), then the file
+// from start. The client sends the file's bytes from data itself rather
+// than from a copy: a copy made inside the transfer's loop lives in the
+// loop's region, and every compaction of that region copies it again.
+pub List(Int) put_head(List(Int) data, List(Int) hashes) {
     Int start = matching(data, hashes, 0) * file_chunk();
-    return u64_be(start).concat(u64_be(data.len())).concat(sha256_bytes(data)).concat(data[start..data.len()]);
+    return u64_be(start).concat(u64_be(data.len())).concat(sha256_bytes(data));
+}
+
+pub List(Int) put_body(List(Int) data, List(Int) hashes) {
+    List(Int) h = put_head(data, hashes);
+    return h.concat(data[be64_at(h, 0)..data.len()]);
 }
 
 // ============================================================================

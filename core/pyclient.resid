@@ -457,15 +457,25 @@ pub Fx pylon_file(Fx x0) {
     // Under the test hook a put sends nothing past its limit, so the stop
     // below waits only for acknowledgments (else a fast link sends it all).
     Bool held = x2.op == 1 && x2.stop > 0 && x2.sent >= x2.stop;
-    Int n = if (held) { 0 } else { min(min(room(x2.l, x2.sid), 65536), x2.out.len() - x2.sent) };
-    Link l3 = if (n > 0) { push_bytes(x2.l, x2.sid, x2.out[x2.sent..x2.sent + n], now) } else { x2.l };
-    Bool last = x2.op == 1 && x2.stage == 1 && x2.sent + n >= x2.out.len();
+    Int n = if (held) { 0 } else { min(min(room(x2.l, x2.sid), 65536), out_len(x2) - x2.sent) };
+    Link l3 = if (n > 0) { push_bytes(x2.l, x2.sid, out_at(x2, x2.sent, x2.sent + n), now) } else { x2.l };
+    Bool last = x2.op == 1 && x2.stage == 1 && x2.sent + n >= out_len(x2);
     Link l4 = if (last) { push_eof(l3, x2.sid, -1, now) } else { l3 };
     Fx x3 = fx_l(fx_buf(x2, if (last) { 2 } else { x2.stage }, x2.buf, x2.out, x2.sent + n, x2.wrote), l4, x2.rk);
     // The test hook: stop once that many bytes are written (get) or acknowledged (put).
     Bool stop = x3.stop > 0 && (if (x3.op == 0) { x3.wrote >= x3.stop } else { x3.sent >= x3.stop && unsent(x3.l, x3.sid) == 0 });
     if (stop) { return fx_end(x3, "stopped (test hook)"); }
     return pylon_file(x3);
+}
+
+// What is due to pylond: out, then (a put past its header) the file
+// from start, read from data itself (see put_head).
+Int out_len(Fx x) { return x.out.len() + (if (x.op == 1 && x.stage >= 1) { x.data.len() - x.start } else { 0 }); }
+
+List(Int) out_at(Fx x, Int a, Int b) {
+    Int h = x.out.len();
+    List(Int) hp = if (a < h) { x.out[a..min(b, h)] } else { [] };
+    return if (b <= h) { hp } else { hp.concat(x.data[x.start + max(a, h) - h..x.start + b - h]) };
 }
 
 // A refusal from pylond (1 | message, then its end), shown escaped.
@@ -512,9 +522,9 @@ Fx put_bytes(Fx x, Bool ended) {
         Int n = be32(x.buf, 1);
         if (n > file_max() / file_chunk() + 1) { return fx_end(x, "pylond sent a malformed answer"); }
         if (x.buf.len() < 5 + n * 32) { return x; }
-        List(Int) body = put_body(x.data, x.buf[5..5 + n * 32]);
-        Fx h = fx_head(x, x.data.len(), be64_at(body, 0), [], x.data);
-        return fx_buf(h, 1, x.buf[5 + n * 32..x.buf.len()], body, 0, 0);
+        List(Int) head = put_head(x.data, x.buf[5..5 + n * 32]);
+        Fx h = fx_head(x, x.data.len(), be64_at(head, 0), [], x.data);
+        return fx_buf(h, 1, x.buf[5 + n * 32..x.buf.len()], head, 0, 0);
     }
     // After our end: 0, or a refusal, then pylond's end.
     if (x.stage == 2 && ended) { return fx_end(x, if (x.buf.len() == 1) { "" } else { "pylond: " + display_text(x.buf[1..x.buf.len()]) }); }
