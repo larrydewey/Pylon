@@ -29,7 +29,11 @@ android {
 
     defaultConfig {
         applicationId = "dev.pylon.pylon"
-        minSdk = flutter.minSdkVersion
+        // Android 10: each terminal's emulator runs in an isolated process
+        // of its own (Context.bindIsolatedService, SPEC 12). Older versions
+        // can only put every terminal's emulator in one process, so they
+        // are not supported rather than given the weaker sandbox.
+        minSdk = 29
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)

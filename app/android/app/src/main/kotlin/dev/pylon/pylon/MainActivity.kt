@@ -34,9 +34,10 @@ import io.flutter.plugin.common.MethodChannel
  * Terminal content is kept out of screenshots and recents (FLAG_SECURE)
  * unless the principal turns that off (SPEC 15).
  *
- * The local shell (SPEC 13) and the terminal emulator (SPEC 12) run in
- * isolated processes under UIDs of their own ([LocalShellService],
- * [TermService]); this activity holds one end of a socket pair per program
+ * The local shell (SPEC 13) and the terminal emulators (SPEC 12) run in
+ * isolated processes under UIDs of their own ([LocalShellService]; one
+ * [TermService] instance, and so one process and UID, per terminal);
+ * this activity holds one end of a socket pair per program
  * and passes bytes between it and the Dart side ("localStart" with kind
  * "shell" or "term", "localInput", "localClose"; output on "pylon/local").
  */
@@ -52,9 +53,18 @@ class MainActivity : FlutterActivity() {
     private var localSink: EventChannel.EventSink? = null
     private val writer = Executors.newSingleThreadExecutor()
 
-    /** One isolated service, bound on first use. */
-    private inner class Isolated(val cls: Class<out IsolatedRelayService>, val descriptor: String) {
+    /**
+     * One isolated service, bound on first use. With an [instance] name it
+     * is one instance of the service, in an isolated process (and under an
+     * isolated UID) of its own (Context.bindIsolatedService, Android 10):
+     * each terminal emulator gets one, so an emulator a host's output took
+     * over shares no process, UID or relay with another host's terminal
+     * (SPEC 12). Without one, one process for every program it runs (the
+     * local shells, all the principal's own).
+     */
+    private inner class Isolated(val cls: Class<out IsolatedRelayService>, val descriptor: String, val instance: String? = null) {
         var binder: IBinder? = null
+        var bound = false
         val waiting = ArrayList<(IBinder?) -> Unit>()
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -68,6 +78,25 @@ class MainActivity : FlutterActivity() {
                 // The sandbox died: everything it ran ends with it.
                 binder = null
                 for ((id, i) in HashMap(shellOf)) if (i === this@Isolated) closeShell(id)
+                // A per-terminal sandbox is never started again.
+                if (instance != null) unbind()
+            }
+
+            override fun onBindingDied(name: ComponentName?) {
+                onServiceDisconnected(name)
+                unbind()
+            }
+        }
+
+        private fun bind(): Boolean {
+            val i = Intent(this@MainActivity, cls)
+            bound = true
+            return try {
+                if (instance != null) bindIsolatedService(i, Context.BIND_AUTO_CREATE, instance, mainExecutor, conn)
+                else bindService(i, conn, Context.BIND_AUTO_CREATE)
+            } catch (e: RuntimeException) {
+                // SecurityException, IllegalArgumentException: no sandbox, no program.
+                false
             }
         }
 
@@ -75,18 +104,31 @@ class MainActivity : FlutterActivity() {
             val b = binder
             if (b != null) { then(b); return }
             waiting.add(then)
-            if (waiting.size == 1 && !bindService(Intent(this@MainActivity, cls), conn, Context.BIND_AUTO_CREATE)) {
+            if (waiting.size == 1 && !bound && !bind()) {
+                val w = ArrayList(waiting)
                 waiting.clear()
-                then(null)
+                unbind()
+                w.forEach { it(null) }
             }
         }
 
         fun unbind() {
-            if (binder != null || waiting.isNotEmpty()) {
-                try { unbindService(conn) } catch (_: IllegalArgumentException) {}
-            }
+            if (!bound) return
+            bound = false
+            binder = null
+            val w = ArrayList(waiting)
+            waiting.clear()
+            try { unbindService(conn) } catch (_: IllegalArgumentException) {}
+            w.forEach { it(null) }
         }
     }
+
+    // Per-terminal sandboxes are named from this activity's own counter and
+    // a random tag, never from anything the Dart side sends, so no two
+    // terminals (nor a terminal of an earlier activity still going away)
+    // can share an instance.
+    private val termTag = java.security.SecureRandom().let { r -> ByteArray(8).also { r.nextBytes(it) } }.joinToString("") { "%02x".format(it) }
+    private var nextTerm = 1
 
     // Documents for the Files page (SPEC 11): only ones the principal picked
     // in the system's document picker, so Pylon needs no storage
@@ -152,10 +194,16 @@ class MainActivity : FlutterActivity() {
     }
 
     private val localShell = Isolated(LocalShellService::class.java, LocalShellService.DESCRIPTOR)
-    private val term = Isolated(TermService::class.java, TermService.DESCRIPTOR)
+
+    /** A terminal emulator in a sandbox of its own, ended with its terminal. */
+    private fun newTerm() = Isolated(TermService::class.java, TermService.DESCRIPTOR, "term_${termTag}_${nextTerm++}")
 
     private fun startShell(svc: Isolated, rows: Int, cols: Int, result: MethodChannel.Result) = svc.with { b ->
-        if (b == null) { result.error("local", "the isolated service cannot be bound", null); return@with }
+        if (b == null) {
+            if (svc.instance != null) svc.unbind()
+            result.error("local", "the isolated service cannot be bound", null)
+            return@with
+        }
         val pair = ParcelFileDescriptor.createSocketPair()
         val id = nextShell++
         val data = Parcel.obtain()
@@ -170,6 +218,7 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             pair[0].close()
             pair[1].close()
+            if (svc.instance != null) svc.unbind()
             result.error("local", "the isolated service failed: ${e.message}", null)
             return@with
         } finally {
@@ -202,7 +251,10 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun closeShell(id: Int) {
-        shellOf.remove(id)
+        val svc = shellOf.remove(id)
+        // A terminal's own sandbox goes with it: unbinding the last
+        // binding of an isolated instance ends its process.
+        if (svc?.instance != null) svc.unbind()
         val out = shellOut.remove(id)
         val fd = shells.remove(id)
         writer.execute {
@@ -238,8 +290,12 @@ class MainActivity : FlutterActivity() {
         if (!isChangingConfigurations) endCoreChildren()
         for (id in ArrayList(shells.keys)) closeShell(id)
         localShell.unbind()
-        term.unbind()
         super.onDestroy()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        SensitiveClip.focused = hasFocus
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
@@ -336,10 +392,14 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(null)
                 }
+                "clipCopy" -> {
+                    val text = call.arguments as? String
+                    result.success(text != null && SensitiveClip.copy(this, text))
+                }
                 "localStart" -> {
                     val rows = call.argument<Number>("rows")?.toInt() ?: 24
                     val cols = call.argument<Number>("cols")?.toInt() ?: 80
-                    startShell(if (call.argument<String>("kind") == "term") term else localShell, rows, cols, result)
+                    startShell(if (call.argument<String>("kind") == "term") newTerm() else localShell, rows, cols, result)
                 }
                 "localInput" -> {
                     val id = call.argument<Number>("id")?.toInt()

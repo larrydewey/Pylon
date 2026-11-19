@@ -50,8 +50,10 @@
             android:process=":local"
             android:exported="false" />
         <!-- The terminal emulator (SPEC 12): the parser of a hostile host's
-             output, in an isolated process of its own, apart from the
-             connection, Symbolon's binding and the local shell. -->
+             output, in an isolated process apart from the connection,
+             Symbolon's binding and the local shell. MainActivity binds one
+             instance per terminal (bindIsolatedService), each its own
+             process and isolated UID. -->
         <service
             android:name=".TermService"
             android:isolatedProcess="true"

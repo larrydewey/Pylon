@@ -53,6 +53,9 @@ sshd: a terminal from keys to screens and back, a resize, the exit status.
 ## Status
 
 Web (preview) builds here; `flutter build linux` needs the GTK 3
-development files (`libgtk-3-dev`), which this machine lacks. Android needs the Android
+development files (`libgtk-3-dev`), which this machine lacks. The app
+needs Android 10 (API 29) or later: each terminal's emulator runs in an
+isolated process of its own (`bindIsolatedService`, SPEC 12), which
+older versions cannot do. Android needs the Android
 SDK, and the core built with `residc --target aarch64-linux-android`
 bundled as executables in the APK's native library directory.

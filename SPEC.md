@@ -1032,15 +1032,36 @@ parser of attacker-controlled bytes in the client, it is **isolated**:
 on Android it runs in an `isolatedProcess` service (no network, no
 storage, no binder access to Symbolon) that receives channel bytes and
 returns screen cells; the process that holds connections and the
-Symbolon binding never parses host output. On desktop the same split
-uses a separate process under seccomp. A bug in the emulator then
-yields a process that can draw one terminal and nothing else. Within
-the emulator:
+Symbolon binding never parses host output. Each terminal has its own
+emulator process: on Android the activity binds the service once per
+terminal with an instance name of its own (`Context.bindIsolatedService`,
+Android 10, which is why Pylon needs Android 10 or later), so each
+emulator, and the relay in its sandbox that carries that terminal's
+bytes, runs in a process and under an isolated UID of its own; the
+instance is unbound, and its process ends, when the terminal ends.
+Instance names come from the activity's own counter and a random tag,
+never from the Dart side. On desktop the same split uses a separate
+process per terminal, which confines itself (`pylon-term`). A bug in
+the emulator then yields a process that can draw one terminal and
+nothing else: not another host's terminal, and no connection (each is
+held by a `pylon` process under Pylon's own UID, apart from every
+emulator). Within the emulator:
 
 - **Clipboard** (OSC 52): writes require a per-host grant; reads are not
-  implemented. One prompt a session at a time: writes that arrive while
-  it is up replace what it offers, so a program copying again and again
-  cannot stack prompts.
+  implemented. The prompt shows all of the text, in a scrollable
+  monospace view with its length in characters and lines, control and
+  direction characters shown as codes, and what it shows never changes
+  while it is up: "Allow" copies exactly what the principal read. One
+  prompt a session at a time: writes that arrive while it is up don't
+  stack; the latest of them waits (replacing any earlier one) and is
+  asked about in a prompt of its own once this one closes, so a program
+  copying again and again cannot stack prompts. A copy allowed goes on
+  the clipboard as 15 says.
+- **Titles.** A title the program sets (OSC 0 and 2) is the host's word
+  and never stands in for the host's name in Pylon's interface: the
+  header and the sessions list show the name the principal gave the
+  host, the title only under it, smaller and muted, on one line, its
+  control and direction characters shown as codes.
 - **Selection.** A long press selects what is on screen, in Pylon itself:
   the word under the finger, extended by a drag before letting go, its
   ends moved by handles. Copy puts it on the clipboard with no prompt
@@ -1216,9 +1237,18 @@ content.
   offers Pylon's own in-app keyboard, switched to automatically when the
   screen shows a password prompt (echo off on the PTY, reported by
   `pylond`; or a recognised prompt over plain SSH).
-- **Clipboard.** Copies from the terminal are marked sensitive
-  (`ClipDescription.EXTRA_IS_SENSITIVE`, Android 13+), are kept out of
-  cross-device clipboard sync, and are cleared after 60 seconds.
+- **Clipboard.** Copies from the terminal (Pylon's own selection, and a
+  program's OSC 52 write the principal allowed) are marked sensitive
+  (`ClipDescription.EXTRA_IS_SENSITIVE` on Android 13+, the same extra
+  by name before), which is what keyboards and clipboard sync are told
+  to leave alone (Android has no other way for an app to keep a clip
+  out of cross-device sync), and are cleared after 60 seconds if the
+  clipboard still holds them (recognised by a random label of their
+  own). Since Android 10 an app in the background cannot see the
+  clipboard; a copy whose 60 seconds end then is checked, and cleared
+  if still Pylon's, when Pylon is next in front, never cleared blind.
+  On the desktop the copy is cleared after 60 seconds if the clipboard
+  still holds the same text; the desktop has no sensitive marking.
 - **Screenshots and recents.** `FLAG_SECURE` keeps terminal content out
   of screenshots, screen recording and the recents thumbnail by default.
 - **Linux desktop (phase 2).** Tabs and splits; `SSH_AUTH_SOCK` to
@@ -1296,7 +1326,7 @@ adversary, what Draft 1 allowed, and the change.
 |---|---|---|---|
 | H1 | A3 | A session ticket alone let a device resume a session, so an unlocked stolen phone could re-attach to a live shell without any signature; revocation depended on another of the principal's devices being online to tell `pylond`. | Tickets continue connections, never resume them; re-attach needs a fresh signature verified by `pylond` against `authorized_keys`; 12-hour ticket lifetime; G10 (10.4). |
 | H2 | A1 | `pylond` is a new network listener running as the principal; a pre-authentication bug would be remote code execution without SSH. | Pre-authentication surface reduced to one MAC check keyed by bootstrap-only values; bind the reported address only; confinement mandatory or no `pylond`; G11 (8.4, 9.4). |
-| H3 | A2 | The terminal emulator parsed hostile output in the process that holds the Symbolon binding. | Emulator in an isolated process with no network, storage or binder access (12). |
+| H3 | A2 | The terminal emulator parsed hostile output in the process that holds the Symbolon binding. | Emulator in an isolated process with no network, storage or binder access, one process (and on Android one isolated UID) per terminal, so a compromised emulator reaches no other host's terminal (12). |
 | H4 | A4 | Local forwards on Android bind the loopback shared by every app. | In-app consumption without sockets; per-connection UID check; warning; close in background (11). |
 | H5 | A4 | Third-party keyboards see passwords typed into the terminal; the clipboard leaks to other apps and devices. | Input-method flags, in-app keyboard for password prompts, sensitive and expiring clipboard (15). |
 | H6 | A1 | Second-device first-use approval could be satisfied by two devices on the same Wi-Fi. | The second check must use an independent network path (6.1.4). |
