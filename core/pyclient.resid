@@ -37,7 +37,7 @@ pub Str run_command_b(Str hash, Int idle, Bool ephemeral, Bool unconfined, Bool 
 // "x86_64" or "aarch64" (arm64 named so), else what it said.
 pub type Arch = { Conn c; Str arch; Str err; };
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Arch host_arch(Conn c0) {
     Chan ch = open_session(c0);
     if (!chan_ok(ch)) { return Arch {.c = ch.c, .arch = "", .err = ch.err}; }
@@ -55,7 +55,7 @@ List(Int) no_eol(List(Int) b) {
 
 pub type Pushed = { Conn c; Str err; };
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
     Chan ch = open_session(c0);
     if (!chan_ok(ch)) { return Pushed {.c = ch.c, .err = ch.err}; }
@@ -69,10 +69,10 @@ pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
 
 pub type Started = { Conn c; Boot b; BootC bc; Str err; };
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Started start_pylond(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined) { return start_pylond_b(c0, hash, idle, ephemeral, unconfined, false); }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Started start_pylond_b(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unconfined, Bool busy) {
     BootC bc = boot_client_new();
     Chan ch = open_session(c0);
@@ -147,7 +147,7 @@ List(Int) listen_fds(List(Fwd) fs, Int i, List(Int) acc) {
 
 List(Int) ones(Int n, List(Int) acc) { if (n <= 0) { return acc; } return ones(n - 1, acc.concat([1])); }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Link accept_into(Link l, List(Fwd) fs, List(Int) ready, Int at, Int i, Int now) {
     if (i >= fs.len()) { return l; }
     Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
@@ -159,7 +159,7 @@ Link accept_into(Link l, List(Fwd) fs, List(Int) ready, Int at, Int i, Int now) 
 // -D: the SOCKS5 handshake runs here (forward.resid: CONNECT only, host
 // names checked); the address asked for goes to pylond in OPEN, and the
 // client hears success once pylond has connected.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Link socks_open(Link l, Int fd, Int now) {
     Target t = socks_request(fd);
     if (t.refuse != 0) {
@@ -200,7 +200,7 @@ pub Link listen_remote(Link l, List(Fwd) fs, Int i, Int tries) {
 
 // -R: each CONNECT pylond sent (a connection to one of our remote ports)
 // goes to that port's destination here; any other port is reset.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Link serve_connects(Link l, List(Fwd) fs, List(List(Int)) cs, Int i, Int now) {
     if (i >= cs.len()) { return l; }
     Int sid = cs[i][0];
@@ -427,7 +427,7 @@ Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(Int) data) {
 // Start a get or put: FILE, then (a get) the hashes of what we have and
 // our end of the stream. data: the local file (put), or the part of it
 // kept for --resume (get).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Fx file_start(Link l, Rk rk, Int op, Bool resume, Str remote, Str local, List(Int) data, Int stop, Int now) {
     Link l1 = open_file(l, op, if (resume) { 1 } else { 0 }, bytes_of(remote), now);
     Int sid = l1.next_sid - 2;

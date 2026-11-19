@@ -55,7 +55,7 @@ Chan no_chan(Conn c, Str e) {
     return Chan {.c = conn_err(c, e), .remote = -1, .window = 0, .rwin = 0, .rmax = 0, .status = -1, .closed = true, .raw = false, .capture = false, .inbox = [], .err = e};
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan open_session(Conn c0) {
     List(Int) p = [msg_channel_open()].concat(sstr("session")).concat(u32_be(0)).concat(u32_be(our_window())).concat(u32_be(our_max_packet()));
     Conn c1 = send_packet(c0, p);
@@ -75,13 +75,13 @@ pub Chan open_session(Conn c0) {
 
 // A channel request that wants a reply; other channel traffic that
 // arrives first (a window adjust) is handled on the way.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan request(Chan ch, Str kind, List(Int) data) {
     List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr(kind)).concat(sbool(true)).concat(data);
     return request_wait(with_conn(ch, send_packet(ch.c, p)), kind);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Chan request_wait(Chan ch, Str kind) {
     if (!chan_ok(ch)) { return ch; }
     Pkt k = next_msg(ch.c);
@@ -91,12 +91,12 @@ Chan request_wait(Chan ch, Str kind) {
     return request_wait(handle(ch, k), kind);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan exec(Chan ch, Str command) { return request(ch, "exec", sstr(command)); }
 
 // A pseudo-terminal (RFC 4254 6.2) of the given size, then a shell. The
 // terminal modes are left to the server's defaults (only TTY_OP_END).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan shell(Chan ch, Str term, Int cols, Int rows) {
     List(Int) pty = sstr(term).concat(u32_be(cols)).concat(u32_be(rows)).concat(u32_be(0)).concat(u32_be(0)).concat(sstring([0]));
     Chan p = request(ch, "pty-req", pty);
@@ -105,7 +105,7 @@ pub Chan shell(Chan ch, Str term, Int cols, Int rows) {
     return Chan {.c = s.c, .remote = s.remote, .window = s.window, .rwin = s.rwin, .rmax = s.rmax, .status = s.status, .closed = s.closed, .raw = true, .capture = false, .inbox = [], .err = s.err};
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan window_change(Chan ch, Int cols, Int rows) {
     List(Int) p = [msg_channel_request()].concat(u32_be(ch.remote)).concat(sstr("window-change")).concat(sbool(false))
         .concat(u32_be(cols)).concat(u32_be(rows)).concat(u32_be(0)).concat(u32_be(0));
@@ -128,7 +128,7 @@ pub Chan consume(Chan ch, Int n) {
 }
 
 // Step until at least n bytes are kept, the channel closes or fails.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan await_bytes(Chan ch, Int n) {
     if (!chan_ok(ch) || ch.inbox.len() >= n || ch.closed) { return ch; }
     return await_bytes(step(ch), n);
@@ -140,7 +140,7 @@ pub Chan await_bytes(Chan ch, Int n) {
 
 // Read and handle one packet (a transport-level one is handled inside
 // next_once and leaves the channel as it was).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan step(Chan ch) {
     if (!chan_ok(ch) || ch.closed) { return ch; }
     Pkt k = next_once(ch.c);
@@ -149,7 +149,7 @@ pub Chan step(Chan ch) {
     return handle(ch, k);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Chan handle(Chan ch, Pkt k) {
     Int t = k.p[0];
     GotInt rc = rd_u32(rd_at(k.p, 1));
@@ -201,14 +201,14 @@ Bool err_text(List(Int) b) {
 }
 
 // Copy the channel's output until the server closes it.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan pump(Chan ch) {
     if (!chan_ok(ch) || ch.closed) { return ch; }
     return pump(step(ch));
 }
 
 // Give the server more window once half of it is used.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Chan adjust(Chan ch) {
     if (ch.window > our_window() / 2) { return ch; }
     Int add = our_window() - ch.window;
@@ -222,7 +222,7 @@ Chan adjust(Chan ch) {
 
 // Send `b` as channel data within the server's window and packet size,
 // waiting for window adjusts when the window is closed.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan send_data(Chan ch, List(Int) b) {
     if (!chan_ok(ch) || ch.closed || b.len() == 0) { return ch; }
     if (ch.rwin <= 0) { return send_data(step(ch), b); }
@@ -232,7 +232,7 @@ pub Chan send_data(Chan ch, List(Int) b) {
     return send_data(with_flow(ch, c2, ch.window, ch.rwin - n), b[n..b.len()]);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Chan send_eof(Chan ch) {
     if (!chan_ok(ch) || ch.closed) { return ch; }
     return with_conn(ch, send_packet(ch.c, [msg_channel_eof()].concat(u32_be(ch.remote))));
@@ -314,7 +314,7 @@ pub Chan interact(Chan ch0, Int cols, Int rows, Bool in_eof, Keys k, App app) {
     Chan ch = if (app.on) { inbox_taken(ch0) } else { ch0 };
     if (!chan_ok(ch) || ch.closed) { return ch; }
     Int now = clock.monotonic_ns();
-    Bool buffered = ch.c.buf.len() > 0;
+    Bool buffered = pending(ch.c);
     List(Int) fds = if (in_eof) { [ch.c.fd] } else { [ch.c.fd, 0] };
     List(Int) wants = if (in_eof) { [1] } else { [1, 1] };
     List(Int) ready = resid_tcp_poll(fds, wants, if (buffered) { 0 } else { wait_ms(k, now) });

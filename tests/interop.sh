@@ -249,6 +249,61 @@ ssh-add -q -D; ssh-add -q user_ed25519
 check "4 MiB of output"                        0 "4194304" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'head -c 4194304 /dev/zero' | wc -c"
 
+# --- rekeying started by Pylon (SPEC 5) ---------------------------------------
+# Test hooks lower the limits (PYLON_TEST_SSH_REKEY_BYTES / _PACKETS / _SECS)
+# so that Pylon must start rekeys itself: OpenSSH starts none at these sizes.
+# sshd logs a kex the client started as its KEXINIT received, then its own
+# sent (the first exchange is the other way round); the data must survive.
+# Against this sshd and, when it is another build, the system's (OpenSSH 9.6
+# here: curve25519 instead of the post-quantum hybrid).
+head -c 4194304 /dev/urandom > rk.bin; RKSUM="$(sha256sum rk.bin | cut -d' ' -f1)"
+mkdir -p rkwww && cp rk.bin rkwww/
+RKW=$((PORT + 17)); RKL=$((PORT + 18))
+( cd rkwww && exec python3 -m http.server $RKW --bind 127.0.0.1 ) > /dev/null 2>&1 & RKWEB=$!
+rekeyed() {   # log at-least: kex exchanges the client started, per sshd's log
+    local n; n=$(awk '/SSH2_MSG_KEXINIT received/ { r = 1; next } /SSH2_MSG_KEXINIT sent/ && r { n++ } { r = 0 } END { print n + 0 }' "$1")
+    echo "$n client-initiated rekeys in $(basename "$1")"
+    [ "$n" -ge "$2" ]
+}
+rekey_suite() {   # label
+    start_sshd "HostKey $WORK/host_ed25519"
+    : > sshd.log
+    check "rekey ($1): 4 MiB of output intact (byte limit)" 0 "$RKSUM" \
+        bash -c "PYLON_TEST_SSH_REKEY_BYTES=262144 '$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'cat $WORK/rk.bin' | sha256sum"
+    check "rekey ($1): Pylon started the rekeys"   0 "" rekeyed sshd.log 2
+    : > sshd.log; rm -f "$WORK/rk_up.bin"
+    check "rekey ($1): SFTP put of 4 MiB (byte limit)" 0 "4194304 bytes" \
+        env PYLON_TEST_SSH_REKEY_BYTES=262144 "$PYLON" put -p $PORT rk.bin "$USER_NAME@127.0.0.1:$WORK/rk_up.bin"
+    check "rekey ($1): the server has the same bytes" 0 "$RKSUM" sha256sum "$WORK/rk_up.bin"
+    check "rekey ($1): Pylon started rekeys while sending" 0 "" rekeyed sshd.log 8
+    : > sshd.log
+    check "rekey ($1): packet limit, output intact" 0 "$RKSUM" \
+        bash -c "PYLON_TEST_SSH_REKEY_PACKETS=40 '$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'cat $WORK/rk.bin' | sha256sum"
+    check "rekey ($1): Pylon started rekeys at the packet limit" 0 "" rekeyed sshd.log 2
+    : > sshd.log
+    check "rekey ($1): time limit"                 0 "a b c" \
+        bash -c "PYLON_TEST_SSH_REKEY_SECS=1 '$PYLON' -p $PORT '$USER_NAME@127.0.0.1' 'echo a; sleep 1.5; echo b; sleep 1.5; echo c' | tr '\n' ' '"
+    check "rekey ($1): Pylon started rekeys after a second" 0 "" rekeyed sshd.log 2
+    : > sshd.log
+    PYLON_TEST_SSH_REKEY_BYTES=262144 "$PYLON" -p $PORT -N -L $RKL:127.0.0.1:$RKW "$USER_NAME@127.0.0.1" 2> rkfwd.log & local fwd=$!
+    for _ in $(seq 50); do grep -q forwarding rkfwd.log && break; sleep 0.1; done
+    check "rekey ($1): -L forward, 4 MiB twice, intact" 0 "$RKSUM $RKSUM" \
+        bash -c "for i in 1 2; do curl -s http://127.0.0.1:$RKL/rk.bin | sha256sum | cut -d' ' -f1; done | tr '\n' ' '"
+    kill $fwd 2>/dev/null; wait $fwd 2>/dev/null
+    check "rekey ($1): Pylon started rekeys in the forward" 0 "" rekeyed sshd.log 2
+}
+rekey_suite "$("$SSHD" -V 2>&1 | head -1 | cut -d, -f1)"
+SYS_SSHD=/usr/sbin/sshd
+if [ -x "$SYS_SSHD" ] && [ "$("$SYS_SSHD" -V 2>&1 | head -1)" != "$("$SSHD" -V 2>&1 | head -1)" ]; then
+    MAIN_SSHD="$SSHD"; SSHD="$SYS_SSHD"
+    rekey_suite "$("$SSHD" -V 2>&1 | head -1 | cut -d, -f1)"
+    SSHD="$MAIN_SSHD"
+else
+    echo "skip rekey against the system sshd (none, or the same build)"
+fi
+kill $RKWEB 2>/dev/null; wait $RKWEB 2>/dev/null
+start_sshd "HostKey $WORK/host_ed25519"
+
 # --- post-quantum hybrid against OpenSSH itself (9.9 and later) ----------------
 # OpenSSH 9.6 has no ML-KEM (the reference server below covers it then); the
 # CI job "openssh10" runs this suite against OpenSSH 10 built from source.
@@ -286,6 +341,10 @@ if [ -x "$FLUTTER" ] && [ -d "$(dirname "$HOSTILE")/../app" ]; then
 else
     echo "skip app backend test (no flutter)"
 fi
+: > sshd.log
+check "rekey: interactive shell while Pylon rekeys (packet limit)" 0 "interactive ok" \
+    env PYLON_TEST_SSH_REKEY_PACKETS=25 python3 "$(dirname "$HOSTILE")/pty_drive.py" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1"
+check "rekey: Pylon started rekeys in the shell" 0 "" rekeyed sshd.log 2
 check "interactive without a terminal is refused" 2 "needs a terminal" \
     bash -c "'$PYLON' -p $PORT '$USER_NAME@127.0.0.1' < /dev/null"
 
@@ -405,6 +464,11 @@ check "jump: the jump host relayed (direct-tcpip)" 0 "" \
     grep -q "direct-tcpip" sshd.log
 check "jump: SFTP through the jump"             0 "3145728 bytes" \
     "$PYLON" get -J "$USER_NAME@127.0.0.1:$PORT" -p $JT "$USER_NAME@127.0.0.1:$RDIR/up.bin" viajump.bin
+: > sshd.log; : > target.log
+check "jump: SFTP through the jump while both connections rekey" 0 "$(sha256sum up.bin | cut -d' ' -f1)" \
+    bash -c "PYLON_TEST_SSH_REKEY_BYTES=262144 '$PYLON' get -J '$USER_NAME@127.0.0.1:$PORT' -p $JT '$USER_NAME@127.0.0.1:$RDIR/up.bin' viajump_rk.bin >/dev/null 2>&1; sha256sum viajump_rk.bin"
+check "jump: Pylon rekeyed the jump connection" 0 "" rekeyed sshd.log 2
+check "jump: Pylon rekeyed the target connection" 0 "" rekeyed target.log 2
 check "jump: nothing listening behind the jump" 1 "pylon:" \
     "$PYLON" -J "$USER_NAME@127.0.0.1:$PORT" -p 1 "$USER_NAME@127.0.0.1" true
 kill "$(cat "$WORK/target.pid")" 2>/dev/null
@@ -695,6 +759,25 @@ python3 "$(dirname "$HOSTILE")/pq_server.py" $PQPORT $PQSEED bad-ct > pq2.log 2>
 sleep 0.5
 check "pq: a corrupted ML-KEM ciphertext fails the signature" 1 "does not verify" \
     "$PYLON" -p $PQPORT "$USER_NAME@127.0.0.1" true
+kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
+# A server without strict kex (no Terrapin fix) that completes the exchange:
+# --allow-no-strict lets the named host through, with a warning, and never
+# a jump host.
+python3 "$(dirname "$HOSTILE")/pq_server.py" $PQPORT $PQSEED no-strict > pq3.log 2>&1 & PQ=$!
+sleep 0.5
+check "no-strict: refused without the exception" 1 "does not support strict key exchange" \
+    "$PYLON" -p $PQPORT "$USER_NAME@127.0.0.1" true
+check "no-strict: --allow-no-strict proceeds, with the warning" 0 "2" \
+    bash -c "'$PYLON' --allow-no-strict -p $PQPORT '$USER_NAME@127.0.0.1' true 2>&1 | grep -c -e 'WARNING: 127.0.0.1 does not support strict key exchange' -e 'post-quantum handshake verified'"
+check "no-strict: the warning names Terrapin-style truncation" 1 "prefix truncation" \
+    "$PYLON" --allow-no-strict -p $PQPORT "$USER_NAME@127.0.0.1" true
+check "no-strict: the session keys worked"     0 "SERVER-DECRYPTED type 5: ssh-userauth" \
+    cat pq3.log
+NS0=$(grep -c SERVER-DECRYPTED pq3.log)
+check "no-strict: a jump host is refused even with --allow-no-strict" 1 "never to a jump host" \
+    "$PYLON" --allow-no-strict -J "$USER_NAME@127.0.0.1:$PQPORT" -p $PORT "$USER_NAME@127.0.0.1" true
+check "no-strict: the jump host got no keyed packet" 0 "" \
+    bash -c "test \$(grep -c SERVER-DECRYPTED pq3.log) -eq $NS0"
 kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
 else
     echo "skip pq: this Python's cryptography has no ML-KEM"

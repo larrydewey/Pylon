@@ -3,7 +3,7 @@
 post-quantum hybrid key exchange against independent primitives (OpenSSL's
 ML-KEM-768, X25519, Ed25519 and AES-GCM, through pyca/cryptography).
 
-    pq_server.py PORT HOSTKEY_SEED_HEX MODE      (MODE: ok | bad-ct)
+    pq_server.py PORT HOSTKEY_SEED_HEX MODE      (MODE: ok | bad-ct | no-strict)
 
 It offers only mlkem768x25519-sha256 (with strict kex), ssh-ed25519 and
 aes256-gcm@openssh.com; computes S_REPLY, K = SHA-256(K_mlkem || K_x25519)
@@ -11,7 +11,8 @@ and H per draft-ietf-sshm-mlkem-hybrid-kex; switches keys; decrypts the
 client's first encrypted packet (its SERVICE_REQUEST); and answers with an
 encrypted DISCONNECT whose text the test looks for. "bad-ct" corrupts the
 ML-KEM ciphertext after encapsulating, so the client's K differs and the
-host signature must fail to verify.
+host signature must fail to verify. "no-strict" leaves strict kex out of
+the server's KEXINIT, as a server without the Terrapin fix does.
 """
 import hashlib
 import os
@@ -117,7 +118,11 @@ def serve(c, hk, k_s, mode):
     c.sock.sendall(v_s + b"\r\n")
     v_c = c.line()
     i_c = c.clear_packet()
-    i_s = (bytes([20]) + os.urandom(16) + namelist("mlkem768x25519-sha256", "kex-strict-s-v00@openssh.com")
+    # "no-strict": an old server without the Terrapin fix (no strict kex;
+    # with AES-GCM the sequence numbers are not part of the nonce, so
+    # nothing else changes here).
+    kex = ["mlkem768x25519-sha256"] + ([] if mode == "no-strict" else ["kex-strict-s-v00@openssh.com"])
+    i_s = (bytes([20]) + os.urandom(16) + namelist(*kex)
            + namelist("ssh-ed25519") + namelist("aes256-gcm@openssh.com") * 2 + namelist() * 2
            + namelist("none") * 2 + namelist() * 2 + b"\x00" + struct.pack(">I", 0))
     c.sock.sendall(packet(i_s))

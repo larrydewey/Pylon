@@ -1,9 +1,9 @@
 // Algorithm negotiation and key exchange (RFC 4253 7-8, RFC 8731
 // curve25519-sha256, RFC 8308 ext-info, OpenSSH strict kex).
 //
-// Phase 0 implements curve25519-sha256; the hybrid post-quantum methods
-// of SPEC 5 (mlkem768x25519-sha256, sntrup761x25519-sha512) are added
-// when the Resid standard library has ML-KEM.
+// Implemented: the post-quantum hybrid mlkem768x25519-sha256 (preferred)
+// and curve25519-sha256. sntrup761x25519-sha512, also listed in SPEC 5,
+// is not implemented (SPEC 17, phase 0).
 
 import "crypto.resid";
 import "word.resid";

@@ -182,8 +182,11 @@ Further rules:
   fix) MUST be offered, and a server that does not offer
   `kex-strict-s-v00@openssh.com` is refused by default (a per-host
   exception exists for old embedded devices, shown as a warning badge on
-  the host). Under strict kex, sequence numbers reset at each NEWKEYS and
-  any unexpected message during kex ends the connection.
+  the host; in the CLI, `--allow-no-strict` covers only the target host
+  named on the command line, never a `-J` jump host, and prints a warning
+  each time a connection proceeds without strict kex). Under strict kex,
+  sequence numbers reset at each NEWKEYS and any unexpected message during
+  kex (from the server's KEXINIT to NEWKEYS) ends the connection.
 - **ext-info** (RFC 8308) is sent; `server-sig-algs` decides the RSA
   signature algorithm and `publickey-hostbound@openssh.com` enables
   host-bound authentication (7.2).
@@ -192,7 +195,12 @@ Further rules:
 - **Limits.** Packets ≤ 256 KiB; the version line ≤ 255 bytes and at most
   1024 lines of pre-banner noise; name-lists ≤ 64 KiB; every parser is
   total (malformed input is a value, not an abort).
-- **Rekey** after 1 GiB in either direction or one hour, whichever first.
+- **Rekey** after 1 GiB in either direction or one hour, whichever first,
+  or 2^31 packets in either direction under the same keys. Pylon starts
+  these rekeys itself (and answers the server's); traffic the server sends
+  before its KEXINIT is held and handled afterwards (RFC 4253 7.1). A
+  sequence number is the chacha20-poly1305 nonce, so one that would wrap
+  ends the connection rather than repeat a nonce.
 - **Keystroke timing.** Interactive input is sent in fixed 20 ms frames
   padded with `SSH_MSG_PING`/chaff when the server supports
   `ping@openssh.com`, as OpenSSH 9.5 does.

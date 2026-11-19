@@ -36,7 +36,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Host keys | `ssh-ed25519`, `ecdsa-sha2-nistp256/384`, `rsa-sha2-512/256` (RSA ≥ 2048) |
 | Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` |
 | Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound |
-| Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; server-initiated rekey |
+| Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; rekeying started by either side (Pylon starts one after 1 GiB, an hour or 2^31 packets) |
 | Keystroke timing | obfuscated by default: 20 ms ticks, one-size chaff (PING or IGNORE), checked on the wire; `--no-obfuscate-keystrokes` opts out |
 | Port forwarding | `-N` with `-L [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT` (SOCKS5, host names validated), `-R [localhost:]RPORT:HOST:HOSTPORT` (server binds loopback; only requested ports, each to its own destination); loopback binds only |
 | Files | `pylon sftp USER@HOST[:DIR]`: an interactive browser (`ls`, `cd`, `stat`, `mkdir`, `rm [-r]`, `mv`, `cp [-r]`, `cut`/`copy` then `paste`, `get`, `put`, `lls`/`lcd`); moves and copies never replace what exists (a copy pasted beside its original becomes `NAME copy`), trees are walked without following symbolic links, a directory is never copied into itself, names shown escaped and typed back as `\xHH`; the app's Files page does the same over `pylon sftp --app` (downloads and uploads through Android's document picker, no storage permission). `pylon get USER@HOST:REMOTE LOCAL`, `pylon put LOCAL USER@HOST:REMOTE` (SFTP v3; an IPv6 host in brackets, `USER@[ADDR]:REMOTE`); a local file is never replaced without `--force`; server messages shown escaped; over the Pylon protocol (`--pylond DIR`) resumable with `--resume` (per-chunk hashes, the whole file's hash checked) |
@@ -88,8 +88,8 @@ eval "$(symbolon ssh-agent ~/.symbolon &)"   # or any session-bind capable agent
 build/pylon alice@example.org uptime
 ```
 
-Options: `-p PORT`, `--allow-no-strict` (per-connection exception for
-servers without the Terrapin fix), `--no-obfuscate-keystrokes`, `-N -L
+Options: `-p PORT`, `--allow-no-strict` (exception for a target server
+without the Terrapin fix, shown as a warning; never applied to a `-J` jump host), `--no-obfuscate-keystrokes`, `-N -L
 [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT`, `-R
 [localhost:]RPORT:HOST:HOSTPORT` (each repeatable), `-J USER@JUMP[:PORT]`, `--pylond DIR` (experimental, a terminal or `-N` with `-L`/`-D`/`-R`;
 DIR holds `pylond-x86_64`/`pylond-aarch64` and their signed release,
@@ -110,6 +110,7 @@ work there as they do on the desktop.
 tests/interop.sh build/pylon      # needs sshd, ssh-keygen, ssh-agent, python3;
                                   # uses build/pylond and build/pylon-release when present
 residc test tests/kex_test.resid  # key derivation known answers
+residc test tests/rekey_test.resid # when Pylon rekeys; sequence numbers never wrap
 residc test tests/proto_test.resid # Pylon protocol: bootstrap, handshake, replay, padding, cookies
 residc test tests/term_test.resid  # the terminal emulator core
 residc test tests/release_test.resid # pylond releases: Merkle log, proofs, quorum, rollback

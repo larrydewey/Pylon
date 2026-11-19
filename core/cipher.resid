@@ -80,9 +80,15 @@ pub Dir dir_new(Str name, List(Secret(UInt(8))) key, List(Int) iv, Int seq) {
 // at every NEWKEYS).
 pub Dir dir_seq(Dir d, Int seq) { return Dir {.kind = d.kind, .key = d.key, .iv = d.iv, .seq = seq}; }
 
-// Sequence numbers are uint32 and wrap (RFC 4253 6.4). Under strict kex
-// a wrap during the initial exchange is an error the transport checks.
+// Sequence numbers are uint32 and wrap (RFC 4253 6.4). The sequence
+// number is chacha20-poly1305's nonce, so a wrap under one key would
+// repeat one: the transport rekeys long before (2^31 packets, which under
+// strict kex resets the number to 0) and ends the connection rather than
+// seal or open a packet with a direction whose number is spent.
 Int next_seq(Int s) { return (s + 1) & 4294967295; }
+
+// The last sequence number: using it would make the next one wrap to 0.
+pub Bool seq_spent(Dir d) { return d.seq >= 4294967295; }
 
 Int block_of(Dir d) { return if (d.kind == 2) { 16 } else { 8 }; }
 
