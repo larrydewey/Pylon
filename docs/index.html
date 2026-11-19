@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pylon — a remote terminal that refuses to guess</title>
+<meta name="description" content="Pylon is a security-first SSH client and roaming terminal: strict SSH to every server, no trust on first use, no private keys in the client, and its own post-quantum protocol where both ends run Pylon.">
+<link rel="icon" href="assets/pylon-mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="#">
+    <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M6 56 L13 8 L26 8 L26 56 Z" fill="currentColor"/><path d="M38 56 L38 8 L51 8 L58 56 Z" fill="currentColor"/><path d="M29 42 H35 V56 H29 Z" class="accent-fill"/></svg>
+    Pylon
+  </a>
+  <nav>
+    <a href="#trust">Trust</a>
+    <a href="#keys">Keys</a>
+    <a href="#roaming">Roaming</a>
+    <a href="#ssh">vs. ssh</a>
+    <a href="https://github.com/larrydewey/Pylon">GitHub</a>
+  </nav>
+</header>
+
+<main>
+
+<!-- ───────────────────────── hero ───────────────────────── -->
+<section class="hero">
+  <div class="hero-text">
+    <p class="eyebrow">SSH client · roaming terminal · Android &amp; Linux</p>
+    <h1>A remote terminal that refuses to guess.</h1>
+    <p class="lede">Pylon connects to the servers you already have, over the SSH they already run,
+      but it never takes a host on faith, never holds your private key, and never lets a
+      server's output reach further than the screen it was drawn on.</p>
+    <div class="cta">
+      <a class="btn primary" href="#start">Build it</a>
+      <a class="btn" href="https://github.com/larrydewey/Pylon/blob/master/SPEC.md">Read the specification</a>
+    </div>
+  </div>
+  <figure class="hero-art" aria-label="A Pylon terminal session that refused an unknown host key">
+    <div class="term">
+      <div class="term-bar"><span></span><span></span><span></span><em>pylon</em></div>
+<pre><span class="p">$</span> pylon alice@build.example.org
+<span class="dim">kex   </span> mlkem768x25519-sha256 <span class="ok">· strict</span>
+<span class="dim">cipher</span> chacha20-poly1305@openssh.com
+<span class="dim">host  </span> ssh-ed25519 SHA256:3fK1…Qy0
+<span class="bad">refused:</span> build.example.org has no pin,
+        no trusted certificate and no secure
+        SSHFP record. Nothing was sent.
+
+<span class="dim">Pin it from a source you trust:</span>
+<span class="p">$</span> pylon pin build.example.org SHA256:3fK1…Qy0
+<span class="p">$</span> pylon alice@build.example.org
+<span class="ok">✓</span> host verified <span class="dim">(pinned)</span>
+<span class="ok">✓</span> signed by Symbolon <span class="dim">(bound to this session)</span>
+alice@build:~$ <span class="cursor"> </span></pre>
+    </div>
+  </figure>
+</section>
+
+<!-- ───────────────────────── the gap ───────────────────────── -->
+<section class="band">
+  <div class="wrap two">
+    <div>
+      <h2>Most SSH attacks don't break the cryptography. They wait for you to type <code>yes</code>.</h2>
+      <p>SSH's mathematics have held up for decades. What fails is everything around them: a first-connection
+        prompt people approve without reading, private keys copied onto every laptop and phone, agents forwarded
+        to servers that can then sign as you elsewhere, legacy algorithms left enabled "for compatibility",
+        and a terminal that will faithfully interpret any byte a compromised server sends.</p>
+      <p>Each of these is fixable from the client side, without changing a single server. Pylon is that client.
+        It speaks ordinary SSH to the world, but a deliberately narrow, strictly enforced SSH, and it moves the
+        decisions that people get wrong under pressure out of the moment of connection.</p>
+    </div>
+    <ul class="failures">
+      <li><b>Trust on first use</b><span>"The authenticity of host … can't be established. Continue? (yes/no)"</span></li>
+      <li><b>Keys on disk</b><span><code>~/.ssh/id_ed25519</code> on every device, backed up who-knows-where</span></li>
+      <li><b>Forwarded agents</b><span>a compromised bastion signs logins to your other servers</span></li>
+      <li><b>Downgrade &amp; Terrapin</b><span>old ciphers and kex methods kept for the one router that needs them</span></li>
+      <li><b>Hostile output</b><span>escape sequences that rewrite your clipboard or fake a prompt</span></li>
+      <li><b>Fragile sessions</b><span>a train tunnel, a Wi-Fi hop, a closed laptop lid: the shell is gone</span></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ───────────────────────── trust ───────────────────────── -->
+<section id="trust" class="wrap">
+  <p class="eyebrow">Host trust</p>
+  <h2>A host key earns trust before a single byte of your session leaves the device.</h2>
+  <p class="lede narrow">Pylon has no "accept and continue" button. A host's key is checked during the key exchange,
+    and if none of the sources below vouches for it, the connection ends before authentication, so a
+    man in the middle learns nothing: not your user name, not a signature, not a keystroke.</p>
+
+  <figure class="diagram wide">
+    <svg viewBox="0 0 960 360" role="img" aria-labelledby="t-trust">
+      <title id="t-trust">Four sources can vouch for a host key; anything else is refused before authentication.</title>
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="arrowhead"/></marker>
+      </defs>
+      <!-- sources -->
+      <g class="node">
+        <rect x="20" y="20" width="270" height="62" rx="10"/>
+        <text x="40" y="47" class="h">Out-of-band fingerprint</text>
+        <text x="40" y="68" class="s">pasted, or scanned as a QR code</text>
+      </g>
+      <g class="node">
+        <rect x="20" y="102" width="270" height="62" rx="10"/>
+        <text x="40" y="129" class="h">Host certificate</text>
+        <text x="40" y="150" class="s">from a CA you trust for that name</text>
+      </g>
+      <g class="node">
+        <rect x="20" y="184" width="270" height="62" rx="10"/>
+        <text x="40" y="211" class="h">SSHFP + DNSSEC</text>
+        <text x="40" y="232" class="s">validated by Pylon, from the root</text>
+      </g>
+      <g class="node">
+        <rect x="20" y="266" width="270" height="62" rx="10"/>
+        <text x="40" y="293" class="h">Existing pin</text>
+        <text x="40" y="314" class="s">from any of the above, earlier</text>
+      </g>
+      <!-- funnel -->
+      <path d="M290 51 C 360 51, 360 175, 420 175" class="edge" marker-end="url(#arr)"/>
+      <path d="M290 133 C 350 133, 360 175, 420 175" class="edge"/>
+      <path d="M290 215 C 350 215, 360 175, 420 175" class="edge"/>
+      <path d="M290 297 C 360 297, 360 175, 420 175" class="edge"/>
+      <g class="node accent">
+        <rect x="422" y="128" width="200" height="94" rx="12"/>
+        <text x="522" y="165" text-anchor="middle" class="h">Key exchange</text>
+        <text x="522" y="188" text-anchor="middle" class="s">host signs H with</text>
+        <text x="522" y="206" text-anchor="middle" class="s">the key it presents</text>
+      </g>
+      <path d="M622 150 L 720 90" class="edge ok" marker-end="url(#arr)"/>
+      <path d="M622 200 L 720 262" class="edge bad" marker-end="url(#arr)"/>
+      <text x="676" y="108" class="lbl ok-t" text-anchor="end">matches</text>
+      <text x="676" y="250" class="lbl bad-t" text-anchor="end">no match</text>
+      <g class="node ok">
+        <rect x="722" y="50" width="220" height="80" rx="10"/>
+        <text x="742" y="82" class="h">Authenticate</text>
+        <text x="742" y="104" class="s">user name, signature, shell</text>
+      </g>
+      <g class="node bad">
+        <rect x="722" y="222" width="220" height="96" rx="10"/>
+        <text x="742" y="254" class="h">Disconnect</text>
+        <text x="742" y="276" class="s">nothing sent; old and new</text>
+        <text x="742" y="294" class="s">fingerprints shown; no</text>
+        <text x="742" y="312" class="s">"connect anyway once"</text>
+      </g>
+    </svg>
+  </figure>
+
+  <div class="cards three">
+    <article>
+      <h3>QR codes, not squinting</h3>
+      <p>The server's console prints a one-line payload, <code>pylon-hostkey/1 HOST[:PORT] SHA256:…</code>, as a QR code.
+        Pylon scans it and pins only if the key presented in a fresh exchange matches, and only for that host and port.</p>
+    </article>
+    <article>
+      <h3>Its own DNSSEC validator</h3>
+      <p>OpenSSH's <code>VerifyHostKeyDNS</code> believes the resolver's "authenticated" bit. Pylon validates every
+        signature itself from the IANA root anchors, so a hostile Wi-Fi resolver can't vouch for anything. Insecure,
+        bogus or indeterminate answers are shown, never trusted.</p>
+    </article>
+    <article>
+      <h3>A changed key is a hard stop</h3>
+      <p>The screen names the old pin and when it was made. The only ways forward are to disconnect or to re-verify
+        from scratch; every re-pin is kept in <code>pylon history</code>.</p>
+    </article>
+  </div>
+</section>
+
+<!-- ───────────────────────── the handshake ───────────────────────── -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">On the wire</p>
+    <h2>One connection, from <code>connect()</code> to a shell.</h2>
+    <p class="lede narrow">Pylon offers a short list of modern algorithms and nothing else; the rest are not switched
+      off, they are absent from the code. The post-quantum hybrid comes first, strict key exchange (the Terrapin fix)
+      is required, and every user signature names both this server's key and this exact session.</p>
+
+    <figure class="diagram wide">
+      <svg viewBox="0 0 960 600" role="img" aria-labelledby="t-seq">
+        <title id="t-seq">Sequence of a Pylon SSH connection between the Pylon client, the Symbolon agent and the server.</title>
+        <defs>
+          <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="arrowhead"/></marker>
+        </defs>
+        <!-- lifelines -->
+        <g class="life">
+          <rect x="60" y="14" width="160" height="40" rx="8"/><text x="140" y="40" text-anchor="middle">Symbolon agent</text>
+          <rect x="400" y="14" width="160" height="40" rx="8" class="accent"/><text x="480" y="40" text-anchor="middle">Pylon</text>
+          <rect x="740" y="14" width="160" height="40" rx="8"/><text x="820" y="40" text-anchor="middle">sshd (unchanged)</text>
+          <line x1="140" y1="54" x2="140" y2="590"/><line x1="480" y1="54" x2="480" y2="590"/><line x1="820" y1="54" x2="820" y2="590"/>
+        </g>
+        <!-- steps -->
+        <g class="msg">
+          <path d="M480 88 H 816" marker-end="url(#arr2)"/>
+          <text x="650" y="80" text-anchor="middle">KEXINIT · PQ hybrid first · strict-c</text>
+          <path d="M820 128 H 484" marker-end="url(#arr2)"/>
+          <text x="650" y="120" text-anchor="middle">KEXINIT · must offer kex-strict-s</text>
+          <path d="M480 168 H 816" marker-end="url(#arr2)"/>
+          <text x="650" y="160" text-anchor="middle">ML-KEM-768 encaps key + X25519 share</text>
+          <path d="M820 208 H 484" marker-end="url(#arr2)"/>
+          <text x="650" y="200" text-anchor="middle">ciphertext + share + host key + sig(H)</text>
+        </g>
+        <g class="step">
+          <rect x="392" y="222" width="176" height="68" rx="8"/>
+          <text x="480" y="245" text-anchor="middle" class="h">verify host key</text>
+          <text x="480" y="264" text-anchor="middle" class="s">pin · cert · SSHFP</text>
+          <text x="480" y="281" text-anchor="middle" class="s">or disconnect</text>
+        </g>
+        <g class="msg">
+          <path d="M480 316 H 816" marker-end="url(#arr2)"/>
+          <text x="650" y="308" text-anchor="middle">NEWKEYS · sequence numbers reset</text>
+          <path d="M480 356 H 144" marker-end="url(#arr2)"/>
+          <text x="310" y="348" text-anchor="middle">session-bind(host key, H, sig)</text>
+        </g>
+        <g class="step agent">
+          <rect x="46" y="368" width="188" height="72" rx="8"/>
+          <text x="140" y="393" text-anchor="middle" class="h">consent sheet</text>
+          <text x="140" y="413" text-anchor="middle" class="s">user · host · key</text>
+          <text x="140" y="429" text-anchor="middle" class="s">checks sig(H) itself</text>
+        </g>
+        <g class="msg">
+          <path d="M140 466 H 476" marker-end="url(#arr2)"/>
+          <text x="310" y="458" text-anchor="middle">signature over (H, host key, user)</text>
+          <path d="M480 506 H 816" marker-end="url(#arr2)"/>
+          <text x="650" y="498" text-anchor="middle">publickey-hostbound-v00 auth</text>
+          <path d="M480 552 H 816" marker-end="url(#arr2)" class="ok"/>
+          <text x="650" y="544" text-anchor="middle">shell · keystrokes in 20 ms frames + chaff</text>
+        </g>
+        <!-- side brackets -->
+        <g class="brace">
+          <text x="932" y="150" class="lbl" transform="rotate(90 932 150)" text-anchor="middle">post-quantum hybrid</text>
+          <text x="22" y="410" class="lbl" transform="rotate(-90 22 410)" text-anchor="middle">key never leaves</text>
+        </g>
+      </svg>
+    </figure>
+
+    <div class="spec-grid">
+      <div><span>Key exchange</span><code>mlkem768x25519-sha256</code><code>curve25519-sha256</code></div>
+      <div><span>Ciphers (AEAD only)</span><code>chacha20-poly1305</code><code>aes256-gcm</code><code>aes128-gcm</code></div>
+      <div><span>Host keys</span><code>ssh-ed25519</code><code>ecdsa-sha2-nistp256/384</code><code>rsa-sha2-512/256 ≥ 2048</code></div>
+      <div><span>Absent from the code</span><code class="strike">SHA-1</code><code class="strike">DH groups</code><code class="strike">CBC / CTR</code><code class="strike">hmac-*</code></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── keys ───────────────────────── -->
+<section id="keys" class="wrap">
+  <p class="eyebrow">Key custody</p>
+  <h2>Pylon has nothing to steal.</h2>
+  <div class="two">
+    <div>
+      <p>There is no private key in Pylon. Every signature comes from
+        <a href="https://github.com/larrydewey/symbolon">Symbolon</a>, a separate agent that holds threshold keys
+        (no single device has the whole key) and shows a consent sheet naming the user, the host and the key before
+        it signs.</p>
+      <p>Before it asks for a signature, Pylon hands the agent the host key, the session hash <i>H</i> and the host's
+        own signature over <i>H</i>. The agent checks that signature itself and refuses anything for a different
+        session. A compromised server therefore cannot relay your login to another server, the classic risk of agent
+        forwarding, which Pylon doesn't offer at all. To reach a host behind a bastion, Pylon tunnels through it
+        (<code>-J</code>) and verifies each hop under its own pin.</p>
+      <p class="muted">Without Symbolon, Pylon also works with a FIDO2 security key, an Android Keystore key, an external
+        agent or an imported key file, each behind an explicit warning of exactly what that gives up.</p>
+    </div>
+    <figure class="diagram">
+      <svg viewBox="0 0 440 400" role="img" aria-labelledby="t-keys">
+        <title id="t-keys">Pylon process holds no key; Symbolon signs only for the bound session; a malicious host cannot reuse the signature.</title>
+        <defs><marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="arrowhead"/></marker></defs>
+        <rect x="10" y="10" width="200" height="380" rx="14" class="frame"/>
+        <text x="110" y="36" text-anchor="middle" class="lbl">your device</text>
+        <g class="node accent"><rect x="30" y="54" width="160" height="96" rx="10"/>
+          <text x="110" y="84" text-anchor="middle" class="h">Pylon</text>
+          <text x="110" y="106" text-anchor="middle" class="s">connections, UI</text>
+          <text x="110" y="126" text-anchor="middle" class="s">keys held: none</text></g>
+        <g class="node"><rect x="30" y="230" width="160" height="140" rx="10"/>
+          <text x="110" y="260" text-anchor="middle" class="h">Symbolon</text>
+          <text x="110" y="282" text-anchor="middle" class="s">threshold key share</text>
+          <text x="110" y="300" text-anchor="middle" class="s">consent per signature</text>
+          <text x="110" y="318" text-anchor="middle" class="s">bound to one session</text>
+          <text x="110" y="348" text-anchor="middle" class="s">revoke everywhere</text></g>
+        <path d="M95 150 V 226" class="edge" marker-end="url(#arr3)"/>
+        <path d="M125 226 V 154" class="edge" marker-end="url(#arr3)"/>
+        <text x="56" y="194" class="lbl" text-anchor="end">bind</text>
+        <text x="134" y="194" class="lbl">sig</text>
+        <g class="node ok"><rect x="270" y="54" width="160" height="70" rx="10"/>
+          <text x="350" y="84" text-anchor="middle" class="h">server A</text>
+          <text x="350" y="106" text-anchor="middle" class="s">signature valid here</text></g>
+        <g class="node bad"><rect x="270" y="250" width="160" height="96" rx="10"/>
+          <text x="350" y="280" text-anchor="middle" class="h">server B</text>
+          <text x="350" y="302" text-anchor="middle" class="s">A replays the</text>
+          <text x="350" y="320" text-anchor="middle" class="s">signature: rejected,</text>
+          <text x="350" y="338" text-anchor="middle" class="s">wrong host key and H</text></g>
+        <path d="M190 90 H 266" class="edge ok" marker-end="url(#arr3)"/>
+        <path d="M350 124 V 246" class="edge bad dashed" marker-end="url(#arr3)"/>
+      </svg>
+    </figure>
+  </div>
+</section>
+
+<!-- ───────────────────────── roaming ───────────────────────── -->
+<section id="roaming" class="band">
+  <div class="wrap">
+    <p class="eyebrow">The Pylon protocol <span class="tag">experimental</span></p>
+    <h2>Log in with SSH. Stay connected without it.</h2>
+    <p class="lede narrow">Once logged in, Pylon can push a small, signed <code>pylond</code> to the server over the same
+      SSH connection (no root, nothing installed beforehand) and move the session onto its own UDP protocol. The new
+      keys are derived inside the already-verified SSH channel, so the Pylon session inherits SSH's host check and your
+      authentication, then adds what TCP can't give.</p>
+
+    <figure class="diagram wide">
+      <svg viewBox="0 0 960 284" role="img" aria-labelledby="t-roam">
+        <title id="t-roam">SSH bootstraps a UDP session; the phone moves from Wi-Fi to cellular and the session continues; the shell keeps running while the phone sleeps.</title>
+        <defs><marker id="arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="arrowhead"/></marker></defs>
+        <!-- callout lines, behind the bars -->
+        <path d="M140 74 V 176" class="edge"/>
+        <path d="M320 74 V 176" class="edge"/>
+        <path d="M760 74 V 176" class="edge"/>
+        <!-- client row -->
+        <text x="40" y="30" class="lbl">your device</text>
+        <rect x="60" y="40" width="80" height="34" rx="6" class="seg ssh"/>
+        <text x="100" y="62" text-anchor="middle" class="segt">SSH</text>
+        <rect x="140" y="40" width="180" height="34" rx="6" class="seg udp"/>
+        <text x="230" y="62" text-anchor="middle" class="segt">UDP · Wi-Fi</text>
+        <rect x="320" y="40" width="240" height="34" rx="6" class="seg udp2"/>
+        <text x="440" y="62" text-anchor="middle" class="segt">UDP · cellular, same session</text>
+        <rect x="560" y="40" width="200" height="34" rx="6" class="seg idle"/>
+        <text x="660" y="62" text-anchor="middle" class="segt">no client</text>
+        <rect x="760" y="40" width="160" height="34" rx="6" class="seg udp"/>
+        <text x="840" y="62" text-anchor="middle" class="segt">re-attached</text>
+        <!-- server row -->
+        <text x="40" y="104" class="lbl">server</text>
+        <rect x="60" y="112" width="860" height="34" rx="6" class="seg host"/>
+        <text x="490" y="134" text-anchor="middle" class="segt">pylond keeps the PTY, the screen and 10 000 lines of scrollback</text>
+        <!-- callouts -->
+        <text x="148" y="174" class="lbl">keys made inside SSH,</text>
+        <text x="148" y="192" class="lbl">then SSH closes</text>
+        <text x="328" y="174" class="lbl">no new handshake: the</text>
+        <text x="328" y="192" class="lbl">server follows the address</text>
+        <text x="752" y="174" class="lbl" text-anchor="end">re-attach needs a</text>
+        <text x="752" y="192" class="lbl" text-anchor="end">fresh signature</text>
+        <!-- time axis -->
+        <line x1="60" y1="240" x2="920" y2="240" class="axis"/>
+        <g class="tick"><circle cx="60" cy="240" r="5"/><text x="60" y="266">09:00 login</text></g>
+        <g class="tick"><circle cx="320" cy="240" r="5"/><text x="320" y="266" text-anchor="middle">09:20 off Wi-Fi</text></g>
+        <g class="tick"><circle cx="560" cy="240" r="5"/><text x="560" y="266" text-anchor="middle">09:40 phone sleeps</text></g>
+        <g class="tick"><circle cx="760" cy="240" r="5"/><text x="760" y="266" text-anchor="middle">next day, laptop</text></g>
+      </svg>
+    </figure>
+
+    <div class="cards three">
+      <article><h3>Post-quantum, forward-secret</h3><p>X25519 + ML-KEM-768, new keys every two minutes, so traffic recorded today stays sealed even against a future quantum computer.</p></article>
+      <article><h3>Silent to scanners</h3><p>An unauthenticated datagram gets one constant-time MAC check and no reply. Under load, a cookie is required before any asymmetric work.</p></article>
+      <article><h3>Re-attach needs you</h3><p>A stolen, unlocked phone can't resume your shell: re-attaching after a long gap or from another device needs a fresh signature, verified against <code>authorized_keys</code> at that moment.</p></article>
+    </div>
+    <p class="note">The v1 handshake is not yet a verified Noise pattern. It is off unless you pass <code>--pylond</code>,
+      and the specification requires a formal model and an external review before it becomes the default.</p>
+  </div>
+</section>
+
+<!-- ───────────────────────── verified code ───────────────────────── -->
+<section class="wrap">
+  <p class="eyebrow">Code pushed to your servers</p>
+  <h2>Nothing runs on a host unless a quorum signed it and the world can see it.</h2>
+  <p class="lede narrow">Pushing a binary to a server is exactly what an attacker who stole a maintainer's key would want
+    to do. So <code>pylond</code> is pushed only if every check below passes, offline, before a byte reaches the host.</p>
+  <ol class="pipeline">
+    <li><b>Reproducible build</b><span>x86-64 and AArch64, code images that match between honest builders</span></li>
+    <li><b>k of n signatures</b><span>separate Ed25519 release keys, one per maintainer device</span></li>
+    <li><b>Transparency log</b><span>an RFC 9162 Merkle tree; inclusion and consistency proofs under a head signed by log keys the maintainers don't hold</span></li>
+    <li><b>No rollback</b><span>a release counter that only goes up</span></li>
+    <li><b>Hash checked on the host</b><span>content-addressed, mode 0500 in a 0700 cache, run as you, never root</span></li>
+  </ol>
+  <p class="note">No release keys are pinned yet: until the first signing ceremony, only developer options (announced
+    as such) push a <code>pylond</code>.</p>
+</section>
+
+<!-- ───────────────────────── hostile output ───────────────────────── -->
+<section class="band">
+  <div class="wrap two">
+    <div>
+      <p class="eyebrow">The terminal</p>
+      <h2>Output from a server is treated as an attack until proven otherwise.</h2>
+      <p>The terminal emulator is the largest parser of attacker-controlled bytes in any SSH client. Pylon's runs in its
+        own confined process that can draw one terminal and nothing else, written in
+        <a href="https://github.com/larrydewey/Resid">Resid</a>: total parsers, checked arithmetic, and secrets typed as
+        <code>Secret</code> so they can't be logged or compared in variable time.</p>
+    </div>
+    <ul class="checks">
+      <li><b>Clipboard writes</b> need a per-host grant; clipboard reads don't exist.</li>
+      <li><b>No read-back</b>: title reports and setting queries that echo attacker text as input are not implemented.</li>
+      <li><b>Pastes</b> with newlines or control characters are shown before they're sent.</li>
+      <li><b>Links</b> show their real target before opening.</li>
+      <li><b>Pylon's own prompts</b> are drawn outside the terminal, so output can't imitate them.</li>
+      <li><b>Keystroke timing</b> is hidden in fixed 20 ms frames with chaff.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ───────────────────────── vs ssh ───────────────────────── -->
+<section id="ssh" class="wrap">
+  <p class="eyebrow">Pylon and ssh</p>
+  <h2>Same servers, same protocol. Different defaults, and a different idea of who decides.</h2>
+  <p class="lede narrow">Pylon is not a replacement for the SSH <em>protocol</em> or for <code>sshd</code>: every server
+    keeps running OpenSSH. It replaces the <em>client</em> (the <code>ssh</code> command, Termius, ConnectBot, JuiceSSH).
+    Much of what Pylon enforces exists in modern OpenSSH as options; the difference is that in Pylon they are not
+    options.</p>
+
+  <div class="table-wrap">
+  <table class="compare">
+    <thead><tr><th></th><th>OpenSSH <code>ssh</code></th><th>Pylon</th></tr></thead>
+    <tbody>
+      <tr><th>First connection to a host</th><td>Shows a fingerprint and asks <code>yes/no</code> (trust on first use)</td><td>Refuses unless a pin, certificate or DNSSEC-validated SSHFP vouches for it</td></tr>
+      <tr><th>Algorithms</th><td>Broad, configurable; legacy can be re-enabled per host</td><td>A fixed modern subset; everything else is absent from the code</td></tr>
+      <tr><th>Post-quantum key exchange</th><td>Default since 9.0 (sntrup761), ML-KEM default since 10.0</td><td>Offered first; used whenever the server has it</td></tr>
+      <tr><th>Strict kex (Terrapin)</th><td>Used when both sides support it (9.6+); silently absent otherwise</td><td>Required; a server without it is refused unless excepted per connection</td></tr>
+      <tr><th>SSHFP</th><td>Trusts the resolver's AD bit</td><td>Validates DNSSEC itself from the root anchors</td></tr>
+      <tr><th>Private keys</th><td>Files in <code>~/.ssh</code>, or an agent</td><td>Never in Pylon; threshold keys in Symbolon, or a hardware key</td></tr>
+      <tr><th>Agent forwarding</th><td>Available (<code>-A</code>)</td><td>Not offered; jump hosts verified hop by hop instead</td></tr>
+      <tr><th>Keystroke timing</th><td>Obfuscated since 9.5</td><td>Obfuscated, checked on the wire in tests</td></tr>
+      <tr><th>Terminal output</th><td>Passed raw to whatever terminal you run it in</td><td>Parsed in a confined emulator with no clipboard reads or read-back</td></tr>
+      <tr><th>Changing networks</th><td>TCP connection drops; needs <code>mosh</code> + <code>tmux</code></td><td>Built-in roaming UDP and persistent sessions (experimental)</td></tr>
+      <tr><th>Implementation</th><td>C, decades of hardening, the reference</td><td>Resid, memory-safe and young; tested against OpenSSH 9.6, 10.2 and Dropbear</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="muted">When to keep using <code>ssh</code>: scripts and automation that need its full configuration surface,
+    servers that only speak algorithms Pylon dropped, X11 forwarding, and anywhere you need the most battle-tested
+    implementation rather than the strictest one.</p>
+</section>
+
+<!-- ───────────────────────── status ───────────────────────── -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">Where it stands</p>
+    <h2>Honest about what's done.</h2>
+    <div class="status">
+      <div class="col done"><h3>Working</h3>
+        <ul><li>Strict SSH client with the post-quantum hybrid</li><li>Pins, QR, host certificates, SSHFP + DNSSEC</li><li>Session-bound agent signing</li><li>Shells, exec, <code>-L</code> <code>-D</code> <code>-R</code>, <code>-J</code>, SFTP browser</li><li>Android app and Linux desktop with tabs and splits</li><li>153 interop and hostile-server cases, fuzzing</li></ul></div>
+      <div class="col exp"><h3>Experimental</h3>
+        <ul><li>The Pylon UDP protocol and <code>pylond</code></li><li>Persistent sessions and re-attach</li><li>The isolated local shell (Android not yet verified on a device)</li></ul></div>
+      <div class="col todo"><h3>Not yet</h3>
+        <ul><li>Pinned release keys and the first signing ceremony</li><li>Formal model and external review of the protocol</li><li>Live DNSSEC against the real root in CI</li><li>Windows, macOS, iOS</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── start ───────────────────────── -->
+<section id="start" class="wrap">
+  <p class="eyebrow">Try it</p>
+  <h2>Build, pin, connect.</h2>
+<pre class="code"><span class="c"># needs the Resid toolchain (residc)</span>
+residc cli/pylon.resid -o build/pylon
+
+<span class="c"># on the server's console, read its key fingerprint</span>
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+
+<span class="c"># on your machine, pin it, then connect through any session-bind capable agent</span>
+build/pylon pin example.org SHA256:...
+eval "$(symbolon ssh-agent ~/.symbolon &amp;)"
+build/pylon alice@example.org</pre>
+  <p>Android builds come from the <code>apk</code> workflow and are attached to each
+    <a href="https://github.com/larrydewey/Pylon/releases">release</a>. The full design, threat model and hardening review
+    are in <a href="https://github.com/larrydewey/Pylon/blob/master/SPEC.md">SPEC.md</a>.</p>
+</section>
+
+</main>
+
+<footer>
+  <span>Pylon · MIT licensed</span>
+  <span><a href="https://github.com/larrydewey/Pylon">Source</a> · <a href="https://github.com/larrydewey/symbolon">Symbolon</a> · <a href="https://github.com/larrydewey/Resid">Resid</a></span>
+</footer>
+
+</body>
+</html>

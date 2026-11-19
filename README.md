@@ -23,6 +23,8 @@ SSH side of Termux.
   protocol chained to the SSH handshake, with persistent sessions you can
   re-attach from any of your devices (phase 2).
 
+An illustrated overview is at <https://larrydewey.github.io/Pylon/> (source in `docs/`).
+
 The protocol code is written in [Resid](https://github.com/larrydewey/Resid).
 The design is in [SPEC.md](SPEC.md).
 
