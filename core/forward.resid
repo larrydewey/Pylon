@@ -84,10 +84,10 @@ Int msg_request_success() { return 81; }
 
 // Open the local listeners and ask the server for the remote ones; a Mux
 // with err set when any of them cannot be had.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Mux mux_new(Conn c, List(Fwd) fs) { return listen_all(Mux {.c = c, .fwds = [], .chans = [], .next_id = 1, .err = "", .opened = 0}, fs, 0); }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux listen_all(Mux m, List(Fwd) fs, Int i) {
     if (i >= fs.len() || str_len(m.err) > 0) { return m; }
     if (fs[i].kind == 2) { return listen_all(remote_listen(m, fs[i]), fs, i + 1); }
@@ -98,7 +98,7 @@ Mux listen_all(Mux m, List(Fwd) fs, Int i) {
 }
 
 // tcpip-forward on the server's loopback (RFC 4254 7.1).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux remote_listen(Mux m, Fwd f) {
     List(Int) p = [msg_global_request()].concat(sstr("tcpip-forward")).concat(sbool(true)).concat(sstr("localhost")).concat(u32_be(f.lport));
     Pkt k = next_msg(send_packet(m.c, p));
@@ -135,11 +135,11 @@ FC fc_state(FC f, Int st) { return FC {.id = f.id, .remote = f.remote, .fd = f.f
 
 // Runs until the connection fails or the server disconnects. `limit` > 0
 // stops after that many forwarded connections have finished (for tests).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Mux serve(Mux m, Int limit) {
     if (str_len(m.err) > 0) { return m; }
     if (limit > 0 && m.opened >= limit && m.chans.len() == 0) { return m; }
-    Bool buffered = m.c.buf.len() > 0;
+    Bool buffered = pending(m.c);
     List(Int) fds = [m.c.fd].concat(lfds(m.fwds, 0, [])).concat(cfds(m.chans, 0, []));
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), if (buffered) { 0 } else { 1000 });
     Mux a = if (buffered || (ready.len() > 0 && (ready[0] & 1) != 0)) { on_packet(m) } else { m };
@@ -164,7 +164,7 @@ List(Int) cfds(List(FC) cs, Int i, List(Int) acc) {
 }
 
 // New local connections: each opens a direct-tcpip channel.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux accept_all(Mux m, List(Int) ready, Int at, Int i) {
     if (i >= m.fwds.len() || str_len(m.err) > 0) { return m; }
     Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
@@ -240,7 +240,7 @@ Str ipv6_text(List(Int) a, Int i, Str acc) {
     return ipv6_text(a, i + 2, if (i == 0) { g } else { acc + ":" + g });
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux socks_accept(Mux m, Int fd) {
     Target t = socks_request(fd);
     if (t.refuse != 0) {
@@ -259,7 +259,7 @@ Mux socks_accept(Mux m, Int fd) {
 // A SOCKS5 reply with an unspecified bound address.
 List(Int) socks_reply(Int code) { return [5, code, 0, 1, 0, 0, 0, 0, 0, 0]; }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Mux open_direct(Mux m, Fwd f, Int fd) {
     Int id = m.next_id;
     List(Int) p = [msg_channel_open()].concat(sstr("direct-tcpip")).concat(u32_be(id)).concat(u32_be(fwd_window())).concat(u32_be(fwd_max_packet()))
@@ -272,7 +272,7 @@ pub Mux open_direct(Mux m, Fwd f, Int fd) {
 
 // Local data, forwarded within each channel's window and packet size;
 // a local EOF sends EOF and CLOSE.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux read_all(Mux m, List(Int) ready, Int at, List(Int) fds, Int i) {
     if (i >= fds.len() || str_len(m.err) > 0) { return m; }
     Bool r = at + i < ready.len() && (ready[at + i] & 1) != 0;
@@ -287,7 +287,7 @@ Int chan_of_fd(List(FC) cs, Int fd, Int i) {
     return chan_of_fd(cs, fd, i + 1);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux read_one(Mux m, Int k) {
     FC f = m.chans[k];
     Int want0 = if (f.rmax < f.rwin) { f.rmax } else { f.rwin };
@@ -303,7 +303,7 @@ Mux read_one(Mux m, Int k) {
 }
 
 // One message from the server, dispatched by channel number.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux on_packet(Mux m) {
     Pkt k = next_once(m.c);
     if (!conn_ok(k.c)) { return with_err(m, k.c.err); }
@@ -380,7 +380,7 @@ Int remote_fwd(List(Fwd) fs, Int port, Int i) {
 // forwarded-tcpip for a port Pylon asked for: connect to that port's
 // destination here. Anything else (another port, x11, an agent channel,
 // a session) is refused (reason 1, administratively prohibited).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Mux on_open(Mux m, Pkt k) {
     GotText kind = rd_text(rd_at(k.p, 1));
     GotInt sender = rd_u32(kind.r);

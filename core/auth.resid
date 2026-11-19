@@ -51,7 +51,7 @@ List(Int) request_body(Conn c, Str user, Str alg, List(Int) blob, Bool signed) {
     return if (c.hostbound) { base.concat(sstring(c.host_blob)) } else { base };
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Authed authenticate(Conn c0, Int agent, Str user, List(Ident) ids) {
     Conn c = request_service(c0, "ssh-userauth");
     if (!conn_ok(c)) { return auth_fail(c, c.err); }
@@ -61,7 +61,7 @@ pub Authed authenticate(Conn c0, Int agent, Str user, List(Ident) ids) {
     return try_keys(c, agent, user, ids, 0);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Authed try_keys(Conn c, Int agent, Str user, List(Ident) ids, Int i) {
     if (i >= ids.len()) { return auth_fail(c, "the server accepted none of the agent's keys"); }
     Option(PubKey) ok = key_of_blob(ids[i].blob);
@@ -92,7 +92,7 @@ Authed try_keys(Conn c, Int agent, Str user, List(Ident) ids, Int i) {
 }
 
 // The next authentication reply; banners are shown (escaped) on stderr.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Pkt auth_reply(Conn c) {
     Pkt k = next_msg(c);
     if (!conn_ok(k.c)) { return k; }

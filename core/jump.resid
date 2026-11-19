@@ -58,7 +58,7 @@ List(Int) read_n(Int fd, Int n, List(Int) acc) {
 // Relay the pipe end `fd` through a direct-tcpip channel to host:port on
 // the jump connection `jc`, until either side closes. 0, or 1 with the
 // reason on stderr.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub Int relay(Conn jc, Int fd, Str host, Int port) {
     Mux m = mux_new(jc, []);
     Mux m2 = open_direct(m, Fwd {.kind = 0, .lport = 0, .host = host, .hport = port, .lfd = -1}, fd);

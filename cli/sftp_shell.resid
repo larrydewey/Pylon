@@ -215,7 +215,7 @@ Flagged flag(List(List(Int)) a, Str f) {
     return Flagged {.on = false, .rest = a};
 }
 
-@requires(network, declassify, filesystem, environment)
+@requires(network, declassify, filesystem, environment, clock(readonly))
 Fsh run(Fsh x, Str cmd, List(List(Int)) a) {
     if (cmd == "help" || cmd == "?") { _ = help(); return x; }
     if (cmd == "pwd") { println(shown(x.cwd)); return x; }
@@ -240,7 +240,7 @@ Fsh run(Fsh x, Str cmd, List(List(Int)) a) {
     return x;
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_cd(Fsh x, List(List(Int)) a) {
     if (a.len() > 1) { eprintln("cd: one directory"); return x; }
     PathR r = real_path(x.s, if (a.len() == 0) { x.home } else { remote(x, a[0]) });
@@ -251,7 +251,7 @@ Fsh cmd_cd(Fsh x, List(List(Int)) a) {
     return with_cwd(x, st.s, r.p);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_ls(Fsh x, List(List(Int)) a) {
     if (a.len() > 1) { eprintln("ls: one path"); return x; }
     List(Int) p = if (a.len() == 0) { x.cwd } else { remote(x, a[0]) };
@@ -269,7 +269,7 @@ Fsh cmd_ls(Fsh x, List(List(Int)) a) {
     return with_s(x, l.s);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_stat(Fsh x, List(List(Int)) a) {
     if (a.len() != 1) { eprintln("stat: one path"); return x; }
     List(Int) p = remote(x, a[0]);
@@ -283,7 +283,7 @@ Fsh cmd_stat(Fsh x, List(List(Int)) a) {
 }
 
 // mkdir (op 0) or rmdir (1) for each path.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh each_path(Fsh x, List(List(Int)) a, Int i, Int op) {
     if (a.len() == 0) { eprintln(if (op == 0) { "mkdir" } else { "rmdir" } + ": give a directory"); return x; }
     if (i >= a.len() || !alive(x)) { return x; }
@@ -292,14 +292,14 @@ Fsh each_path(Fsh x, List(List(Int)) a, Int i, Int op) {
     return each_path(reported(x, s), a, i + 1, op);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_rm(Fsh x, List(List(Int)) a0) {
     Flagged f = flag(a0, "-r");
     if (f.rest.len() == 0) { eprintln("rm: give a path"); return x; }
     return rm_each(x, f.rest, 0, f.on);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh rm_each(Fsh x, List(List(Int)) a, Int i, Bool tree) {
     if (i >= a.len() || !alive(x)) { return x; }
     PathR c = canon(x.s, remote(x, a[i]));
@@ -311,7 +311,7 @@ Fsh rm_each(Fsh x, List(List(Int)) a, Int i, Bool tree) {
 }
 
 // mv / cp SRC... DST: into DST when it is a directory, else (one SRC) as DST.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_mvcp(Fsh x, List(List(Int)) a0, Bool move) {
     Str name = if (move) { "mv" } else { "cp" };
     Flagged f = if (move) { Flagged {.on = true, .rest = a0} } else { flag(a0, "-r") };
@@ -329,7 +329,7 @@ Fsh cmd_mvcp(Fsh x, List(List(Int)) a0, Bool move) {
 
 // Moves (move) or copies each source into dir (into) or as dst. With
 // `dup`, a copy beside its original takes a free "NAME copy" name.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh transfer_each(Fsh x, List(List(Int)) srcs, Int i, List(Int) dst, Bool into, Bool move, Bool tree, Bool dup) {
     if (i >= srcs.len() || !alive(x)) { return x; }
     PathR src = canon(x.s, remote(x, srcs[i]));
@@ -361,7 +361,7 @@ Str done_note(Done d) {
 
 // "NAME copy", "NAME copy 2", ... (before an extension: "a copy.txt"),
 // the first that does not exist in dir.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 pub PathR free_name(Sftp s, List(Int) dir, List(Int) base, Int n) {
     if (n > 99) { return PathR {.s = sftp_err(s, "no free name for a copy of " + shown(base)), .p = []}; }
     List(Int) p = path_join(dir, copy_name(base, n));
@@ -386,7 +386,7 @@ Int last_dot(List(Int) b, Int i) {
 }
 
 // cut / copy PATH...: mark canonical paths (each must exist).
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_mark(Fsh x, List(List(Int)) a, Int mode) {
     if (a.len() == 0) { eprintln(if (mode == 1) { "cut" } else { "copy" } + ": give a path"); return x; }
     Marked m = mark_each(x.s, x.cwd, a, 0, []);
@@ -398,7 +398,7 @@ Fsh cmd_mark(Fsh x, List(List(Int)) a, Int mode) {
 
 type Marked = { Sftp s; List(List(Int)) paths; };
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Marked mark_each(Sftp s, List(Int) cwd, List(List(Int)) a, Int i, List(List(Int)) acc) {
     if (i >= a.len()) { return Marked {.s = s, .paths = acc}; }
     PathR c = canon(s, path_join(cwd, a[i]));
@@ -409,7 +409,7 @@ Marked mark_each(Sftp s, List(Int) cwd, List(List(Int)) a, Int i, List(List(Int)
     return mark_each(st.s, cwd, a, i + 1, acc.concat([c.p]));
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Fsh cmd_paste(Fsh x, List(List(Int)) a) {
     if (x.mode == 0) { eprintln("paste: nothing is marked (cut or copy first)"); return x; }
     if (a.len() > 1) { eprintln("paste: one directory"); return x; }
@@ -438,7 +438,7 @@ Bool show_paths(List(List(Int)) ps, Int i) {
     return show_paths(ps, i + 1);
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Fsh cmd_get(Fsh x, List(List(Int)) a0) {
     Flagged f = flag(a0, "-f");
     List(List(Int)) a = f.rest;
@@ -480,7 +480,7 @@ Int next_slash(List(Int) b, Int i) {
     return next_slash(b, i + 1);
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Fsh cmd_put(Fsh x, List(List(Int)) a0) {
     Flagged f = flag(a0, "-f");
     List(List(Int)) a = f.rest;
@@ -553,7 +553,7 @@ List(Str) starting(List(Str) xs, Str p, Int i, List(Str) acc) {
 
 // The shell: from DIR (or the login directory) until exit or end of
 // input. 0, or 1 when the session failed.
-@requires(network, declassify, filesystem, environment, terminal)
+@requires(network, declassify, filesystem, environment, terminal, clock(readonly))
 pub Int sftp_shell(Sftp s, List(Int) dir) {
     PathR home = real_path(s, [46]);
     if (!sftp_good(home.s)) { eprintln("pylon: " + home.s.err); return 1; }
@@ -563,7 +563,7 @@ pub Int sftp_shell(Sftp s, List(Int) dir) {
     return shell_loop(Fsh {.s = start.s, .cwd = start.p, .home = home.p, .lcwd = "", .mode = 0, .clip = [], .h = history_new(200)});
 }
 
-@requires(network, declassify, filesystem, environment, terminal)
+@requires(network, declassify, filesystem, environment, terminal, clock(readonly))
 Int shell_loop(Fsh x) {
     if (!alive(x)) { eprintln("pylon: the SFTP session ended" + if (str_len(x.s.err) > 0) { ": " + x.s.err } else { "" }); return 1; }
     Str prompt = "sftp " + shown(x.cwd) + "> ";
@@ -574,13 +574,13 @@ Int shell_loop(Fsh x) {
     };
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Int shell_end(Fsh x) {
     _ = disconnect(x.s.ch.c, "done");
     return 0;
 }
 
-@requires(network, declassify, filesystem, environment, terminal)
+@requires(network, declassify, filesystem, environment, terminal, clock(readonly))
 Int shell_line(Fsh x0, Str l) {
     Fsh x = if (str_len(str_trim(l)) > 0) { with_h(x0, history_add(x0.h, l)) } else { x0 };
     Toks t = words(l);
@@ -661,7 +661,7 @@ Sftp answered(Sftp s, List(Int) ok) {
     return if (chan_ok(s.ch) && !s.ch.closed) { sftp_ok(s) } else { s };
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 pub Int sftp_app(Sftp s) {
     PathR home = real_path(s, [46]);
     if (!sftp_good(home.s)) { eprintln("pylon: " + home.s.err); return 1; }
@@ -669,7 +669,7 @@ pub Int sftp_app(Sftp s) {
     return serve_app(home.s, []);
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Int serve_app(Sftp s, List(Int) buf) {
     if (!chan_ok(s.ch) || s.ch.closed) { eprintln("pylon: the SFTP session ended" + if (str_len(s.err) > 0) { ": " + s.err } else { "" }); return 1; }
     AppMsg m = next_in(buf);
@@ -685,7 +685,7 @@ Int serve_app(Sftp s, List(Int) buf) {
     return serve_app(serve_op(s, op, a), m.buf);
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Sftp serve_op(Sftp s, Int op, List(List(Int)) a) {
     if (op == 1) {
         Listing l = list_remote(s, a[0]);
@@ -706,7 +706,7 @@ Sftp serve_op(Sftp s, Int op, List(List(Int)) a) {
 // PUT: the file arrives as frames of type 9, an empty one ending it.
 // After a refusal the rest of its frames are skipped (serve_app drops
 // them); the app sends them all regardless.
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Int serve_put(Sftp s, List(Int) path, Bool replace, List(Int) buf) {
     Stat st = stat_path(s, path, true);
     Bool taken = sftp_good(st.s) && st.found && (!replace || st.a.kind != 0);
@@ -715,7 +715,7 @@ Int serve_put(Sftp s, List(Int) path, Bool replace, List(Int) buf) {
     return put_frames(u, buf);
 }
 
-@requires(network, declassify, filesystem)
+@requires(network, declassify, filesystem, clock(readonly))
 Int put_frames(Upload u, List(Int) buf) {
     AppMsg m = next_in(buf);
     if (m.eof) { _ = disconnect(u.s.ch.c, "done"); return 0; }

@@ -97,13 +97,13 @@ Int usage() {
 }
 
 // The inner end of a jump pipe, as a connection to the target.
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Conn piped(Int fd) {
     _ = resid_tcp_deadline(fd, 30000);
     return conn_new(fd);
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Conn dial(Str host, Int port) {
     Int fd = resid_tcp_connect(host, port);
     Conn c = conn_new(fd);
@@ -130,6 +130,7 @@ Int cmd_pin(Opts o, Int via) {
     Handshake h = handshake(c, probing(), o.no_strict);
     _ = resid_tcp_close(c.fd);
     if (h.c.err != probe_done()) { eprintln("pylon: " + h.c.err); return 1; }
+    _ = if (!h.c.strict) { eprintln_true(no_strict_warning(host)) } else { true };
     if (!x.fps.contains(h.fingerprint)) {
         eprintln("pylon: NOT pinned. " + host + " presents " + h.fingerprint);
         eprintln("       which differs from " + (if (x.fps.len() == 1) { "the fingerprint you gave (" + x.fps[0] + ")." } else { "every fingerprint you gave (" + str_join(x.fps, ", ") + ")." }));
@@ -218,8 +219,10 @@ Authed login(Str user, Str host, Opts o, Int via) {
     if (ids.len() == 0) { return Authed {.c = none, .ok = false, .why = nokeys}; }
     // A host with no pin: what DNSSEC-validated SSHFP records say (SPEC 6.1.2).
     Verdict dv = if (pinned.len() == 0) { dns_for(host) } else { no_dns() };
-    Conn c = if (via >= 0) { piped(via) } else { dial(host, o.port) };
-    if (!conn_ok(c)) { return Authed {.c = c, .ok = false, .why = c.err}; }
+    Conn c0 = if (via >= 0) { piped(via) } else { dial(host, o.port) };
+    if (!conn_ok(c0)) { return Authed {.c = c0, .ok = false, .why = c0.err}; }
+    // Test hooks: rekey sooner than SPEC 5's limits (never later).
+    Conn c = rekey_limits(c0, env_int("PYLON_TEST_SSH_REKEY_BYTES"), env_int("PYLON_TEST_SSH_REKEY_PACKETS"), env_int("PYLON_TEST_SSH_REKEY_SECS"));
     Handshake h = handshake(c, Trust {.pinned = pinned, .probe = false, .cas = cas_for(host), .name = host, .now = clock.now_sec(), .dns = dv}, o.no_strict);
     Str token = host_token(host, o.port);
     if (!conn_ok(h.c)) {
@@ -230,6 +233,7 @@ Authed login(Str user, Str host, Opts o, Int via) {
         _ = if (sshfp_bad) { history("refused", token, h.fingerprint, "a key its DNSSEC-signed SSHFP records do not name") } else { true };
         return Authed {.c = h.c, .ok = false, .why = if (changed) { h.c.err + pin_details(pins_for(token), 0, "") } else { h.c.err }};
     }
+    _ = if (!h.c.strict) { eprintln_true(no_strict_warning(host)) } else { true };
     // Accepted through SSHFP: pin it, so that later changes follow 6.2.
     List(Int) plain = plain_key_blob(h.c.host_blob);
     Bool by_dns = pinned.len() == 0 && sshfp_match(dv, plain) == "match";
@@ -244,6 +248,20 @@ Authed login(Str user, Str host, Opts o, Int via) {
 }
 
 Bool eprintln_true(Str s) { eprintln(s); return true; }
+
+@requires(environment)
+Int env_int(Str name) {
+    Str v = environment.get(name);
+    return if (str_is_int(v)) { str_parse_int(v) } else { 0 };
+}
+
+// SPEC 5's exception for a server without strict key exchange, shown
+// every time it is used.
+Str no_strict_warning(Str host) {
+    return "pylon: WARNING: " + host + " does not support strict key exchange (the Terrapin fix), and\n"
+        + "       --allow-no-strict let the connection proceed without it. An attacker on the path\n"
+        + "       can truncate the start of the encrypted stream (Terrapin-style prefix truncation).";
+}
 
 // What was pinned, when and from which device (SPEC 6.2).
 Str pin_details(List(Pin) ps, Int i, Str acc) {
@@ -532,7 +550,7 @@ List(Fwd) parse_fwds(List(Str) specs, Int i, List(Fwd) acc) {
     return parse_fwds(specs, i + 1, acc.concat([f]));
 }
 
-@requires(network, declassify)
+@requires(network, declassify, clock(readonly))
 Int run_forwards(Conn c, List(Fwd) fs) {
     Mux m = mux_new(c, fs);
     if (str_len(m.err) > 0) { eprintln("pylon: " + m.err); return 1; }
@@ -599,15 +617,18 @@ Int via_jump(Str verb, Opts o) {
     Int jport = if (str_len(jh.rest) > 0) { str_parse_int(ps) } else { 22 };
     Str target = target_host(verb, o);
     if (str_len(target) == 0) { return usage(); }
-    Opts jo = Opts {.port = jport, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = o.pflags, .fwds = [], .rest = [], .err = ""};
+    // --allow-no-strict is for the target named on the command line only:
+    // a jump host always needs strict key exchange.
+    Opts jo = Opts {.port = jport, .no_strict = false, .no_obfuscate = o.no_obfuscate, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = o.pflags, .fwds = [], .rest = [], .err = ""};
     Authed ja = login(uh[0], jh.host, jo, -1);
-    if (!ja.ok) { eprintln("pylon: jump host " + jh.host + ": " + ja.why); return 1; }
+    Str scope = if (o.no_strict && str_contains(ja.why, "strict key exchange")) { "\n       (--allow-no-strict applies only to the target host, never to a jump host)" } else { "" };
+    if (!ja.ok) { eprintln("pylon: jump host " + jh.host + ": " + ja.why + scope); return 1; }
     Pipe p = pipe_pair();
     if (str_len(p.err) > 0) { eprintln("pylon: " + p.err); return 1; }
     Conn jc = ja.c;
     Int pa = p.a;
     Int tport = o.port;
-    Result(Int, RegionError) r = spawn (network, declassify) { return relay(jc, pa, target, tport); };
+    Result(Int, RegionError) r = spawn (network, declassify, clock(readonly)) { return relay(jc, pa, target, tport); };
     Int rc = dispatch(verb, o, p.b);
     _ = resid_tcp_shutdown(p.b);
     _ = resid_tcp_close(p.b);

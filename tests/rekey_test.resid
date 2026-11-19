@@ -1,0 +1,49 @@
+// When Pylon starts a rekey (SPEC 5, core/transport.resid), and the
+// sequence-number wrap it refuses (core/cipher.resid). The exchange itself,
+// and the data around it, are checked against OpenSSH by tests/interop.sh.
+
+import "crypto.resid";
+import "../core/wire.resid";
+import "../core/cipher.resid";
+import "../core/transport.resid";
+
+Meter fresh(Int at) { return Meter {.tx_b = 0, .rx_b = 0, .tx_p = 0, .rx_p = 0, .at = at, .max_b = rekey_bytes(), .max_p = rekey_packets(), .max_ns = rekey_ns()}; }
+
+Meter with_counts(Int tx_b, Int rx_b, Int tx_p, Int rx_p) {
+    return Meter {.tx_b = tx_b, .rx_b = rx_b, .tx_p = tx_p, .rx_p = rx_p, .at = 0, .max_b = rekey_bytes(), .max_p = rekey_packets(), .max_ns = rekey_ns()};
+}
+
+test "the limits are SPEC 5's" {
+    assert(rekey_bytes() == 1073741824, "1 GiB");
+    assert(rekey_ns() == 3600 * 1000000000, "one hour");
+    assert(rekey_packets() == 2147483648, "2^31 packets, half the sequence space");
+}
+
+test "no rekey below every limit" {
+    assert(!meter_due(with_counts(1073741823, 1073741823, 2147483647, 2147483647), 3600 * 1000000000 - 1), "just below");
+    assert(!meter_due(fresh(5), 5), "a fresh meter");
+}
+
+test "a rekey at each limit, in either direction" {
+    assert(meter_due(with_counts(1073741824, 0, 0, 0), 0), "1 GiB sent");
+    assert(meter_due(with_counts(0, 1073741824, 0, 0), 0), "1 GiB received");
+    assert(meter_due(with_counts(0, 0, 2147483648, 0), 0), "2^31 packets sent");
+    assert(meter_due(with_counts(0, 0, 0, 2147483648), 0), "2^31 packets received");
+    assert(meter_due(fresh(7), 7 + 3600 * 1000000000), "an hour after the last exchange");
+}
+
+test "test hooks only lower the limits" {
+    Conn c = conn_new(-1);
+    Conn low = rekey_limits(c, 262144, 40, 1);
+    assert(low.m.max_b == 262144 && low.m.max_p == 40 && low.m.max_ns == 1000000000, "lowered");
+    Conn high = rekey_limits(c, 1099511627776, 4294967296, 86400);
+    assert(high.m.max_b == rekey_bytes() && high.m.max_p == rekey_packets() && high.m.max_ns == rekey_ns(), "not raised");
+    Conn none = rekey_limits(c, 0, -5, 0);
+    assert(none.m.max_b == rekey_bytes() && none.m.max_p == rekey_packets() && none.m.max_ns == rekey_ns(), "defaults kept");
+}
+
+test "the last sequence number is spent: it would wrap and repeat a nonce" {
+    assert(!seq_spent(dir_seq(dir_none(), 0)), "0");
+    assert(!seq_spent(dir_seq(dir_none(), 4294967294)), "2^32 - 2");
+    assert(seq_spent(dir_seq(dir_none(), 4294967295)), "2^32 - 1");
+}
