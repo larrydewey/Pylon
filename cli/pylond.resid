@@ -441,10 +441,13 @@ XL put_step(Link l, Xf x, Int fd, Bool lost, Int now) {
         Xf x1 = xf_out(xf_put(x, start, size, in[16..48], 0, err), 1, x.out, x.sent);
         return put_step(take_inbox(l, x.sid, 48), x1, if (r.len() == 0) { -1 } else { fd }, lost || r.len() == 0, now);
     }
-    // Stage 1: bytes to the file (none past the size promised), 64 KiB or
-    // the rest at a time (a quarter of the stream's window), so the helper
-    // is asked once per chunk, not once per datagram.
-    if (!ended && in.len() < 65536) { return XL {.l = l, .x = x, .lost = lost}; }
+    // Stage 1: bytes to the file (none past the size promised), 8 KiB or
+    // the rest at a time, so the helper is asked once per few datagrams,
+    // not once per datagram. Not more: every datagram that arrives while
+    // the bytes wait is appended by copying those already held, so a
+    // 64 KiB batch copied about 2 MB per chunk and a 40 MB put ran pylond
+    // out of memory.
+    if (!ended && in.len() < 8192) { return XL {.l = l, .x = x, .lost = lost}; }
     Bool over = x.start + x.wrote + in.len() > x.size;
     List(Int) r = if (in.len() == 0 || str_len(x.err) > 0 || over) { [0] } else { xcall(fd, xfer_req(4, x.path, in)) };
     Str err = if (str_len(x.err) > 0) { x.err } else { if (over) { "more bytes than promised" } else { answer_err(r) } };
