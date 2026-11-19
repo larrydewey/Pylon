@@ -7,6 +7,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../backend/select.dart';
 import '../theme.dart';
 import 'keys.dart';
 import 'screen.dart';
@@ -192,7 +193,7 @@ class TermViewState extends State<TermView> {
     final t = selection;
     if (t == null) return;
     clearSelection();
-    await Clipboard.setData(ClipboardData(text: t));
+    await copySensitive(t);
   }
 
   void _selectAll() {

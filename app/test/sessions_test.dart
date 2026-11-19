@@ -76,6 +76,52 @@ void main() {
     expect(find.text('ENDED'), findsNothing);
   });
 
+  // A title the host sets is the host's word: it never stands in for the
+  // host's name in Pylon's own header or list.
+  const spoof = 'prod-db \u202E(trusted)\nroot@bank';
+  const spoofShown = 'prod-db <U+202E>(trusted)<U+000A>root@bank';
+
+  testWidgets("the sessions list names the host, the host's title under it, escaped", (tester) async {
+    final be = FakeBackend();
+    final st = AppState(be);
+    await st.load();
+    final s = st.open(be.hosts[0], 24, 80);
+    s.title = spoof;
+    await tester.pumpWidget(sessions(st));
+    expect(tester.widget<Text>(find.byKey(const Key('session-host-build-01'))).data, 'build-01');
+    final title = tester.widget<Text>(find.descendant(of: find.byKey(const Key('session-title-build-01')), matching: find.byType(Text)));
+    expect(title.data, spoofShown);
+    expect(title.maxLines, 1);
+    expect(title.style!.fontSize!, lessThan(16));
+    final host = tester.getTopLeft(find.byKey(const Key('session-host-build-01')));
+    expect(tester.getTopLeft(find.byKey(const Key('session-title-build-01'))).dy, greaterThan(host.dy), reason: 'under the name');
+    expect(find.text(spoof), findsNothing);
+  });
+
+  testWidgets("the terminal page's header is the host's name; the host's title is under it, escaped", (tester) async {
+    final be = FakeBackend();
+    final st = AppState(be);
+    await st.load();
+    final h = be.hosts[0];
+    await tester.pumpWidget(MaterialApp(theme: pylonTheme(), home: TerminalPage(st: st, host: h)));
+    await tester.pump();
+    expect(tester.widget<Text>(find.byKey(const Key('header-host'))).data, 'build-01');
+    expect(find.byKey(const Key('header-title')), findsNothing);
+
+    final s = be.opened.single;
+    s.title = spoof;
+    s.changed();
+    await tester.pump();
+    await tester.pump();
+    expect(tester.widget<Text>(find.byKey(const Key('header-host'))).data, 'build-01', reason: 'not replaced by the title');
+    final title = tester.widget<Text>(find.descendant(of: find.byKey(const Key('header-title')), matching: find.byType(Text)));
+    expect(title.data, spoofShown);
+    expect(title.maxLines, 1);
+    expect(title.style!.color, P.muted);
+    expect(find.text(spoof), findsNothing);
+    expect(tester.takeException(), isNull, reason: 'the header has room for both');
+  });
+
   testWidgets('the terminal page disconnects a live session and closes an ended one', (tester) async {
     final be = FakeBackend();
     final st = AppState(be);

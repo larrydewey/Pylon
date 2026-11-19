@@ -8,6 +8,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:pylon/backend/clip.dart';
 import 'package:pylon/backend/model.dart';
 import 'package:pylon/term/screen.dart';
 import 'package:pylon/term/term_view.dart';
@@ -88,17 +89,18 @@ void main() {
     await tester.pump();
     expect(view.currentState!.selection, 'hello world\nsecond');
 
-    String? copied;
-    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (c) async {
-      if (c.method == 'Clipboard.setData') copied = (c.arguments as Map)['text'] as String;
-      return null;
-    });
+    final clip = fakeClipboard(tester);
     await tester.tap(find.byKey(const Key('sel-copy')));
     await tester.pump();
-    expect(copied, 'hello world\nsecond');
+    expect(clip.text, 'hello world\nsecond');
     expect(view.currentState!.selecting, false);
     expect(sent, isEmpty);
     expect(find.byType(BottomSheet), findsNothing);
+    // Cleared after 60 seconds, still being ours (SPEC 15).
+    await tester.pump(const Duration(seconds: 59));
+    expect(clip.text, 'hello world\nsecond');
+    await tester.pump(const Duration(seconds: 2));
+    expect(clip.text, '');
   });
 
   testWidgets('a drag before the long press scrolls instead; a tap clears a selection', (tester) async {
@@ -148,34 +150,125 @@ void main() {
     expect(view.currentState!.selection, ' main  1:zsh\nleft one\nleft two\nleft three');
   });
 
-  testWidgets('a program copying again and again gets one sheet, offering its latest', (tester) async {
-    final s = FakeSession(Host.local());
+  Uint8List req(String t) => Uint8List.fromList(base64.encode(utf8.encode(t)).codeUnits);
+
+  Future<BuildContext> host(WidgetTester tester) async {
     late BuildContext ctx;
     await tester.pumpWidget(MaterialApp(theme: pylonTheme(), home: Scaffold(body: Builder(builder: (c) {
       ctx = c;
       return const SizedBox();
     }))));
-    Uint8List req(String t) => Uint8List.fromList(base64.encode(utf8.encode(t)).codeUnits);
+    return ctx;
+  }
+
+  testWidgets('a program copying again and again gets one sheet; what it shows is what Allow copies', (tester) async {
+    final s = FakeSession(Host.local());
+    final ctx = await host(tester);
+    final clip = fakeClipboard(tester);
     s.clipboardRequests.add(req('first'));
     askClipboard(ctx, s);
     await tester.pumpAndSettle();
+    expect(find.byKey(const Key('clip-waiting')), findsNothing);
     for (final t in ['second', 'third']) {
       s.clipboardRequests.add(req(t));
       askClipboard(ctx, s);
       await tester.pumpAndSettle();
     }
+    expect(find.byType(BottomSheet), findsOneWidget, reason: "writes don't stack sheets");
+    expect(find.text('first'), findsOneWidget, reason: 'the open sheet never changes what it offers');
+    expect(find.text('third'), findsNothing);
+    expect(find.byKey(const Key('clip-waiting')), findsOneWidget);
+    expect(s.clipboardRequests, isEmpty);
+
+    await tester.tap(find.byKey(const Key('clip-allow')));
+    await tester.pumpAndSettle();
+    expect(clip.text, 'first', reason: 'Allow copies what the principal read');
+    expect(clip.writes, 1);
+
+    // The latest of the writes that came meanwhile, in a sheet of its own.
     expect(find.byType(BottomSheet), findsOneWidget);
     expect(find.text('third'), findsOneWidget);
-
-    String? copied;
-    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (c) async {
-      if (c.method == 'Clipboard.setData') copied = (c.arguments as Map)['text'] as String;
-      return null;
-    });
+    expect(find.text('second'), findsNothing, reason: 'only the latest waits');
+    expect(find.byKey(const Key('clip-waiting')), findsNothing);
     await tester.tap(find.byKey(const Key('clip-deny')));
     await tester.pumpAndSettle();
-    expect(copied, isNull, reason: "don't allow copies nothing");
+    expect(clip.text, 'first', reason: "don't allow copies nothing");
+    expect(clip.writes, 1);
     expect(find.byType(BottomSheet), findsNothing);
-    expect(s.clipboardRequests, isEmpty);
+
+    // The copy expires after 60 seconds.
+    await tester.pump(const Duration(seconds: 61));
+    expect(clip.text, '');
   });
+
+  testWidgets('the sheet shows all of the text, escaped, with its length and lines', (tester) async {
+    final s = FakeSession(Host(name: 'build-01', user: 'u', address: '10.0.0.1'));
+    final ctx = await host(tester);
+    fakeClipboard(tester);
+    final long = '${List.generate(80, (i) => 'line $i ${'x' * 30}').join('\n')}\nrm -rf ~ \u202Egnp.exe\u001b[2J END';
+    s.clipboardRequests.add(req(long));
+    askClipboard(ctx, s);
+    await tester.pumpAndSettle();
+    expect(find.text('Let build-01 copy to your clipboard?'), findsOneWidget);
+    final offer = tester.widget<Text>(find.byKey(const Key('clip-offer')));
+    final shown = offer.data!;
+    expect(shown, contains('line 0 '));
+    expect(shown, contains('line 79 '));
+    expect(shown, endsWith('rm -rf ~ <U+202E>gnp.exe<U+001B>[2J END'), reason: 'all of it, its controls shown as codes');
+    expect(shown, isNot(contains('\u202E')));
+    expect(offer.style!.fontFamily, mono);
+    final (chars, lines) = clipStats(long);
+    expect(lines, 81);
+    expect(find.text('$chars characters · 81 lines'), findsOneWidget);
+    // Too long for the sheet: it scrolls, and the buttons stay in reach.
+    expect(find.byKey(const Key('clip-allow')).hitTestable(), findsOneWidget);
+    await tester.drag(find.byKey(const Key('clip-scroll')), const Offset(0, -5000));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('clip-deny')));
+    await tester.pumpAndSettle();
+    expect(find.byType(BottomSheet), findsNothing);
+  });
+
+  test('clipStats counts characters and lines', () {
+    expect(clipStats(''), (0, 0));
+    expect(clipStats('a'), (1, 1));
+    expect(clipStats('a\n'), (2, 1));
+    expect(clipStats('a\nb'), (3, 2));
+    expect(clipStats('\u{1F600}'), (1, 1), reason: 'characters, not UTF-16 units');
+  });
+
+  testWidgets('an expiring copy leaves alone what was copied since', (tester) async {
+    final clip = fakeClipboard(tester);
+    final e = ExpiringClipboard();
+    await e.copy('secret');
+    clip.text = 'something else';
+    await tester.pump(const Duration(seconds: 61));
+    expect(clip.text, 'something else');
+    await e.copy('one');
+    await tester.pump(const Duration(seconds: 30));
+    await e.copy('two');
+    await tester.pump(const Duration(seconds: 31));
+    expect(clip.text, 'two', reason: 'a newer copy restarts the clock');
+    await tester.pump(const Duration(seconds: 30));
+    expect(clip.text, '');
+  });
+}
+
+/// The platform clipboard, in memory.
+class FakeClip {
+  String? text;
+  int writes = 0;
+}
+
+FakeClip fakeClipboard(WidgetTester tester) {
+  final clip = FakeClip();
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (c) async {
+    if (c.method == 'Clipboard.setData') {
+      clip.text = (c.arguments as Map)['text'] as String;
+      clip.writes++;
+    }
+    if (c.method == 'Clipboard.getData') return clip.text == null ? null : {'text': clip.text};
+    return null;
+  });
+  return clip;
 }
