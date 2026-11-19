@@ -1,12 +1,21 @@
 // SFTP version 3 (draft-ietf-secsh-filexfer-02, the version OpenSSH
-// speaks) over a session channel: copying one file each way (SPEC 11).
+// speaks) over a session channel (SPEC 11 "Files"): copying one file each
+// way, and the operations of a file browser (`pylon sftp`, the app's
+// Files page): listing, stat, making and removing directories, removing,
+// moving and copying files and trees.
 //
 //   pylon get USER@HOST:REMOTE LOCAL     pylon put LOCAL USER@HOST:REMOTE
+//   pylon sftp USER@HOST[:DIR]
 //
 // The local path is always the one the principal typed; nothing the
-// server says chooses where a file lands. A local file is never replaced
-// unless --force is given. Server messages are shown escaped. Requests
-// are sequential (one outstanding at a time), 32 KiB each.
+// server says chooses where a file lands. Nothing is ever replaced
+// unless the principal said so: a local file needs --force, a move or a
+// copy refuses a destination that exists (a move uses the v3 RENAME,
+// which fails rather than replaces; a copy opens its target with
+// O_EXCL). Trees are walked without following symbolic links: a link is
+// removed as a link, and a copy skips it. Server messages and names are
+// shown escaped. Requests are sequential (one outstanding at a time),
+// 32 KiB each.
 
 import "crypto.resid";
 import "wire.resid";
@@ -19,27 +28,47 @@ Int fx_open() { return 3; }
 Int fx_close() { return 4; }
 Int fx_read() { return 5; }
 Int fx_write() { return 6; }
+Int fx_lstat() { return 7; }
+Int fx_opendir() { return 11; }
+Int fx_readdir() { return 12; }
+Int fx_remove() { return 13; }
+Int fx_mkdir() { return 14; }
+Int fx_rmdir() { return 15; }
+Int fx_realpath() { return 16; }
+Int fx_stat() { return 17; }
+Int fx_rename() { return 18; }
 Int fx_status() { return 101; }
 Int fx_handle() { return 102; }
 Int fx_data() { return 103; }
+Int fx_name() { return 104; }
+Int fx_attrs() { return 105; }
+Int fx_extended() { return 200; }
 
 Int fx_ok() { return 0; }
 Int fx_eof() { return 1; }
+Int fx_no_such_file() { return 2; }
 
 Int pf_read() { return 1; }
 Int pf_write() { return 2; }
 Int pf_creat() { return 8; }
 Int pf_trunc() { return 16; }
+Int pf_excl() { return 32; }
 
-Int chunk() { return 32768; }
-// The largest SFTP packet accepted from the server (a 32 KiB data reply
-// plus headers, with room to spare).
+pub Int chunk() { return 32768; }
+// The largest SFTP packet accepted from the server (a 32 KiB data reply,
+// or a directory's worth of names, with room to spare).
 Int max_packet() { return 262144; }
+// The most entries one listing holds.
+Int max_entries() { return 100000; }
 
-// A session with its next request id.
-pub type Sftp = { Chan ch; Int id; Str err; };
+// A session with its next request id, and the extensions the server
+// named in its VERSION (copy-data@openssh.com lets a copy stay on the
+// server).
+pub type Sftp = { Chan ch; Int id; Str err; List(Str) exts; };
 
-Sftp sftp_err(Sftp s, Str e) { return Sftp {.ch = s.ch, .id = s.id, .err = e}; }
+pub Sftp sftp_err(Sftp s, Str e) { return Sftp {.ch = s.ch, .id = s.id, .err = e, .exts = s.exts}; }
+pub Sftp sftp_ok(Sftp s) { return Sftp {.ch = s.ch, .id = s.id, .err = "", .exts = s.exts}; }
+pub Bool sftp_good(Sftp s) { return str_len(s.err) == 0; }
 
 // A reply: type, request id (or the version for VERSION), the rest.
 pub type Reply = { Sftp s; Int t; Int id; List(Int) body; };
@@ -49,47 +78,65 @@ Reply reply_err(Sftp s, Str e) { return Reply {.s = sftp_err(s, e), .t = -1, .id
 @requires(network, declassify)
 pub Sftp sftp_start(Chan ch0) {
     Chan ch = request(ch0, "subsystem", sstr("sftp"));
-    if (!chan_ok(ch)) { return Sftp {.ch = ch, .id = 1, .err = "the server has no SFTP service: " + ch.err}; }
-    Sftp s0 = Sftp {.ch = capturing(ch), .id = 1, .err = ""};
+    if (!chan_ok(ch)) { return Sftp {.ch = ch, .id = 1, .err = "the server has no SFTP service: " + ch.err, .exts = []}; }
+    Sftp s0 = Sftp {.ch = capturing(ch), .id = 1, .err = "", .exts = []};
     Sftp s1 = send(s0, [fx_init()].concat(u32_be(3)));
     Reply r = next_reply(s1);
     if (str_len(r.s.err) > 0) { return r.s; }
     if (r.t != fx_version() || r.id != 3) { return sftp_err(r.s, "the server does not speak SFTP version 3"); }
-    return r.s;
+    return Sftp {.ch = r.s.ch, .id = r.s.id, .err = "", .exts = ext_names(rd(r.body), 0, [])};
+}
+
+// The names of the extension pairs (name, data) in a VERSION reply.
+List(Str) ext_names(Rd r, Int n, List(Str) acc) {
+    if (n >= 64 || rd_done(r)) { return acc; }
+    Got name = rd_str(r);
+    Got data = rd_str(name.r);
+    if (!rd_ok(data.r)) { return acc; }
+    return ext_names(data.r, n + 1, acc.concat([ascii_text(name.v)]));
 }
 
 @requires(network, declassify)
 Sftp send(Sftp s, List(Int) body) {
     if (str_len(s.err) > 0) { return s; }
     Chan c2 = send_data(s.ch, u32_be(body.len()).concat(body));
-    if (!chan_ok(c2)) { return Sftp {.ch = c2, .id = s.id, .err = c2.err}; }
-    return Sftp {.ch = c2, .id = s.id, .err = ""};
+    if (!chan_ok(c2)) { return Sftp {.ch = c2, .id = s.id, .err = c2.err, .exts = s.exts}; }
+    return Sftp {.ch = c2, .id = s.id, .err = "", .exts = s.exts};
 }
 
 // The next whole SFTP packet from the channel.
 @requires(network, declassify)
 Reply next_reply(Sftp s) {
     if (str_len(s.err) > 0) { return Reply {.s = s, .t = -1, .id = -1, .body = []}; }
+    // Failures carry the channel as it now is (closed, or failed), so the
+    // session is never continued from a stale copy of it.
     Chan a = await_bytes(s.ch, 4);
-    if (!chan_ok(a) || a.inbox.len() < 4) { return reply_err(s, "the SFTP session ended"); }
+    if (!chan_ok(a) || a.inbox.len() < 4) { return reply_err(on_chan(s, closed_chan(a)), "the SFTP session ended"); }
     Int n = be32(a.inbox, 0);
-    if (n < 5 || n > max_packet()) { return reply_err(s, "the server sent a malformed SFTP packet"); }
+    if (n < 5 || n > max_packet()) { return reply_err(on_chan(s, closed_chan(a)), "the server sent a malformed SFTP packet"); }
     Chan b = await_bytes(a, 4 + n);
-    if (!chan_ok(b) || b.inbox.len() < 4 + n) { return reply_err(s, "the SFTP session ended mid-packet"); }
+    if (!chan_ok(b) || b.inbox.len() < 4 + n) { return reply_err(on_chan(s, closed_chan(b)), "the SFTP session ended mid-packet"); }
     List(Int) pkt = b.inbox[4..4 + n];
     Chan rest = consume(b, 4 + n);
     Int id = be32(pkt, 1);
-    return Reply {.s = Sftp {.ch = rest, .id = s.id, .err = ""}, .t = pkt[0], .id = id, .body = pkt[5..pkt.len()]};
+    return Reply {.s = Sftp {.ch = rest, .id = s.id, .err = "", .exts = s.exts}, .t = pkt[0], .id = id, .body = pkt[5..pkt.len()]};
+}
+
+Sftp on_chan(Sftp s, Chan ch) { return Sftp {.ch = ch, .id = s.id, .err = s.err, .exts = s.exts}; }
+
+// A channel the session can no longer use (the stream is out of step).
+Chan closed_chan(Chan ch) {
+    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .capture = ch.capture, .inbox = [], .err = ch.err};
 }
 
 // A request and its reply, matched by id.
 @requires(network, declassify)
 Reply call(Sftp s, Int t, List(Int) args) {
     Int id = s.id;
-    Sftp s1 = send(Sftp {.ch = s.ch, .id = id + 1, .err = s.err}, [t].concat(u32_be(id)).concat(args));
+    Sftp s1 = send(Sftp {.ch = s.ch, .id = id + 1, .err = s.err, .exts = s.exts}, [t].concat(u32_be(id)).concat(args));
     Reply r = next_reply(s1);
     if (str_len(r.s.err) > 0) { return r; }
-    if (r.id != id) { return reply_err(r.s, "the server answered another SFTP request"); }
+    if (r.id != id) { return reply_err(on_chan(r.s, closed_chan(r.s.ch)), "the server answered another SFTP request"); }
     return r;
 }
 
@@ -103,50 +150,424 @@ Str status_text(List(Int) body) {
 
 Int status_code(List(Int) body) { return be32(body, 0); }
 
+// A path as the principal sees it: escaped.
+pub Str shown(List(Int) path) { return display_text(path); }
+
 @requires(network, declassify)
-Reply open_remote(Sftp s, Str path, Int flags) {
-    List(Int) attrs = if ((flags & pf_creat()) != 0) { u32_be(4).concat(u32_be(384)) } else { u32_be(0) };   // mode 0600 for a new file
-    Reply r = call(s, fx_open(), sstr(path).concat(u32_be(flags)).concat(attrs));
+Reply open_remote(Sftp s, List(Int) path, Int flags, Int mode) {
+    List(Int) attrs = if ((flags & pf_creat()) != 0) { u32_be(4).concat(u32_be(mode)) } else { u32_be(0) };
+    Reply r = call(s, fx_open(), sstring(path).concat(u32_be(flags)).concat(attrs));
     if (str_len(r.s.err) > 0) { return r; }
-    if (r.t == fx_status()) { return reply_err(r.s, "cannot open " + display_text(bytes_of(path)) + " on the server: " + status_text(r.body)); }
+    if (r.t == fx_status()) { return reply_err(r.s, "cannot open " + shown(path) + " on the server: " + status_text(r.body)); }
     if (r.t != fx_handle()) { return reply_err(r.s, "unexpected reply to open"); }
-    return r;
+    Got h = rd_str(rd(r.body));
+    if (!rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return reply_err(r.s, "the server sent a malformed handle"); }
+    return Reply {.s = r.s, .t = r.t, .id = r.id, .body = h.v};
 }
 
 @requires(network, declassify)
 Sftp close_remote(Sftp s, List(Int) handle) {
-    Reply r = call(s, fx_close(), sstring(handle));
+    Reply r = call(sftp_ok(s), fx_close(), sstring(handle));
+    // A close after a failure keeps the first error.
+    return if (str_len(s.err) > 0) { sftp_err(r.s, s.err) } else { r.s };
+}
+
+// A request answered by STATUS: ok, or the error "cannot WHAT PATH".
+@requires(network, declassify)
+Sftp simple(Sftp s, Int t, List(Int) args, Str what, List(Int) path) {
+    if (!sftp_good(s)) { return s; }
+    Reply r = call(s, t, args);
+    if (str_len(r.s.err) > 0) { return r.s; }
+    if (r.t != fx_status()) { return sftp_err(r.s, "unexpected reply to " + what); }
+    if (status_code(r.body) != fx_ok()) { return sftp_err(r.s, "cannot " + what + " " + shown(path) + ": " + status_text(r.body)); }
     return r.s;
+}
+
+// ============================================================================
+// Attributes, names and paths
+// ============================================================================
+
+// kind: 0 a regular file, 1 a directory, 2 a symbolic link, 3 anything
+// else, -1 unknown (the server sent no permissions).
+pub type Attrs = { Int size; Int perms; Int mtime; Int kind; };
+
+pub Attrs no_attrs() { return Attrs {.size = 0, .perms = 0, .mtime = 0, .kind = -1}; }
+
+type GotAttrs = { Rd r; Attrs a; };
+
+pub Int kind_of(Int perms) {
+    Int t = perms & 61440;   // S_IFMT
+    if (t == 32768) { return 0; }
+    if (t == 16384) { return 1; }
+    if (t == 40960) { return 2; }
+    return 3;
+}
+
+GotInt rd_u64(Rd r) {
+    GotInt hi = rd_u32(r);
+    GotInt lo = rd_u32(hi.r);
+    // Sizes past 2^62 are not real; they read as malformed.
+    if (!rd_ok(lo.r) || hi.v >= 1073741824) { return GotInt {.r = rd_bad(r), .v = -1}; }
+    return GotInt {.r = lo.r, .v = (hi.v << 32) | lo.v};
+}
+
+GotAttrs rd_attrs(Rd r0) {
+    GotInt fl = rd_u32(r0);
+    Int f = fl.v;
+    GotInt sz = if (rd_ok(fl.r) && (f & 1) != 0) { rd_u64(fl.r) } else { GotInt {.r = fl.r, .v = 0} };
+    Got ids = if ((f & 2) != 0) { take(sz.r, 8) } else { Got {.r = sz.r, .v = []} };
+    GotInt pm = if ((f & 4) != 0) { rd_u32(ids.r) } else { GotInt {.r = ids.r, .v = -1} };
+    GotInt at = if ((f & 8) != 0) { rd_u32(pm.r) } else { GotInt {.r = pm.r, .v = 0} };
+    GotInt mt = if ((f & 8) != 0) { rd_u32(at.r) } else { GotInt {.r = at.r, .v = 0} };
+    GotInt nx = if ((f & 2147483648) != 0) { rd_u32(mt.r) } else { GotInt {.r = mt.r, .v = 0} };
+    Rd end = if (nx.v > 1024) { rd_bad(nx.r) } else { skip_pairs(nx.r, nx.v) };
+    Int perms = if (pm.v >= 0) { pm.v } else { 0 };
+    return GotAttrs {.r = end, .a = Attrs {.size = sz.v, .perms = perms, .mtime = mt.v, .kind = if (pm.v >= 0) { kind_of(pm.v) } else { -1 }}};
+}
+
+Rd skip_pairs(Rd r, Int left) {
+    if (left <= 0 || !rd_ok(r)) { return r; }
+    Got a = rd_str(r);
+    Got b = rd_str(a.r);
+    return skip_pairs(b.r, left - 1);
+}
+
+// One name in a directory, as the server spelled it (bytes), and its
+// attributes.
+pub type Entry = { List(Int) name; Attrs a; };
+
+// A path inside a directory: a name starting with / is already whole.
+pub List(Int) path_join(List(Int) dir, List(Int) name) {
+    if (name.len() > 0 && name[0] == 47) { return name; }
+    if (dir.len() == 0) { return name; }
+    if (dir[dir.len() - 1] == 47) { return dir.concat(name); }
+    return dir.concat([47]).concat(name);
+}
+
+// A path without its trailing slashes ("/" stays "/").
+pub List(Int) trimmed(List(Int) p) {
+    if (p.len() > 1 && p[p.len() - 1] == 47) { return trimmed(p[0..p.len() - 1]); }
+    return p;
+}
+
+Int last_slash(List(Int) p, Int i) {
+    if (i < 0) { return -1; }
+    if (p[i] == 47) { return i; }
+    return last_slash(p, i - 1);
+}
+
+// The last component of a path.
+pub List(Int) base_name(List(Int) p0) {
+    List(Int) p = trimmed(p0);
+    Int k = last_slash(p, p.len() - 1);
+    return p[k + 1..p.len()];
+}
+
+// The directory a path is in ("." for a bare name, "/" at the top).
+pub List(Int) dir_name(List(Int) p0) {
+    List(Int) p = trimmed(p0);
+    Int k = last_slash(p, p.len() - 1);
+    if (k < 0) { return [46]; }
+    if (k == 0) { return [47]; }
+    return p[0..k];
+}
+
+// Whether `p` is `root` or inside it (both canonical).
+pub Bool within(List(Int) p, List(Int) root) {
+    if (same_bytes(p, root)) { return true; }
+    List(Int) r = if (root.len() > 0 && root[root.len() - 1] == 47) { root } else { root.concat([47]) };
+    return p.len() > r.len() && same_bytes(p[0..r.len()], r);
+}
+
+// ============================================================================
+// Asking about paths
+// ============================================================================
+
+// found: the path exists (no error when it does not).
+pub type Stat = { Sftp s; Bool found; Attrs a; };
+
+// stat, or with `link` lstat (the link itself, not what it names).
+@requires(network, declassify)
+pub Stat stat_path(Sftp s, List(Int) path, Bool link) {
+    if (!sftp_good(s)) { return Stat {.s = s, .found = false, .a = no_attrs()}; }
+    Reply r = call(s, if (link) { fx_lstat() } else { fx_stat() }, sstring(path));
+    if (str_len(r.s.err) > 0) { return Stat {.s = r.s, .found = false, .a = no_attrs()}; }
+    if (r.t == fx_status() && status_code(r.body) == fx_no_such_file()) { return Stat {.s = r.s, .found = false, .a = no_attrs()}; }
+    if (r.t == fx_status()) { return Stat {.s = sftp_err(r.s, "cannot look at " + shown(path) + ": " + status_text(r.body)), .found = false, .a = no_attrs()}; }
+    GotAttrs g = rd_attrs(rd(r.body));
+    if (r.t != fx_attrs() || !rd_ok(g.r)) { return Stat {.s = sftp_err(r.s, "the server sent malformed attributes"), .found = false, .a = no_attrs()}; }
+    return Stat {.s = r.s, .found = true, .a = g.a};
+}
+
+pub type PathR = { Sftp s; List(Int) p; };
+
+// The server's canonical form of a path (REALPATH).
+@requires(network, declassify)
+pub PathR real_path(Sftp s, List(Int) path) {
+    if (!sftp_good(s)) { return PathR {.s = s, .p = []}; }
+    Reply r = call(s, fx_realpath(), sstring(path));
+    if (str_len(r.s.err) > 0) { return PathR {.s = r.s, .p = []}; }
+    if (r.t == fx_status()) { return PathR {.s = sftp_err(r.s, "no such directory " + shown(path) + ": " + status_text(r.body)), .p = []}; }
+    GotInt n = rd_u32(rd(r.body));
+    Got name = rd_str(n.r);
+    if (r.t != fx_name() || n.v != 1 || !rd_ok(name.r) || name.v.len() == 0) { return PathR {.s = sftp_err(r.s, "the server sent a malformed name"), .p = []}; }
+    return PathR {.s = r.s, .p = name.v};
+}
+
+// The canonical form of a path without resolving its last component: a
+// symbolic link stays the link (a cut moves the link, not what it names).
+@requires(network, declassify)
+pub PathR canon(Sftp s, List(Int) p) {
+    List(Int) b = base_name(p);
+    Bool dots = b.len() == 0 || same_bytes(b, [46]) || same_bytes(b, [46, 46]);
+    if (dots) { return real_path(s, p); }
+    PathR d = real_path(s, dir_name(p));
+    if (!sftp_good(d.s)) { return d; }
+    return PathR {.s = d.s, .p = path_join(d.p, b)};
+}
+
+pub type Listing = { Sftp s; List(Entry) items; };
+
+// A directory's entries, without "." and "..", in the server's order.
+@requires(network, declassify)
+pub Listing list_remote(Sftp s, List(Int) path) {
+    if (!sftp_good(s)) { return Listing {.s = s, .items = []}; }
+    Reply o = call(s, fx_opendir(), sstring(path));
+    if (str_len(o.s.err) > 0) { return Listing {.s = o.s, .items = []}; }
+    if (o.t == fx_status()) { return Listing {.s = sftp_err(o.s, "cannot list " + shown(path) + ": " + status_text(o.body)), .items = []}; }
+    Got h = rd_str(rd(o.body));
+    if (o.t != fx_handle() || !rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return Listing {.s = sftp_err(o.s, "the server sent a malformed handle"), .items = []}; }
+    Listing l = read_names(o.s, h.v, path, [], 0);
+    return Listing {.s = close_remote(l.s, h.v), .items = l.items};
+}
+
+@requires(network, declassify)
+Listing read_names(Sftp s, List(Int) handle, List(Int) path, List(Entry) acc, Int n) {
+    Reply r = call(s, fx_readdir(), sstring(handle));
+    if (str_len(r.s.err) > 0) { return Listing {.s = r.s, .items = acc}; }
+    if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Listing {.s = r.s, .items = acc}; }
+    if (r.t == fx_status()) { return Listing {.s = sftp_err(r.s, "cannot list " + shown(path) + ": " + status_text(r.body)), .items = acc}; }
+    GotInt count = rd_u32(rd(r.body));
+    if (r.t != fx_name() || !rd_ok(count.r) || count.v < 0 || n + count.v > max_entries()) { return Listing {.s = sftp_err(r.s, "the server sent a malformed or oversized listing"), .items = acc}; }
+    Names got = names_acc(count.r, count.v, acc);
+    if (!rd_ok(got.r)) { return Listing {.s = sftp_err(r.s, "the server sent a malformed listing"), .items = got.acc}; }
+    return read_names(r.s, handle, path, got.acc, n + count.v);
+}
+
+type Names = { Rd r; List(Entry) acc; };
+
+Names names_acc(Rd r, Int left, List(Entry) acc) {
+    if (left <= 0 || !rd_ok(r)) { return Names {.r = r, .acc = acc}; }
+    Got name = rd_str(r);
+    Got long = rd_str(name.r);
+    GotAttrs a = rd_attrs(long.r);
+    if (!rd_ok(a.r)) { return Names {.r = a.r, .acc = acc}; }
+    Bool dots = (name.v.len() == 1 && name.v[0] == 46) || (name.v.len() == 2 && name.v[0] == 46 && name.v[1] == 46);
+    // A name with a slash or a NUL is not one entry of this directory.
+    Bool bad = name.v.len() == 0 || name.v.contains(47) || name.v.contains(0);
+    return names_acc(a.r, left - 1, if (dots || bad) { acc } else { acc.concat([Entry {.name = name.v, .a = a.a}]) });
+}
+
+// ============================================================================
+// Changing the tree
+// ============================================================================
+
+// Mode 0700 for a directory the principal makes (the server's umask
+// applies too); a copied directory keeps its original's.
+@requires(network, declassify)
+pub Sftp make_dir(Sftp s, List(Int) path) { return make_dir_mode(s, path, 448); }
+
+@requires(network, declassify)
+Sftp make_dir_mode(Sftp s, List(Int) path, Int mode) {
+    return simple(s, fx_mkdir(), sstring(path).concat(u32_be(4)).concat(u32_be(mode)), "make the directory", path);
+}
+
+@requires(network, declassify)
+pub Sftp remove_dir(Sftp s, List(Int) path) { return simple(s, fx_rmdir(), sstring(path), "remove the directory", path); }
+
+@requires(network, declassify)
+pub Sftp remove_file(Sftp s, List(Int) path) { return simple(s, fx_remove(), sstring(path), "remove", path); }
+
+// A move: SSH_FXP_RENAME, which in version 3 fails when the destination
+// exists (OpenSSH links, then unlinks), so nothing is replaced. The
+// destination is checked first for a plain message.
+@requires(network, declassify)
+pub Sftp move_path(Sftp s, List(Int) from, List(Int) to) {
+    Stat d = stat_path(s, to, true);
+    if (!sftp_good(d.s)) { return d.s; }
+    if (d.found) { return sftp_err(d.s, shown(to) + " already exists; not replaced"); }
+    return simple(d.s, fx_rename(), sstring(from).concat(sstring(to)), "move", from);
+}
+
+// What removing or copying a tree did.
+pub type Done = { Sftp s; Int files; Int dirs; Int skipped; Int bytes; };
+
+Done done_err(Done d, Str e) { return Done {.s = sftp_err(d.s, e), .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+
+// Removes a file, a link (the link, never what it names), or with `tree`
+// a directory and everything in it.
+@requires(network, declassify)
+pub Done remove_path(Sftp s, List(Int) path, Bool tree) {
+    Stat st = stat_path(s, path, true);
+    Done d0 = Done {.s = st.s, .files = 0, .dirs = 0, .skipped = 0, .bytes = 0};
+    if (!sftp_good(st.s)) { return d0; }
+    if (!st.found) { return done_err(d0, "no such file " + shown(path)); }
+    if (st.a.kind == 1 && !tree) { return done_err(d0, shown(path) + " is a directory (remove it with its contents: rm -r)"); }
+    return remove_walk(st.s, path, st.a, d0);
+}
+
+@requires(network, declassify)
+Done remove_walk(Sftp s, List(Int) path, Attrs a, Done d) {
+    if (a.kind != 1) {
+        Sftp r = remove_file(s, path);
+        return Done {.s = r, .files = d.files + if (sftp_good(r)) { 1 } else { 0 }, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes};
+    }
+    Listing l = list_remote(s, path);
+    if (!sftp_good(l.s)) { return Done {.s = l.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    Done inner = remove_each(l.s, path, l.items, 0, d);
+    if (!sftp_good(inner.s)) { return inner; }
+    Sftp r = remove_dir(inner.s, path);
+    return Done {.s = r, .files = inner.files, .dirs = inner.dirs + if (sftp_good(r)) { 1 } else { 0 }, .skipped = inner.skipped, .bytes = inner.bytes};
+}
+
+@requires(network, declassify)
+Done remove_each(Sftp s, List(Int) dir, List(Entry) es, Int i, Done d) {
+    if (i >= es.len() || !sftp_good(s)) { return Done {.s = s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    List(Int) p = path_join(dir, es[i].name);
+    // The listing's attributes come from lstat on OpenSSH; asked again
+    // when the server sent none.
+    Stat st = if (es[i].a.kind < 0) { stat_path(s, p, true) } else { Stat {.s = s, .found = true, .a = es[i].a} };
+    if (!sftp_good(st.s)) { return Done {.s = st.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    Done n = remove_walk(st.s, p, st.a, Done {.s = st.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes});
+    return remove_each(n.s, dir, es, i + 1, n);
+}
+
+// A copy of `from` (a file, or with its contents a directory) as `to`,
+// which must not exist. Both are canonical paths (the caller asked the
+// server), so a directory is never copied into itself. Symbolic links are
+// skipped (counted), never followed. With copy-data@openssh.com the bytes
+// stay on the server; otherwise they pass through Pylon, 32 KiB at a time.
+@requires(network, declassify)
+pub Done copy_path(Sftp s, List(Int) from0, List(Int) to0) {
+    // Canonical both (a directory reached through a link is its real
+    // path), so `within` sees a copy into itself whatever the spelling.
+    PathR cf = canon(s, from0);
+    PathR ct = canon(cf.s, to0);
+    if (!sftp_good(ct.s)) { return Done {.s = ct.s, .files = 0, .dirs = 0, .skipped = 0, .bytes = 0}; }
+    List(Int) from = cf.p;
+    List(Int) to = ct.p;
+    Stat st = stat_path(ct.s, from, true);
+    Done d1 = Done {.s = st.s, .files = 0, .dirs = 0, .skipped = 0, .bytes = 0};
+    if (!sftp_good(st.s)) { return d1; }
+    if (!st.found) { return done_err(d1, "no such file " + shown(from)); }
+    if (st.a.kind == 2) { return done_err(d1, shown(from) + " is a symbolic link; not copied"); }
+    if (st.a.kind != 0 && st.a.kind != 1) { return done_err(d1, shown(from) + " is not a file or a directory; not copied"); }
+    if (st.a.kind == 1 && within(to, from)) { return done_err(d1, "cannot copy " + shown(from) + " into itself"); }
+    Stat t = stat_path(st.s, to, true);
+    Done d2 = Done {.s = t.s, .files = 0, .dirs = 0, .skipped = 0, .bytes = 0};
+    if (!sftp_good(t.s)) { return d2; }
+    if (t.found) { return done_err(d2, shown(to) + " already exists; not replaced"); }
+    return copy_walk(t.s, from, to, st.a, d2);
+}
+
+@requires(network, declassify)
+Done copy_walk(Sftp s, List(Int) from, List(Int) to, Attrs a, Done d) {
+    if (a.kind == 0) {
+        Copied c = copy_file(s, from, to, a.perms & 511);
+        return Done {.s = c.s, .files = d.files + if (sftp_good(c.s)) { 1 } else { 0 }, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes + c.bytes};
+    }
+    if (a.kind != 1) { return Done {.s = s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped + 1, .bytes = d.bytes}; }
+    Sftp m = make_dir_mode(s, to, if ((a.perms & 511) == 0) { 448 } else { a.perms & 511 });
+    if (!sftp_good(m)) { return Done {.s = m, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    Listing l = list_remote(m, from);
+    if (!sftp_good(l.s)) { return Done {.s = l.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    return copy_each(l.s, from, to, l.items, 0, Done {.s = l.s, .files = d.files, .dirs = d.dirs + 1, .skipped = d.skipped, .bytes = d.bytes});
+}
+
+@requires(network, declassify)
+Done copy_each(Sftp s, List(Int) from, List(Int) to, List(Entry) es, Int i, Done d) {
+    if (i >= es.len() || !sftp_good(s)) { return Done {.s = s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    List(Int) p = path_join(from, es[i].name);
+    Stat st = if (es[i].a.kind < 0) { stat_path(s, p, true) } else { Stat {.s = s, .found = true, .a = es[i].a} };
+    if (!sftp_good(st.s)) { return Done {.s = st.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes}; }
+    Done n = copy_walk(st.s, p, path_join(to, es[i].name), st.a, Done {.s = st.s, .files = d.files, .dirs = d.dirs, .skipped = d.skipped, .bytes = d.bytes});
+    return copy_each(n.s, from, to, es, i + 1, n);
+}
+
+pub type Copied = { Sftp s; Int bytes; };
+
+// One regular file, into a new file `to` (O_EXCL: never one that exists)
+// with `mode`.
+@requires(network, declassify)
+Copied copy_file(Sftp s, List(Int) from, List(Int) to, Int mode) {
+    Reply src = open_remote(s, from, pf_read(), 0);
+    if (str_len(src.s.err) > 0) { return Copied {.s = src.s, .bytes = 0}; }
+    Reply dst = open_remote(src.s, to, pf_write() | pf_creat() | pf_excl(), if (mode == 0) { 384 } else { mode });
+    if (str_len(dst.s.err) > 0) { return Copied {.s = close_remote(dst.s, src.body), .bytes = 0}; }
+    Copied c = if (dst.s.exts.contains("copy-data")) { copy_data(dst.s, src.body, dst.body, from) } else { relay(dst.s, src.body, dst.body, 0) };
+    return Copied {.s = close_remote(close_remote(c.s, dst.body), src.body), .bytes = c.bytes};
+}
+
+// copy-data (OpenSSH 9.0+): the whole of one handle into the other, on
+// the server.
+@requires(network, declassify)
+Copied copy_data(Sftp s, List(Int) rh, List(Int) wh, List(Int) from) {
+    Reply r = call(s, fx_extended(), sstr("copy-data").concat(sstring(rh)).concat(u64_be(0)).concat(u64_be(0)).concat(sstring(wh)).concat(u64_be(0)));
+    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = 0}; }
+    if (r.t != fx_status() || status_code(r.body) != fx_ok()) { return Copied {.s = sftp_err(r.s, "cannot copy " + shown(from) + ": " + status_text(r.body)), .bytes = 0}; }
+    Reply f = call(r.s, 8, sstring(wh));   // SSH_FXP_FSTAT: how much was copied
+    GotAttrs g = rd_attrs(rd(f.body));
+    Int n = if (str_len(f.s.err) == 0 && f.t == fx_attrs() && rd_ok(g.r)) { g.a.size } else { 0 };
+    return Copied {.s = f.s, .bytes = n};
+}
+
+@requires(network, declassify)
+Copied relay(Sftp s, List(Int) rh, List(Int) wh, Int off) {
+    Reply r = call(s, fx_read(), sstring(rh).concat(u64_be(off)).concat(u32_be(chunk())));
+    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
+    if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Copied {.s = r.s, .bytes = off}; }
+    if (r.t == fx_status()) { return Copied {.s = sftp_err(r.s, "read failed: " + status_text(r.body)), .bytes = off}; }
+    Got d = rd_str(rd(r.body));
+    if (r.t != fx_data() || !rd_ok(d.r) || d.v.len() == 0 || d.v.len() > chunk()) { return Copied {.s = sftp_err(r.s, "the server sent a malformed data reply"), .bytes = off}; }
+    Reply w = call(r.s, fx_write(), sstring(wh).concat(u64_be(off)).concat(sstring(d.v)));
+    if (str_len(w.s.err) > 0) { return Copied {.s = w.s, .bytes = off}; }
+    if (w.t != fx_status() || status_code(w.body) != fx_ok()) { return Copied {.s = sftp_err(w.s, "write failed: " + status_text(w.body)), .bytes = off}; }
+    return relay(w.s, rh, wh, off + d.v.len());
 }
 
 // ============================================================================
 // get
 // ============================================================================
 
-pub type Copied = { Sftp s; Int bytes; };
-
-// REMOTE into LOCAL (created; the caller has checked it may be).
+// REMOTE into LOCAL (created; the caller has checked it may be), or with
+// `app` to standard output as frames of type 9 (the app writes them where
+// the principal chose).
 @requires(network, declassify, filesystem)
-pub Copied get_file(Sftp s0, Str remote, Str local) {
-    Reply o = open_remote(s0, remote, pf_read());
+pub Copied get_file(Sftp s0, Str remote, Str local) { return fetch(s0, bytes_of(remote), local, false); }
+
+@requires(network, declassify, filesystem)
+pub Copied fetch(Sftp s0, List(Int) remote, Str local, Bool app) {
+    Stat st = stat_path(s0, remote, false);
+    if (!sftp_good(st.s)) { return Copied {.s = st.s, .bytes = 0}; }
+    if (st.found && st.a.kind == 1) { return Copied {.s = sftp_err(st.s, shown(remote) + " is a directory"), .bytes = 0}; }
+    Reply o = open_remote(st.s, remote, pf_read(), 0);
     if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    Got h = rd_str(rd(o.body));
-    if (!rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return Copied {.s = sftp_err(o.s, "the server sent a malformed handle"), .bytes = 0}; }
-    if (!filesystem.write_bytes(local, [])) { return Copied {.s = sftp_err(close_remote(o.s, h.v), "cannot write " + local), .bytes = 0}; }
-    Copied c = get_loop(o.s, h.v, local, 0);
-    return Copied {.s = if (str_len(c.s.err) > 0) { c.s } else { close_remote(c.s, h.v) }, .bytes = c.bytes};
+    if (!app && !filesystem.write_bytes(local, [])) { return Copied {.s = sftp_err(close_remote(o.s, o.body), "cannot write " + local), .bytes = 0}; }
+    Copied c = get_loop(o.s, o.body, local, app, 0);
+    return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
 }
 
 @requires(network, declassify, filesystem)
-Copied get_loop(Sftp s, List(Int) handle, Str local, Int off) {
+Copied get_loop(Sftp s, List(Int) handle, Str local, Bool app, Int off) {
     Reply r = call(s, fx_read(), sstring(handle).concat(u64_be(off)).concat(u32_be(chunk())));
     if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
     if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Copied {.s = r.s, .bytes = off}; }
     if (r.t == fx_status()) { return Copied {.s = sftp_err(r.s, "read failed: " + status_text(r.body)), .bytes = off}; }
     Got d = rd_str(rd(r.body));
     if (r.t != fx_data() || !rd_ok(d.r) || d.v.len() == 0 || d.v.len() > chunk()) { return Copied {.s = sftp_err(r.s, "the server sent a malformed data reply"), .bytes = off}; }
-    if (!filesystem.append_bytes(local, d.v)) { return Copied {.s = sftp_err(r.s, "cannot write " + local), .bytes = off}; }
-    return get_loop(r.s, handle, local, off + d.v.len());
+    Bool wrote = if (app) { print_bytes(app_frame(9, d.v)) } else { filesystem.append_bytes(local, d.v) };
+    if (!wrote) { return Copied {.s = sftp_err(r.s, "cannot write " + local), .bytes = off}; }
+    return get_loop(r.s, handle, local, app, off + d.v.len());
 }
 
 // ============================================================================
@@ -155,21 +576,46 @@ Copied get_loop(Sftp s, List(Int) handle, Str local, Int off) {
 
 // The bytes `data` into REMOTE (created or truncated, mode 0600 if new).
 @requires(network, declassify)
-pub Copied put_file(Sftp s0, List(Int) data, Str remote) {
-    Reply o = open_remote(s0, remote, pf_write() | pf_creat() | pf_trunc());
+pub Copied put_file(Sftp s0, List(Int) data, Str remote) { return put_bytes(s0, data, bytes_of(remote), true); }
+
+// With `replace` false, a REMOTE that exists is refused (O_EXCL).
+@requires(network, declassify)
+pub Copied put_bytes(Sftp s0, List(Int) data, List(Int) remote, Bool replace) {
+    Reply o = open_remote(s0, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
     if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    Got h = rd_str(rd(o.body));
-    if (!rd_ok(h.r) || h.v.len() == 0 || h.v.len() > 256) { return Copied {.s = sftp_err(o.s, "the server sent a malformed handle"), .bytes = 0}; }
-    Copied c = put_loop(o.s, h.v, data, 0);
-    return Copied {.s = if (str_len(c.s.err) > 0) { c.s } else { close_remote(c.s, h.v) }, .bytes = c.bytes};
+    Copied c = put_loop(o.s, o.body, data, 0, 0);
+    return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
+}
+
+// A file opened for writing, to be fed in pieces (the app's uploads).
+pub type Upload = { Sftp s; List(Int) handle; Int off; };
+
+@requires(network, declassify)
+pub Upload upload_start(Sftp s, List(Int) remote, Bool replace) {
+    Reply o = open_remote(s, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
+    return Upload {.s = o.s, .handle = if (str_len(o.s.err) > 0) { [] } else { o.body }, .off = 0};
 }
 
 @requires(network, declassify)
-Copied put_loop(Sftp s, List(Int) handle, List(Int) data, Int off) {
-    if (off >= data.len()) { return Copied {.s = s, .bytes = off}; }
-    Int n = if (data.len() - off < chunk()) { data.len() - off } else { chunk() };
-    Reply r = call(s, fx_write(), sstring(handle).concat(u64_be(off)).concat(sstring(data[off..off + n])));
-    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
-    if (r.t != fx_status() || status_code(r.body) != fx_ok()) { return Copied {.s = sftp_err(r.s, "write failed: " + status_text(r.body)), .bytes = off}; }
-    return put_loop(r.s, handle, data, off + n);
+pub Upload upload_more(Upload u, List(Int) data) {
+    if (!sftp_good(u.s)) { return u; }
+    Copied c = put_loop(u.s, u.handle, data, 0, u.off);
+    return Upload {.s = c.s, .handle = u.handle, .off = c.bytes};
+}
+
+@requires(network, declassify)
+pub Copied upload_end(Upload u) {
+    if (u.handle.len() == 0) { return Copied {.s = u.s, .bytes = 0}; }
+    return Copied {.s = close_remote(u.s, u.handle), .bytes = u.off};
+}
+
+// data[i..] written at file offset `at` onward; bytes: the offset reached.
+@requires(network, declassify)
+Copied put_loop(Sftp s, List(Int) handle, List(Int) data, Int i, Int at) {
+    if (i >= data.len()) { return Copied {.s = s, .bytes = at}; }
+    Int n = if (data.len() - i < chunk()) { data.len() - i } else { chunk() };
+    Reply r = call(s, fx_write(), sstring(handle).concat(u64_be(at)).concat(sstring(data[i..i + n])));
+    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = at}; }
+    if (r.t != fx_status() || status_code(r.body) != fx_ok()) { return Copied {.s = sftp_err(r.s, "write failed: " + status_text(r.body)), .bytes = at}; }
+    return put_loop(r.s, handle, data, i + n, at + n);
 }

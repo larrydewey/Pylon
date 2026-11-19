@@ -1,0 +1,726 @@
+// pylon sftp: an interactive file browser over SFTP (SPEC 11 "Files"),
+// and the same operations for the app as framed requests (--app).
+//
+//   pylon sftp [-p PORT] [-J USER@JUMP[:PORT]] USER@HOST[:DIR]
+//
+// Commands (help lists them): ls, cd, pwd, stat, mkdir, rmdir, rm [-r],
+// mv, cp [-r], cut, copy, paste, clip, get [-f], put [-f], lls, lcd,
+// lpwd, exit. cut and copy mark remote paths; paste moves (cut) or copies
+// (copy) them into a directory. Nothing is ever replaced without -f:
+// moves and copies refuse a destination that exists, except that a copy
+// pasted beside its original is named "NAME copy" (then "NAME copy 2", ...).
+//
+// Words split at spaces; quote with '...' or "...", or escape one
+// character with a backslash. \xHH is the byte HH, so a name the listing
+// shows escaped can be typed back exactly. Names from the server are
+// always shown escaped (core/wire.resid display_text).
+
+import "crypto.resid";
+import "readline.resid";
+import "../core/wire.resid";
+import "../core/transport.resid";
+import "../core/session.resid";
+import "../core/sftp.resid";
+
+// The shell's state: the session, the remote and local working
+// directories, the clipboard (mode 0 empty, 1 cut, 2 copy; canonical
+// remote paths), and the line history.
+type Fsh = { Sftp s; List(Int) cwd; List(Int) home; Str lcwd; Int mode; List(List(Int)) clip; History h; };
+
+Fsh with_s(Fsh x, Sftp s) { return Fsh {.s = s, .cwd = x.cwd, .home = x.home, .lcwd = x.lcwd, .mode = x.mode, .clip = x.clip, .h = x.h}; }
+Fsh with_cwd(Fsh x, Sftp s, List(Int) cwd) { return Fsh {.s = s, .cwd = cwd, .home = x.home, .lcwd = x.lcwd, .mode = x.mode, .clip = x.clip, .h = x.h}; }
+Fsh with_lcwd(Fsh x, Str l) { return Fsh {.s = x.s, .cwd = x.cwd, .home = x.home, .lcwd = l, .mode = x.mode, .clip = x.clip, .h = x.h}; }
+Fsh with_clip(Fsh x, Sftp s, Int mode, List(List(Int)) clip) { return Fsh {.s = s, .cwd = x.cwd, .home = x.home, .lcwd = x.lcwd, .mode = mode, .clip = clip, .h = x.h}; }
+Fsh with_h(Fsh x, History h) { return Fsh {.s = x.s, .cwd = x.cwd, .home = x.home, .lcwd = x.lcwd, .mode = x.mode, .clip = x.clip, .h = h}; }
+
+// The session after a command: a failed request is reported and the
+// shell goes on; a channel that failed ends it.
+Fsh reported(Fsh x, Sftp s) {
+    if (sftp_good(s)) { return with_s(x, s); }
+    eprintln(s.err);
+    return with_s(x, if (chan_ok(s.ch) && !s.ch.closed) { sftp_ok(s) } else { s });
+}
+
+Bool alive(Fsh x) { return chan_ok(x.s.ch) && !x.s.ch.closed; }
+
+// ============================================================================
+// Words
+// ============================================================================
+
+type Toks = { List(List(Int)) words; List(Int) cur; Bool inw; Int quote; Str err; };
+
+// The words of a line, as bytes.
+pub Toks words(Str line) { return tok_at(line, 0, str_len(line), Toks {.words = [], .cur = [], .inw = false, .quote = 0, .err = ""}); }
+
+Toks tok_at(Str l, Int i, Int n, Toks t) {
+    if (str_len(t.err) > 0) { return t; }
+    if (i >= n) {
+        if (t.quote != 0) { return Toks {.words = t.words, .cur = [], .inw = false, .quote = 0, .err = "an unclosed quote"}; }
+        return Toks {.words = if (t.inw) { t.words.concat([t.cur]) } else { t.words }, .cur = [], .inw = false, .quote = 0, .err = ""};
+    }
+    Int c = str_char_at(l, i);
+    if (t.quote == 0 && (c == 32 || c == 9)) { return tok_at(l, i + 1, n, Toks {.words = if (t.inw) { t.words.concat([t.cur]) } else { t.words }, .cur = [], .inw = false, .quote = 0, .err = ""}); }
+    if (t.quote == 0 && (c == 39 || c == 34)) { return tok_at(l, i + 1, n, Toks {.words = t.words, .cur = t.cur, .inw = true, .quote = c, .err = ""}); }
+    if (t.quote != 0 && c == t.quote) { return tok_at(l, i + 1, n, Toks {.words = t.words, .cur = t.cur, .inw = true, .quote = 0, .err = ""}); }
+    // Backslash: \xHH a byte, else the next character as it is (not
+    // inside single quotes).
+    if (c == 92 && t.quote != 39 && i + 1 < n) {
+        Int d = str_char_at(l, i + 1);
+        Int hv = if (d == 120 && i + 3 < n) { hex_pair(str_char_at(l, i + 2), str_char_at(l, i + 3)) } else { -1 };
+        if (hv >= 0) { return tok_at(l, i + 4, n, Toks {.words = t.words, .cur = t.cur.concat([hv]), .inw = true, .quote = t.quote, .err = ""}); }
+        return tok_at(l, i + 2, n, Toks {.words = t.words, .cur = t.cur.concat(bytes_of(str_from_code(d))), .inw = true, .quote = t.quote, .err = ""});
+    }
+    return tok_at(l, i + 1, n, Toks {.words = t.words, .cur = t.cur.concat(bytes_of(str_from_code(c))), .inw = true, .quote = t.quote, .err = ""});
+}
+
+Int hex_digit(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+Int hex_pair(Int a, Int b) {
+    Int x = hex_digit(a);
+    Int y = hex_digit(b);
+    return if (x < 0 || y < 0) { -1 } else { x * 16 + y };
+}
+
+// Bytes as a local file name: strict UTF-8 with no control characters,
+// bidi controls or slashes, else "" (the principal then names it).
+pub Str local_name(List(Int) b) {
+    if (b.len() == 0 || (b.len() == 1 && b[0] == 46) || (b.len() == 2 && b[0] == 46 && b[1] == 46)) { return ""; }
+    return utf8_at(b, 0, "");
+}
+
+Str utf8_at(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    Int c = b[i];
+    Int len = if (c < 128) { 1 } else { if (c >= 194 && c < 224) { 2 } else { if (c >= 224 && c < 240) { 3 } else { if (c >= 240 && c < 245) { 4 } else { 0 } } } };
+    if (len == 0 || i + len > b.len()) { return ""; }
+    Int cp = if (len == 1) { c } else { if (len == 2) { ((c & 31) << 6) | cont(b, i + 1) } else { if (len == 3) { ((c & 15) << 12) | (cont(b, i + 1) << 6) | cont(b, i + 2) } else { ((c & 7) << 18) | (cont(b, i + 1) << 12) | (cont(b, i + 2) << 6) | cont(b, i + 3) } } };
+    Bool contok = len == 1 || (cont_ok(b, i + 1, len - 1));
+    Bool overlong = (len == 3 && cp < 2048) || (len == 4 && (cp < 65536 || cp > 1114111));
+    Bool surrogate = cp >= 55296 && cp < 57344;
+    Bool control = cp < 32 || cp == 127 || (cp >= 128 && cp < 160) || cp == 47;
+    Bool bidi = (cp >= 8234 && cp <= 8238) || (cp >= 8294 && cp <= 8297) || cp == 8206 || cp == 8207 || cp == 1564;
+    if (!contok || overlong || surrogate || control || bidi) { return ""; }
+    return utf8_at(b, i + len, acc + str_from_code(cp));
+}
+
+Int cont(List(Int) b, Int i) { return b[i] & 63; }
+
+Bool cont_ok(List(Int) b, Int i, Int left) {
+    if (left <= 0) { return true; }
+    return (b[i] & 192) == 128 && cont_ok(b, i + 1, left - 1);
+}
+
+// ============================================================================
+// Showing entries
+// ============================================================================
+
+Bool bytes_lt(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len()) { return i < b.len(); }
+    if (i >= b.len()) { return false; }
+    if (a[i] != b[i]) { return a[i] < b[i]; }
+    return bytes_lt(a, b, i + 1);
+}
+
+// Entries sorted by name (merge sort).
+pub List(Entry) sorted(List(Entry) es) {
+    if (es.len() < 2) { return es; }
+    Int mid = es.len() / 2;
+    return merged(sorted(es[0..mid]), sorted(es[mid..es.len()]), 0, 0, []);
+}
+
+List(Entry) merged(List(Entry) a, List(Entry) b, Int i, Int j, List(Entry) acc) {
+    if (i >= a.len()) { return acc.concat(b[j..b.len()]); }
+    if (j >= b.len()) { return acc.concat(a[i..a.len()]); }
+    if (bytes_lt(b[j].name, a[i].name, 0)) { return merged(a, b, i, j + 1, acc.concat([b[j]])); }
+    return merged(a, b, i + 1, j, acc.concat([a[i]]));
+}
+
+Str mode_text(Attrs a) {
+    Str t = if (a.kind == 1) { "d" } else { if (a.kind == 2) { "l" } else { if (a.kind == 0) { "-" } else { "?" } } };
+    return t + rwx(a.perms >> 6) + rwx(a.perms >> 3) + rwx(a.perms);
+}
+
+Str rwx(Int p) {
+    return (if ((p & 4) != 0) { "r" } else { "-" }) + (if ((p & 2) != 0) { "w" } else { "-" }) + (if ((p & 1) != 0) { "x" } else { "-" });
+}
+
+// A Unix time as YYYY-MM-DD HH:MM (UTC).
+pub Str when_text(Int t) {
+    if (t <= 0) { return "                "; }
+    Int days = t / 86400;
+    Int secs = t % 86400;
+    // Days to a civil date (H. Hinnant's algorithm).
+    Int z = days + 719468;
+    Int era = z / 146097;
+    Int doe = z - era * 146097;
+    Int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    Int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    Int mp = (5 * doy + 2) / 153;
+    Int d = doy - (153 * mp + 2) / 5 + 1;
+    Int m = if (mp < 10) { mp + 3 } else { mp - 9 };
+    Int y = yoe + era * 400 + if (m <= 2) { 1 } else { 0 };
+    return f"{y}-{m:zero, width 2}-{d:zero, width 2} {secs / 3600:zero, width 2}:{(secs % 3600) / 60:zero, width 2}";
+}
+
+pub Str entry_line(Entry e) {
+    Str suffix = if (e.a.kind == 1) { "/" } else { if (e.a.kind == 2) { "@" } else { "" } };
+    return mode_text(e.a) + " " + f"{e.a.size:width 12}" + " " + when_text(e.a.mtime) + " " + shown(e.name) + suffix;
+}
+
+Bool print_entries(List(Entry) es, Int i) {
+    if (i >= es.len()) { return true; }
+    println(entry_line(es[i]));
+    return print_entries(es, i + 1);
+}
+
+// ============================================================================
+// Paths
+// ============================================================================
+
+// A remote path the principal typed, relative to the working directory.
+List(Int) remote(Fsh x, List(Int) p) { return path_join(x.cwd, p); }
+
+Str local(Fsh x, Str p) {
+    if (str_starts_with(p, "/") || str_len(x.lcwd) == 0) { return p; }
+    return x.lcwd + "/" + p;
+}
+
+// ============================================================================
+// Commands
+// ============================================================================
+
+Bool help() {
+    println("Remote:  ls [PATH]  cd [DIR]  pwd  stat PATH  mkdir DIR  rmdir DIR  rm [-r] PATH...");
+    println("         mv SRC... DST       move or rename (DST an existing directory: into it)");
+    println("         cp [-r] SRC... DST  copy (-r for directories)");
+    println("         cut PATH...  copy PATH...   mark paths; paste [DIR] moves or copies them");
+    println("         clip  clip clear            what is marked; forget it");
+    println("Files:   get [-f] REMOTE [LOCAL]   put [-f] LOCAL [REMOTE]");
+    println("Local:   lls [DIR]  lcd DIR  lpwd");
+    println("         help  exit");
+    println("Nothing is replaced without -f. Quote names with spaces, or write \\xHH for a byte.");
+    return true;
+}
+
+// Splits a leading flag (-r, -f) off the arguments.
+type Flagged = { Bool on; List(List(Int)) rest; };
+
+Flagged flag(List(List(Int)) a, Str f) {
+    if (a.len() > 0 && same_bytes(a[0], bytes_of(f))) { return Flagged {.on = true, .rest = a[1..a.len()]}; }
+    return Flagged {.on = false, .rest = a};
+}
+
+@requires(network, declassify, filesystem, environment)
+Fsh run(Fsh x, Str cmd, List(List(Int)) a) {
+    if (cmd == "help" || cmd == "?") { _ = help(); return x; }
+    if (cmd == "pwd") { println(shown(x.cwd)); return x; }
+    if (cmd == "cd") { return cmd_cd(x, a); }
+    if (cmd == "ls" || cmd == "dir") { return cmd_ls(x, a); }
+    if (cmd == "stat") { return cmd_stat(x, a); }
+    if (cmd == "mkdir") { return each_path(x, a, 0, 0); }
+    if (cmd == "rmdir") { return each_path(x, a, 0, 1); }
+    if (cmd == "rm") { return cmd_rm(x, a); }
+    if (cmd == "mv" || cmd == "rename") { return cmd_mvcp(x, a, true); }
+    if (cmd == "cp") { return cmd_mvcp(x, a, false); }
+    if (cmd == "cut") { return cmd_mark(x, a, 1); }
+    if (cmd == "copy") { return cmd_mark(x, a, 2); }
+    if (cmd == "paste") { return cmd_paste(x, a); }
+    if (cmd == "clip") { return cmd_clip(x, a); }
+    if (cmd == "get") { return cmd_get(x, a); }
+    if (cmd == "put") { return cmd_put(x, a); }
+    if (cmd == "lpwd") { println(lpwd(x)); return x; }
+    if (cmd == "lcd") { return cmd_lcd(x, a); }
+    if (cmd == "lls") { return cmd_lls(x, a); }
+    eprintln("unknown command " + display_text(bytes_of(cmd)) + " (help lists them)");
+    return x;
+}
+
+@requires(network, declassify)
+Fsh cmd_cd(Fsh x, List(List(Int)) a) {
+    if (a.len() > 1) { eprintln("cd: one directory"); return x; }
+    PathR r = real_path(x.s, if (a.len() == 0) { x.home } else { remote(x, a[0]) });
+    if (!sftp_good(r.s)) { return reported(x, r.s); }
+    Stat st = stat_path(r.s, r.p, false);
+    if (!sftp_good(st.s)) { return reported(x, st.s); }
+    if (!st.found || st.a.kind != 1) { eprintln("cd: " + shown(r.p) + " is not a directory"); return with_s(x, st.s); }
+    return with_cwd(x, st.s, r.p);
+}
+
+@requires(network, declassify)
+Fsh cmd_ls(Fsh x, List(List(Int)) a) {
+    if (a.len() > 1) { eprintln("ls: one path"); return x; }
+    List(Int) p = if (a.len() == 0) { x.cwd } else { remote(x, a[0]) };
+    Stat st = stat_path(x.s, p, true);
+    if (!sftp_good(st.s)) { return reported(x, st.s); }
+    if (!st.found) { eprintln("ls: no such file " + shown(p)); return with_s(x, st.s); }
+    // A file (or a link to a directory named on its own) lists as itself,
+    // unless it is a link to a directory and was asked for as one.
+    Stat full = if (st.a.kind == 2) { stat_path(st.s, p, false) } else { st };
+    if (!sftp_good(full.s)) { return reported(x, full.s); }
+    if (full.a.kind != 1) { println(entry_line(Entry {.name = base_name(p), .a = st.a})); return with_s(x, full.s); }
+    Listing l = list_remote(full.s, p);
+    if (!sftp_good(l.s)) { return reported(x, l.s); }
+    _ = print_entries(sorted(l.items), 0);
+    return with_s(x, l.s);
+}
+
+@requires(network, declassify)
+Fsh cmd_stat(Fsh x, List(List(Int)) a) {
+    if (a.len() != 1) { eprintln("stat: one path"); return x; }
+    List(Int) p = remote(x, a[0]);
+    Stat st = stat_path(x.s, p, true);
+    if (!sftp_good(st.s)) { return reported(x, st.s); }
+    if (!st.found) { eprintln("stat: no such file " + shown(p)); return with_s(x, st.s); }
+    Str kind = if (st.a.kind == 1) { "directory" } else { if (st.a.kind == 2) { "symbolic link" } else { if (st.a.kind == 0) { "file" } else { "other" } } };
+    println(shown(p));
+    println("  " + kind + ", " + f"{st.a.size}" + " bytes, mode " + mode_text(st.a) + f" ({st.a.perms & 4095:oct})" + ", modified " + when_text(st.a.mtime) + " UTC");
+    return with_s(x, st.s);
+}
+
+// mkdir (op 0) or rmdir (1) for each path.
+@requires(network, declassify)
+Fsh each_path(Fsh x, List(List(Int)) a, Int i, Int op) {
+    if (a.len() == 0) { eprintln(if (op == 0) { "mkdir" } else { "rmdir" } + ": give a directory"); return x; }
+    if (i >= a.len() || !alive(x)) { return x; }
+    List(Int) p = remote(x, a[i]);
+    Sftp s = if (op == 0) { make_dir(x.s, p) } else { remove_dir(x.s, p) };
+    return each_path(reported(x, s), a, i + 1, op);
+}
+
+@requires(network, declassify)
+Fsh cmd_rm(Fsh x, List(List(Int)) a0) {
+    Flagged f = flag(a0, "-r");
+    if (f.rest.len() == 0) { eprintln("rm: give a path"); return x; }
+    return rm_each(x, f.rest, 0, f.on);
+}
+
+@requires(network, declassify)
+Fsh rm_each(Fsh x, List(List(Int)) a, Int i, Bool tree) {
+    if (i >= a.len() || !alive(x)) { return x; }
+    PathR c = canon(x.s, remote(x, a[i]));
+    if (!sftp_good(c.s)) { return rm_each(reported(x, c.s), a, i + 1, tree); }
+    if (within(x.cwd, c.p) && tree) { eprintln("rm: " + shown(c.p) + " holds the working directory; cd out of it first"); return rm_each(with_s(x, c.s), a, i + 1, tree); }
+    Done d = remove_path(c.s, c.p, tree);
+    _ = if (tree && d.files + d.dirs > 1) { println("removed " + f"{d.files}" + " files and " + f"{d.dirs}" + " directories") } else { true };
+    return rm_each(reported(x, d.s), a, i + 1, tree);
+}
+
+// mv / cp SRC... DST: into DST when it is a directory, else (one SRC) as DST.
+@requires(network, declassify)
+Fsh cmd_mvcp(Fsh x, List(List(Int)) a0, Bool move) {
+    Str name = if (move) { "mv" } else { "cp" };
+    Flagged f = if (move) { Flagged {.on = true, .rest = a0} } else { flag(a0, "-r") };
+    List(List(Int)) a = f.rest;
+    if (a.len() < 2) { eprintln(name + ": give a source and a destination"); return x; }
+    PathR dst = canon(x.s, remote(x, a[a.len() - 1]));
+    if (!sftp_good(dst.s)) { return reported(x, dst.s); }
+    Stat ds = stat_path(dst.s, dst.p, false);
+    if (!sftp_good(ds.s)) { return reported(x, ds.s); }
+    Bool into = ds.found && ds.a.kind == 1;
+    if (!into && a.len() > 2) { eprintln(name + ": " + shown(dst.p) + " is not a directory"); return with_s(x, ds.s); }
+    List(List(Int)) srcs = a[0..a.len() - 1];
+    return transfer_each(with_s(x, ds.s), srcs, 0, dst.p, into, move, f.on, false);
+}
+
+// Moves (move) or copies each source into dir (into) or as dst. With
+// `dup`, a copy beside its original takes a free "NAME copy" name.
+@requires(network, declassify)
+Fsh transfer_each(Fsh x, List(List(Int)) srcs, Int i, List(Int) dst, Bool into, Bool move, Bool tree, Bool dup) {
+    if (i >= srcs.len() || !alive(x)) { return x; }
+    PathR src = canon(x.s, remote(x, srcs[i]));
+    if (!sftp_good(src.s)) { return transfer_each(reported(x, src.s), srcs, i + 1, dst, into, move, tree, dup); }
+    List(Int) to0 = if (into) { path_join(dst, base_name(src.p)) } else { dst };
+    Bool beside = dup && same_bytes(dir_name(src.p), dir_name(to0));
+    if (move && same_bytes(src.p, to0)) { eprintln(shown(src.p) + " is already there"); return transfer_each(with_s(x, src.s), srcs, i + 1, dst, into, move, tree, dup); }
+    PathR to = if (beside && !move) { free_name(src.s, dir_name(to0), base_name(to0), 0) } else { PathR {.s = src.s, .p = to0} };
+    if (!sftp_good(to.s)) { return transfer_each(reported(x, to.s), srcs, i + 1, dst, into, move, tree, dup); }
+    if (move && within(x.cwd, src.p)) { eprintln("mv: " + shown(src.p) + " holds the working directory; cd out of it first"); return transfer_each(with_s(x, to.s), srcs, i + 1, dst, into, move, tree, dup); }
+    if (move) {
+        Sftp m = move_path(to.s, src.p, to.p);
+        _ = if (sftp_good(m)) { println("moved " + shown(src.p) + " to " + shown(to.p)) } else { true };
+        return transfer_each(reported(x, m), srcs, i + 1, dst, into, move, tree, dup);
+    }
+    Stat st = stat_path(to.s, src.p, true);
+    if (!sftp_good(st.s)) { return transfer_each(reported(x, st.s), srcs, i + 1, dst, into, move, tree, dup); }
+    if (st.found && st.a.kind == 1 && !tree) { eprintln("cp: " + shown(src.p) + " is a directory (cp -r copies it with its contents)"); return transfer_each(with_s(x, st.s), srcs, i + 1, dst, into, move, tree, dup); }
+    Done d = copy_path(st.s, src.p, to.p);
+    _ = if (sftp_good(d.s)) { println("copied " + shown(src.p) + " to " + shown(to.p) + done_note(d)) } else { true };
+    return transfer_each(reported(x, d.s), srcs, i + 1, dst, into, move, tree, dup);
+}
+
+Str done_note(Done d) {
+    Str files = if (d.dirs > 0) { " (" + f"{d.files}" + " files, " + f"{d.dirs}" + " directories" } else { " (" + f"{d.bytes}" + " bytes" };
+    Str skipped = if (d.skipped > 0) { ", " + f"{d.skipped}" + " symbolic links or special files skipped" } else { "" };
+    return files + skipped + ")";
+}
+
+// "NAME copy", "NAME copy 2", ... (before an extension: "a copy.txt"),
+// the first that does not exist in dir.
+@requires(network, declassify)
+pub PathR free_name(Sftp s, List(Int) dir, List(Int) base, Int n) {
+    if (n > 99) { return PathR {.s = sftp_err(s, "no free name for a copy of " + shown(base)), .p = []}; }
+    List(Int) p = path_join(dir, copy_name(base, n));
+    Stat st = stat_path(s, p, true);
+    if (!sftp_good(st.s)) { return PathR {.s = st.s, .p = []}; }
+    if (!st.found) { return PathR {.s = st.s, .p = p}; }
+    return free_name(st.s, dir, base, n + 1);
+}
+
+pub List(Int) copy_name(List(Int) base, Int n) {
+    Int dot = last_dot(base, base.len() - 1);
+    // A leading dot (".profile") is not an extension.
+    Int at = if (dot > 0) { dot } else { base.len() };
+    List(Int) tag = bytes_of(if (n == 0) { " copy" } else { " copy " + f"{n + 1}" });
+    return base[0..at].concat(tag).concat(base[at..base.len()]);
+}
+
+Int last_dot(List(Int) b, Int i) {
+    if (i < 0) { return -1; }
+    if (b[i] == 46) { return i; }
+    return last_dot(b, i - 1);
+}
+
+// cut / copy PATH...: mark canonical paths (each must exist).
+@requires(network, declassify)
+Fsh cmd_mark(Fsh x, List(List(Int)) a, Int mode) {
+    if (a.len() == 0) { eprintln(if (mode == 1) { "cut" } else { "copy" } + ": give a path"); return x; }
+    Marked m = mark_each(x.s, x.cwd, a, 0, []);
+    if (!sftp_good(m.s) && !chan_ok(m.s.ch)) { return reported(x, m.s); }
+    if (!sftp_good(m.s)) { eprintln(m.s.err); return with_s(x, sftp_ok(m.s)); }
+    println(f"{m.paths.len()}" + (if (m.paths.len() == 1) { " path " } else { " paths " }) + (if (mode == 1) { "cut" } else { "copied" }) + "; paste [DIR] to " + (if (mode == 1) { "move" } else { "copy" }) + (if (m.paths.len() == 1) { " it" } else { " them" }));
+    return with_clip(x, m.s, mode, m.paths);
+}
+
+type Marked = { Sftp s; List(List(Int)) paths; };
+
+@requires(network, declassify)
+Marked mark_each(Sftp s, List(Int) cwd, List(List(Int)) a, Int i, List(List(Int)) acc) {
+    if (i >= a.len()) { return Marked {.s = s, .paths = acc}; }
+    PathR c = canon(s, path_join(cwd, a[i]));
+    if (!sftp_good(c.s)) { return Marked {.s = c.s, .paths = []}; }
+    Stat st = stat_path(c.s, c.p, true);
+    if (!sftp_good(st.s)) { return Marked {.s = st.s, .paths = []}; }
+    if (!st.found) { return Marked {.s = sftp_err(st.s, "no such file " + shown(c.p) + "; nothing marked"), .paths = []}; }
+    return mark_each(st.s, cwd, a, i + 1, acc.concat([c.p]));
+}
+
+@requires(network, declassify)
+Fsh cmd_paste(Fsh x, List(List(Int)) a) {
+    if (x.mode == 0) { eprintln("paste: nothing is marked (cut or copy first)"); return x; }
+    if (a.len() > 1) { eprintln("paste: one directory"); return x; }
+    PathR d = real_path(x.s, if (a.len() == 0) { x.cwd } else { remote(x, a[0]) });
+    if (!sftp_good(d.s)) { return reported(x, d.s); }
+    Stat st = stat_path(d.s, d.p, false);
+    if (!sftp_good(st.s)) { return reported(x, st.s); }
+    if (!st.found || st.a.kind != 1) { eprintln("paste: " + shown(d.p) + " is not a directory"); return with_s(x, st.s); }
+    Bool move = x.mode == 1;
+    Fsh y = transfer_each(with_s(x, st.s), x.clip, 0, d.p, true, move, true, true);
+    // What was cut has moved: the marks no longer name anything.
+    return if (move) { with_clip(y, y.s, 0, []) } else { y };
+}
+
+Fsh cmd_clip(Fsh x, List(List(Int)) a) {
+    if (a.len() == 1 && same_bytes(a[0], bytes_of("clear"))) { println("cleared"); return with_clip(x, x.s, 0, []); }
+    if (x.mode == 0) { println("nothing is marked"); return x; }
+    println(if (x.mode == 1) { "cut (paste moves):" } else { "copied (paste copies):" });
+    _ = show_paths(x.clip, 0);
+    return x;
+}
+
+Bool show_paths(List(List(Int)) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    println("  " + shown(ps[i]));
+    return show_paths(ps, i + 1);
+}
+
+@requires(network, declassify, filesystem)
+Fsh cmd_get(Fsh x, List(List(Int)) a0) {
+    Flagged f = flag(a0, "-f");
+    List(List(Int)) a = f.rest;
+    if (a.len() < 1 || a.len() > 2) { eprintln("get: get [-f] REMOTE [LOCAL]"); return x; }
+    List(Int) rp = remote(x, a[0]);
+    Str named = if (a.len() == 2) { local_name_typed(a[1]) } else { local_name(base_name(rp)) };
+    if (str_len(named) == 0) { eprintln("get: name the local file (get REMOTE LOCAL)"); return x; }
+    Str lp0 = local(x, named);
+    // An existing local directory: the file goes into it.
+    Str lp = if (filesystem.is_dir(lp0)) { lp0 + "/" + local_name(base_name(rp)) } else { lp0 };
+    if (filesystem.is_dir(lp0) && str_len(local_name(base_name(rp))) == 0) { eprintln("get: name the local file (get REMOTE LOCAL)"); return x; }
+    if (filesystem.is_dir(lp)) { eprintln("get: " + lp + " is a directory"); return x; }
+    if (filesystem.exists(lp) && !f.on) { eprintln("get: " + lp + " exists; not replaced (get -f replaces it)"); return x; }
+    Copied c = fetch(x.s, rp, lp, false);
+    _ = if (sftp_good(c.s)) { println(f"{c.bytes}" + " bytes to " + lp) } else { true };
+    return reported(x, c.s);
+}
+
+// A local path typed in the shell: the bytes as UTF-8 (slashes allowed).
+Str local_name_typed(List(Int) b) { return typed_at(b, 0, ""); }
+
+Str typed_at(List(Int) b, Int i, Str acc) {
+    if (i >= b.len()) { return acc; }
+    // Split at slashes so each part is checked as a name.
+    Int k = next_slash(b, i);
+    Str part = if (k == i) { "" } else { local_part(b[i..k]) };
+    if (k > i && str_len(part) == 0) { return ""; }
+    Str withp = acc + part;
+    return if (k >= b.len()) { withp } else { typed_at(b, k + 1, withp + "/") };
+}
+
+Str local_part(List(Int) b) {
+    if (same_bytes(b, [46]) || same_bytes(b, [46, 46])) { return display_text(b); }
+    return local_name(b);
+}
+
+Int next_slash(List(Int) b, Int i) {
+    if (i >= b.len() || b[i] == 47) { return i; }
+    return next_slash(b, i + 1);
+}
+
+@requires(network, declassify, filesystem)
+Fsh cmd_put(Fsh x, List(List(Int)) a0) {
+    Flagged f = flag(a0, "-f");
+    List(List(Int)) a = f.rest;
+    if (a.len() < 1 || a.len() > 2) { eprintln("put: put [-f] LOCAL [REMOTE]"); return x; }
+    Str typed = local_name_typed(a[0]);
+    if (str_len(typed) == 0) { eprintln("put: cannot use that local name"); return x; }
+    Str lp = local(x, typed);
+    if (!filesystem.exists(lp) || filesystem.is_dir(lp)) { eprintln("put: " + lp + " is not a file"); return x; }
+    List(Int) rp0 = if (a.len() == 2) { remote(x, a[1]) } else { path_join(x.cwd, base_name(a[0])) };
+    Stat st = stat_path(x.s, rp0, false);
+    if (!sftp_good(st.s)) { return reported(x, st.s); }
+    List(Int) rp = if (st.found && st.a.kind == 1) { path_join(rp0, base_name(a[0])) } else { rp0 };
+    Stat there = stat_path(st.s, rp, true);
+    if (!sftp_good(there.s)) { return reported(x, there.s); }
+    if (there.found && there.a.kind == 1) { eprintln("put: " + shown(rp) + " is a directory"); return with_s(x, there.s); }
+    if (there.found && !f.on) { eprintln("put: " + shown(rp) + " exists; not replaced (put -f replaces it)"); return with_s(x, there.s); }
+    // O_EXCL still guards a file that appears meanwhile.
+    Copied c = put_bytes(there.s, filesystem.read_bytes(lp), rp, f.on);
+    _ = if (sftp_good(c.s)) { println(f"{c.bytes}" + " bytes to " + shown(rp)) } else { true };
+    return reported(x, c.s);
+}
+
+@requires(environment)
+Str lpwd(Fsh x) {
+    if (str_starts_with(x.lcwd, "/")) { return x.lcwd; }
+    Str pwd = environment.get("PWD");
+    return if (str_len(x.lcwd) == 0) { pwd } else { pwd + "/" + x.lcwd };
+}
+
+@requires(filesystem)
+Fsh cmd_lcd(Fsh x, List(List(Int)) a) {
+    if (a.len() != 1) { eprintln("lcd: one directory"); return x; }
+    Str typed = local_name_typed(a[0]);
+    Str p = local(x, typed);
+    if (str_len(typed) == 0 || !filesystem.is_dir(p)) { eprintln("lcd: " + display_text(a[0]) + " is not a directory"); return x; }
+    return with_lcwd(x, p);
+}
+
+@requires(filesystem)
+Fsh cmd_lls(Fsh x, List(List(Int)) a) {
+    Str p = if (a.len() == 0) { local(x, ".") } else { local(x, local_name_typed(a[0])) };
+    if (!filesystem.is_dir(p)) { eprintln("lls: " + p + " is not a directory"); return x; }
+    _ = local_lines(p, sort(filesystem.list_dir(p)), 0);
+    return x;
+}
+
+@requires(filesystem)
+Bool local_lines(Str dir, List(Str) names, Int i) {
+    if (i >= names.len()) { return true; }
+    Str n = names[i];
+    println(display_text(bytes_of(n)) + (if (filesystem.is_dir(dir + "/" + n)) { "/" } else { "" }));
+    return local_lines(dir, names, i + 1);
+}
+
+// ============================================================================
+// The loop
+// ============================================================================
+
+List(Str) commands() { return ["cd", "clip", "copy", "cp", "cut", "exit", "get", "help", "lcd", "lls", "lpwd", "ls", "mkdir", "mv", "paste", "put", "pwd", "rm", "rmdir", "stat"]; }
+
+List(Str) complete(Str line) {
+    if (str_contains(line, " ")) { List(Str) none = []; return none; }
+    return starting(commands(), line, 0, []);
+}
+
+List(Str) starting(List(Str) xs, Str p, Int i, List(Str) acc) {
+    if (i >= xs.len()) { return acc; }
+    return starting(xs, p, i + 1, if (str_starts_with(xs[i], p)) { acc.concat([xs[i] + " "]) } else { acc });
+}
+
+// The shell: from DIR (or the login directory) until exit or end of
+// input. 0, or 1 when the session failed.
+@requires(network, declassify, filesystem, environment, terminal)
+pub Int sftp_shell(Sftp s, List(Int) dir) {
+    PathR home = real_path(s, [46]);
+    if (!sftp_good(home.s)) { eprintln("pylon: " + home.s.err); return 1; }
+    PathR start = if (dir.len() > 0) { real_path(home.s, path_join(home.p, dir)) } else { home };
+    if (!sftp_good(start.s)) { eprintln("pylon: " + start.s.err); return 1; }
+    eprintln("pylon: SFTP to the server; help lists the commands");
+    return shell_loop(Fsh {.s = start.s, .cwd = start.p, .home = home.p, .lcwd = "", .mode = 0, .clip = [], .h = history_new(200)});
+}
+
+@requires(network, declassify, filesystem, environment, terminal)
+Int shell_loop(Fsh x) {
+    if (!alive(x)) { eprintln("pylon: the SFTP session ended" + if (str_len(x.s.err) > 0) { ": " + x.s.err } else { "" }); return 1; }
+    Str prompt = "sftp " + shown(x.cwd) + "> ";
+    return match readline_with(prompt, x.h, lambda(l) { complete(l) }) {
+        Line(l) => shell_line(x, l),
+        Interrupted => shell_loop(x),
+        Eof => shell_end(x),
+    };
+}
+
+@requires(network, declassify)
+Int shell_end(Fsh x) {
+    _ = disconnect(x.s.ch.c, "done");
+    return 0;
+}
+
+@requires(network, declassify, filesystem, environment, terminal)
+Int shell_line(Fsh x0, Str l) {
+    Fsh x = if (str_len(str_trim(l)) > 0) { with_h(x0, history_add(x0.h, l)) } else { x0 };
+    Toks t = words(l);
+    if (str_len(t.err) > 0) { eprintln(t.err); return shell_loop(x); }
+    if (t.words.len() == 0) { return shell_loop(x); }
+    Str cmd = display_text(t.words[0]);
+    if (cmd == "exit" || cmd == "quit" || cmd == "bye") { return shell_end(x); }
+    return shell_loop(run(x, cmd, t.words[1..t.words.len()]));
+}
+
+// ============================================================================
+// The app (--app): framed requests
+// ============================================================================
+//
+// Frames both ways are type (1) | length (4) | payload. After login
+// (agent requests as frames 3, core/agent.resid) the core sends frame 4,
+// its payload the starting directory, then answers each request:
+//
+//   app -> core  8  op (1) | arguments, each a string (length (4) | bytes)
+//                     1 LIST path        2 REALPATH path   3 MKDIR path
+//                     4 REMOVE path      (a directory with its contents)
+//                     5 MOVE from to     6 COPY from to    (to: the new path)
+//                     7 GET path         8 PUT path | replace (1)
+//                     9 STAT path        (lstat)
+//                     10 FREE dir name   (a free "NAME copy" name in dir)
+//                9  file bytes for a PUT; an empty one ends the file
+//   core -> app  9  file bytes for a GET (before its answer)
+//                8  0 | result, or 1 | message (shown escaped)
+//
+// Results: LIST count (4) | per entry name (string) | kind (1) | size (8)
+// | perms (4) | mtime (4), kind 0 file, 1 directory, 2 link, 3 other,
+// 255 unknown; REALPATH, FREE the path; STAT found (1) | kind | size |
+// perms | mtime; COPY and REMOVE files (4) | directories (4) | skipped (4);
+// GET and PUT the bytes (8); the rest nothing. Requests are answered in
+// order, one at a time. A request the core cannot read ends the session.
+
+type AppMsg = { List(Int) buf; Int t; List(Int) p; Bool eof; };
+
+// The next whole frame on standard input.
+@requires(network)
+AppMsg next_in(List(Int) buf) {
+    if (buf.len() >= 5) {
+        Int n = be32(buf, 1);
+        if (n < 0 || n > 4194304) { return AppMsg {.buf = [], .t = -1, .p = [], .eof = true}; }
+        if (buf.len() >= 5 + n) { return AppMsg {.buf = buf[5 + n..buf.len()], .t = buf[0], .p = buf[5..5 + n], .eof = false}; }
+    }
+    List(Int) more = resid_read_some(65536);
+    if (more.len() == 0) { return AppMsg {.buf = [], .t = -1, .p = [], .eof = true}; }
+    return next_in(buf.concat(more));
+}
+
+Bool answer(List(Int) p) { return print_bytes(app_frame(8, [0].concat(p))); }
+Bool refuse(Str why) { return print_bytes(app_frame(8, [1].concat(bytes_of(why)))); }
+
+// A request's string arguments.
+List(List(Int)) req_args(Rd r, List(List(Int)) acc) {
+    if (rd_done(r) || !rd_ok(r) || acc.len() >= 4) { return acc; }
+    Got g = rd_str(r);
+    if (!rd_ok(g.r)) { return acc; }
+    return req_args(g.r, acc.concat([g.v]));
+}
+
+List(Int) attrs_bytes(Attrs a) {
+    return [if (a.kind < 0) { 255 } else { a.kind }].concat(u64_be(if (a.size < 0) { 0 } else { a.size })).concat(u32_be(a.perms)).concat(u32_be(a.mtime));
+}
+
+List(Int) entries_bytes(List(Entry) es, Int i, List(Int) acc) {
+    if (i >= es.len()) { return acc; }
+    return entries_bytes(es, i + 1, acc.concat(sstring(es[i].name)).concat(attrs_bytes(es[i].a)));
+}
+
+List(Int) done_bytes(Done d) { return u32_be(d.files).concat(u32_be(d.dirs)).concat(u32_be(d.skipped)); }
+
+// The served session after a request: its error (if any) sent as the
+// answer; a failed channel ends the loop.
+Sftp answered(Sftp s, List(Int) ok) {
+    _ = if (sftp_good(s)) { answer(ok) } else { refuse(s.err) };
+    return if (chan_ok(s.ch) && !s.ch.closed) { sftp_ok(s) } else { s };
+}
+
+@requires(network, declassify, filesystem)
+pub Int sftp_app(Sftp s) {
+    PathR home = real_path(s, [46]);
+    if (!sftp_good(home.s)) { eprintln("pylon: " + home.s.err); return 1; }
+    _ = print_bytes(app_frame(4, home.p));
+    return serve_app(home.s, []);
+}
+
+@requires(network, declassify, filesystem)
+Int serve_app(Sftp s, List(Int) buf) {
+    if (!chan_ok(s.ch) || s.ch.closed) { eprintln("pylon: the SFTP session ended" + if (str_len(s.err) > 0) { ": " + s.err } else { "" }); return 1; }
+    AppMsg m = next_in(buf);
+    if (m.eof) { _ = disconnect(s.ch.c, "done"); return 0; }
+    if (m.t == 9) { return serve_app(s, m.buf); }   // the rest of a refused PUT
+    if (m.t != 8 || m.p.len() < 1) { return serve_app(s, m.buf); }
+    Int op = m.p[0];
+    List(List(Int)) a = req_args(rd_at(m.p, 1), []);
+    Bool one = a.len() >= 1 && a[0].len() > 0;
+    Bool two = one && a.len() >= 2 && a[1].len() > 0;
+    if (!one || ((op == 5 || op == 6 || op == 10) && !two)) { _ = refuse("a malformed request"); return serve_app(s, m.buf); }
+    if (op == 8) { return serve_put(s, a[0], a.len() >= 2 && a[1].len() == 1 && a[1][0] == 1, m.buf); }
+    return serve_app(serve_op(s, op, a), m.buf);
+}
+
+@requires(network, declassify, filesystem)
+Sftp serve_op(Sftp s, Int op, List(List(Int)) a) {
+    if (op == 1) {
+        Listing l = list_remote(s, a[0]);
+        return answered(l.s, u32_be(l.items.len()).concat(entries_bytes(l.items, 0, [])));
+    }
+    if (op == 2) { PathR r = real_path(s, a[0]); return answered(r.s, r.p); }
+    if (op == 3) { return answered(make_dir(s, a[0]), []); }
+    if (op == 4) { Done d = remove_path(s, a[0], true); return answered(d.s, done_bytes(d)); }
+    if (op == 5) { return answered(move_path(s, a[0], a[1]), []); }
+    if (op == 6) { Done d = copy_path(s, a[0], a[1]); return answered(d.s, done_bytes(d)); }
+    if (op == 7) { Copied c = fetch(s, a[0], "", true); return answered(c.s, u64_be(c.bytes)); }
+    if (op == 9) { Stat st = stat_path(s, a[0], true); return answered(st.s, [if (st.found) { 1 } else { 0 }].concat(attrs_bytes(st.a))); }
+    if (op == 10) { PathR r = free_name(s, a[0], a[1], 0); return answered(r.s, r.p); }
+    _ = refuse("an unknown request");
+    return s;
+}
+
+// PUT: the file arrives as frames of type 9, an empty one ending it.
+// After a refusal the rest of its frames are skipped (serve_app drops
+// them); the app sends them all regardless.
+@requires(network, declassify, filesystem)
+Int serve_put(Sftp s, List(Int) path, Bool replace, List(Int) buf) {
+    Stat st = stat_path(s, path, true);
+    Bool taken = sftp_good(st.s) && st.found && (!replace || st.a.kind != 0);
+    Str why = if (st.a.kind == 0) { shown(path) + " already exists; not replaced" } else { shown(path) + " exists and is not a file" };
+    Upload u = if (!sftp_good(st.s)) { Upload {.s = st.s, .handle = [], .off = 0} } else { if (taken) { Upload {.s = sftp_err(st.s, why), .handle = [], .off = 0} } else { upload_start(st.s, path, replace) } };
+    return put_frames(u, buf);
+}
+
+@requires(network, declassify, filesystem)
+Int put_frames(Upload u, List(Int) buf) {
+    AppMsg m = next_in(buf);
+    if (m.eof) { _ = disconnect(u.s.ch.c, "done"); return 0; }
+    if (m.t != 9) { return put_frames(u, m.buf); }
+    if (m.p.len() > 0) { return put_frames(upload_more(u, m.p), m.buf); }
+    Copied c = upload_end(u);
+    return serve_app(answered(c.s, u64_be(c.bytes)), m.buf);
+}

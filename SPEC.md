@@ -1008,6 +1008,21 @@ authentication required, and expire after 12 hours regardless.
   where it stopped. Remote file names are displayed escaped (no control
   characters, bidi overrides or look-alike path separators) and never
   used as local paths without the principal choosing a destination.
+  A file browser (`pylon sftp`, the app's Files page over `pylon sftp
+  --app`) lists, makes and removes directories, renames, removes, and
+  moves or copies files and trees on the server, by path or by cut or
+  copy and paste. Nothing is replaced: a move is the v3 RENAME (which
+  fails on an existing target), a copy opens its target with O_EXCL, an
+  upload over a file needs the principal's say-so, and a copy pasted
+  beside its original takes a free "NAME copy" name. Trees are walked
+  with lstat and never through a symbolic link (a link is removed or
+  moved as a link, and skipped by a copy); both ends of a copy are made
+  canonical by the server first, so a directory is never copied into
+  itself whatever path names it. With `copy-data` (OpenSSH 9.0+) a copy
+  stays on the server; otherwise it passes through Pylon. On Android a
+  download or an upload goes through the system document picker: Pylon
+  holds no storage permission and sees only the document picked, and a
+  download that fails is deleted rather than left partial.
 
 ## 12. The terminal emulator
 

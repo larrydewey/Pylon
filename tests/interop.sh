@@ -354,6 +354,39 @@ check "sftp: a missing remote file"            1 "cannot open" \
 check "sftp: escape bytes in a name are shown escaped" 1 'x1b.31mred on the server' \
     "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/$(printf '\033[31mred')" red.bin
 
+# --- pylon sftp: the interactive browser, and the app's framed requests --------
+SD="$WORK/sftpdir"; mkdir -p "$SD/a/b"; echo hello > "$SD/a/f.txt"; echo x > "$SD/a/b/g"; ln -s f.txt "$SD/a/link"
+echo "$(printf '\033')" > "$SD/a/$(printf '\033[31mred')"
+sftp_run() { printf "$1" | "$PYLON" sftp -p $PORT "$USER_NAME@127.0.0.1:$SD" 2>&1; }
+check "sftp shell: ls shows names escaped"       0 'x1b\[31mred' sftp_run 'cd a\nls\n'
+check "sftp shell: a typed \\xHH name reaches it" 0 'moved .*/a/plain' sftp_run 'cd a\nmv \\x1b[31mred plain\n'
+check "sftp shell: cp copies a file"              0 'copied .*/a/f2.txt' sftp_run 'cd a\ncp f.txt f2.txt\n'
+check "sftp shell: cp refuses to replace"         0 'already exists; not replaced' sftp_run 'cd a\ncp f.txt f2.txt\n'
+check "sftp shell: copy, paste beside: NAME copy" 0 'f copy.txt' sftp_run 'cd a\ncopy f.txt\npaste\n'
+check "sftp shell: cut, paste moves"              0 'moved .*/a/f2.txt to .*/a/b/f2.txt' sftp_run 'cd a\ncut f2.txt\npaste b\n'
+check "sftp shell: the cut file has moved"        0 '' test -f "$SD/a/b/f2.txt" -a ! -e "$SD/a/f2.txt"
+check "sftp shell: cp -r copies a tree"           0 '2 files, 1 directories' sftp_run 'cd a\nmkdir c\ncp -r b c\n'
+check "sftp shell: a copied tree is intact"       0 '' cmp "$SD/a/b/g" "$SD/a/c/b/g"
+check "sftp shell: a symbolic link is not copied" 0 'symbolic link; not copied' sftp_run 'cd a\ncp link l2\n'
+check "sftp shell: cut moves a link, not its target" 0 '' bash -c "printf 'cd a\ncut link\npaste c\n' | '$PYLON' sftp -p $PORT '$USER_NAME@127.0.0.1:$SD' >/dev/null 2>&1; test -L '$SD/a/c/link' -a -f '$SD/a/f.txt'"
+check "sftp shell: no directory into itself"      0 'into itself' sftp_run 'cd a\ncp -r c c/sub\n'
+check "sftp shell: mv refuses to replace"         0 'already exists; not replaced' sftp_run 'cd a\nmv f.txt f\\ copy.txt\n'
+check "sftp shell: rm needs -r for a directory"   0 'rm -r' sftp_run 'cd a\nrm c\n'
+check "sftp shell: rm -r removes a tree"          0 'removed 3 files and 2 directories' sftp_run 'cd a\nrm -r c\n'
+check "sftp shell: rm -r leaves a link's target"  0 '' test -f "$SD/a/f.txt"
+check "sftp shell: put and get"                   0 "6 bytes to $WORK/got.txt" sftp_run "cd a\nput $SD/a/f.txt up.txt\nget up.txt $WORK/got.txt\n"
+check "sftp shell: get refuses to replace"        0 'not replaced (get -f' sftp_run "cd a\nget up.txt $WORK/got.txt\n"
+check "sftp shell: put refuses to replace"        0 'not replaced (put -f' sftp_run "cd a\nput $SD/a/f.txt up.txt\n"
+rm -rf "$SD"/*
+python3 "$(dirname "$HOSTILE")/sftp_app_drive.py" "$PYLON" $PORT "$USER_NAME@127.0.0.1" "$SD" > app_sftp.out 2>&1
+check "sftp app: framed requests, a clean exit"   0 'exit 0' cat app_sftp.out
+check "sftp app: a file round trip is intact"     0 'get ok intact' cat app_sftp.out
+check "sftp app: an upload never replaces"        0 'put again refused: .*already exists' cat app_sftp.out
+check "sftp app: a move never replaces"           0 'move onto a file refused: .*already exists' cat app_sftp.out
+check "sftp app: no directory into itself"        0 'copy into itself refused' cat app_sftp.out
+check "sftp app: a free name for a copy"          0 'free name up copy.bin' cat app_sftp.out
+check "sftp app: the tree after it all"           0 'list moved.bin new' cat app_sftp.out
+
 # --- ProxyJump ------------------------------------------------------------------
 # A second sshd is the target, with its own host key; the first is the jump.
 JT=$((PORT + 5))

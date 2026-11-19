@@ -38,6 +38,7 @@ import "../core/files.resid";
 import "../core/release.resid";
 import "../core/release_gate.resid";
 import "../core/addr.resid";
+import "sftp_shell.resid";
 
 type Opts = { Int port; Bool no_strict; Bool no_obfuscate; Bool no_cmd; Bool force; Str jump; Str pylond; List(Str) pflags; List(Str) fwds; List(Str) rest; Str err; };
 
@@ -76,6 +77,7 @@ Int usage() {
     eprintln("                       [-R [localhost:]RPORT:HOST:HOSTPORT] ... USER@HOST");
     eprintln("       pylon get [-p PORT] [--force] USER@HOST:REMOTE LOCAL");
     eprintln("       pylon put [-p PORT] LOCAL USER@HOST:REMOTE");
+    eprintln("       pylon sftp [-p PORT] USER@HOST[:DIR]   browse, move and copy files (help inside lists the commands)");
     eprintln("       pylon get/put --pylond DIR [--resume] ...   over the Pylon protocol, resumable");
     eprintln("       pylon --pylond DIR [-N -L/-D/-R ...] USER@HOST   a terminal or forwards over the");
     eprintln("                       Pylon protocol (experimental; with -J, HOST as an IP address)");
@@ -336,6 +338,26 @@ Int cmd_put(Opts o, Int via) {
     return 0;
 }
 
+// pylon sftp [-p PORT] USER@HOST[:DIR]: the interactive file browser
+// (cli/sftp_shell.resid), or with --app its framed requests for the app.
+// Always over SSH: the Pylon protocol carries whole-file transfers only.
+@requires(network, filesystem, environment, declassify, terminal, clock)
+Int cmd_sftp(Opts o, Int via) {
+    if (o.rest.len() != 1) { return usage(); }
+    if (str_len(o.pylond) > 0) { eprintln("pylon: sftp runs over SSH (--pylond carries get and put)"); return 2; }
+    Bool app = has_flag(o.pflags, "app");
+    List(Str) uh = str_split(o.rest[0], "@");
+    HostRest hr = split_host(if (uh.len() == 2) { uh[1] } else { "" });
+    Bool has_dir = str_len(hr.rest) > 0;
+    if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(hr.host) == 0 || (has_dir && !str_starts_with(hr.rest, ":"))) { eprintln("pylon: give the server as USER@HOST or USER@HOST:DIR"); return 2; }
+    Authed a = login(uh[0], hr.host, o, via);
+    if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    Sftp s = sftp_start(open_session(a.c));
+    if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
+    if (app) { return sftp_app(s); }
+    return sftp_shell(s, if (has_dir) { bytes_of(str_slice(hr.rest, 1, str_len(hr.rest))) } else { [] });
+}
+
 // get (op 0) or put (1) over the Pylon protocol: a resumable transfer
 // (core/files.resid). --resume continues a transfer that stopped: only
 // the chunks the other side lacks are sent, and the whole file's hash is
@@ -551,6 +573,7 @@ Int dispatch(Str verb, Opts o, Int via) {
     if (verb == "history") { return cmd_history(o); }
     if (verb == "get") { return cmd_get(o, via); }
     if (verb == "put") { return cmd_put(o, via); }
+    if (verb == "sftp") { return cmd_sftp(o, via); }
     return cmd_run(o, via);
 }
 
@@ -595,7 +618,7 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pylond-check" || verb == "pin" || verb == "get" || verb == "put" || verb == "history" || verb == "ca" || verb == "pins" || verb == "sshfp";
+    Bool sub = verb == "pylond-check" || verb == "pin" || verb == "get" || verb == "put" || verb == "sftp" || verb == "history" || verb == "ca" || verb == "pins" || verb == "sshfp";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
