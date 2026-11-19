@@ -211,7 +211,31 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /**
+     * The connection processes this app started (`libpylon.so`, children of
+     * this process). When the activity goes (its task swiped away), the
+     * Flutter side that held their pipes goes with it but this process may
+     * stay cached, holding the pipes open: they would keep their
+     * connections up with nothing left to show them. They end with it.
+     */
+    private fun endCoreChildren() {
+        val me = android.os.Process.myPid()
+        val procs = java.io.File("/proc").listFiles() ?: return
+        for (d in procs) {
+            val pid = d.name.toIntOrNull() ?: continue
+            try {
+                val stat = java.io.File(d, "stat").readText()
+                val close = stat.lastIndexOf(')')
+                if (close < 0) continue
+                val ppid = stat.substring(close + 2).split(' ').getOrNull(1)?.toIntOrNull() ?: continue
+                if (ppid == me) android.os.Process.killProcess(pid)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     override fun onDestroy() {
+        if (!isChangingConfigurations) endCoreChildren()
         for (id in ArrayList(shells.keys)) closeShell(id)
         localShell.unbind()
         term.unbind()
