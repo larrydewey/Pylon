@@ -202,6 +202,8 @@ ssh-keygen -r localhost -f host_ed25519.pub > dns.sshfp
 dns_server secure
 check "sshfp: the records validate from the test root" 0 "SHA-256 record(s) for localhost. (secure" \
     dns "$PYLON" sshfp localhost
+check "sshfp: the test anchor is ignored unless every resolver is loopback" 1 "ignoring PYLON_TEST_DNSSEC_ANCHOR" \
+    env PYLON_HOME="$DNSH" PYLON_DNS="127.0.0.1:$(cat dns.port),192.0.2.1:53" PYLON_TEST_DNSSEC_ANCHOR="$(cat dns.anchor)" "$PYLON" -p $PORT "$USER_NAME@localhost" true
 check "sshfp: an unpinned host is accepted through them, and pinned" 0 "matches its DNSSEC-validated SSHFP record" \
     dns "$PYLON" -p $PORT "$USER_NAME@localhost" "echo via-sshfp"
 check "sshfp: the pin is recorded with its source" 0 "sshfp localhost:$PORT $(fp host_ed25519.pub) DNSSEC-validated in localhost." \
@@ -460,7 +462,7 @@ if [ -x "$PYLOND" ]; then
             "$RELTOOL" verify roots rel
         check "release: pylon pylond-check accepts it" 0 "pylond-x86_64 0.1.0 (release 1): signed by 2 release keys, entry 0 of the log's 2" \
             "$PYLON" pylond-check --pylond-roots roots rel
-        check "release: refused under the pinned keys (none yet)" 1 "refusing to push pylond: this build of pylon pins no pylond release keys yet" \
+        check "release: a release signed by other keys is refused under the pinned keys" 1 "refusing to push pylond: the release is signed by 0 of the 2 release keys it needs" \
             "$PYLON" -p $PORT -N -L $((PORT + 16)):127.0.0.1:1 --pylond rel "$USER_NAME@127.0.0.1"
         # A tampered pylond: one byte more than the release names.
         cp -r rel relt && printf 'x' >> relt/pylond-x86_64

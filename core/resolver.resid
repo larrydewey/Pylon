@@ -151,11 +151,38 @@ pub Verdict sshfp_lookup(Str host, List(Ds) anchors, Int now) {
 
 // The trust anchors: IANA's root KSKs, or, for tests only, the DS in
 // $PYLON_TEST_DNSSEC_ANCHOR (announced on stderr whenever it is used).
+// The test anchor is honoured only while every resolver is a loopback
+// address given in $PYLON_DNS (a test zone served on this machine): with
+// the system's or a network's resolvers it is ignored, so a stray or
+// planted variable cannot make answers from the network count as secure.
 @requires(environment)
 pub List(Ds) dnssec_anchors() {
     Str t = environment.get("PYLON_TEST_DNSSEC_ANCHOR");
     if (str_len(t) == 0) { return iana_anchors(); }
+    Str env = environment.get("PYLON_DNS");
+    List(Server) ss = if (str_len(env) > 0) { servers_of(str_split(env, ","), 0, []) } else { [] };
+    if (ss.len() == 0 || !all_loopback(ss, 0)) {
+        eprintln("pylon: WARNING: ignoring PYLON_TEST_DNSSEC_ANCHOR: it is honoured only with loopback resolvers in PYLON_DNS; using IANA's root keys");
+        return iana_anchors();
+    }
     eprintln("pylon: WARNING: using the test DNSSEC trust anchor from PYLON_TEST_DNSSEC_ANCHOR, not IANA's root keys");
     Ds d = ds_text(t);
     return if (d.tag >= 0) { [d] } else { [] };
+}
+
+// Whether every server from `i` on is 127.0.0.0/8 or ::1.
+pub Bool all_loopback(List(Server) ss, Int i) {
+    if (i >= ss.len()) { return true; }
+    return is_loopback(ss[i].addr) && all_loopback(ss, i + 1);
+}
+
+pub Bool is_loopback(List(Int) a) {
+    if (a.len() == 4) { return a[0] == 127; }
+    if (a.len() == 16) { return zeros_upto(a, 0, 15) && a[15] == 1; }
+    return false;
+}
+
+Bool zeros_upto(List(Int) a, Int i, Int n) {
+    if (i >= n) { return true; }
+    return a[i] == 0 && zeros_upto(a, i + 1, n);
 }

@@ -635,8 +635,10 @@ other roots apart from the pinned ones'.
 announced on every use: `--pylond-roots ROOTS` trusts another roots file
 (a release signed with one's own keys; the test suite's), and
 `--pylond-unverified` skips the check (in the app, a build made with
-`--dart-define=PYLON_UNVERIFIED_PYLOND=true`). Until the first release
-ceremony `core/release_roots.resid` pins no keys, so only these work.
+`--dart-define=PYLON_UNVERIFIED_PYLOND=true`). `core/release_roots.resid`
+pins three release keys (any two sign a release) and one log key; until a
+release signed by them is published and bundled, only these options push
+a `pylond`.
 
 **Making a release** (`pylon-release`, built from `tools/release`):
 each maintainer runs `keygen NAME` on their own device once (the `.key`
@@ -1304,7 +1306,7 @@ adversary, what Draft 1 allowed, and the change.
 | H4 | A4 | Local forwards on Android bind the loopback shared by every app. | In-app consumption without sockets; per-connection UID check; warning; close in background (11). |
 | H5 | A4 | Third-party keyboards see passwords typed into the terminal; the clipboard leaks to other apps and devices. | Input-method flags, in-app keyboard for password prompts, sensitive and expiring clipboard (15). |
 | H6 | A1 | Second-device first-use approval could be satisfied by two devices on the same Wi-Fi. | The second check must use an independent network path (6.1.4). |
-| H7 | A5 | A coerced or colluding release quorum could still ship a malicious `pylond`, possibly to one victim only. | Reproducible builds, a public transparency log with inclusion proofs, rollback protection (8.2). *Implemented (8.2.1):* k-of-n signed manifests, an RFC 9162 log with signed tree heads, inclusion and consistency proofs checked offline against the newest head seen, a monotonic release counter, code images reproducible; no keys pinned before the first release ceremony; head gossip and revocation open. |
+| H7 | A5 | A coerced or colluding release quorum could still ship a malicious `pylond`, possibly to one victim only. | Reproducible builds, a public transparency log with inclusion proofs, rollback protection (8.2). *Implemented (8.2.1):* k-of-n signed manifests, an RFC 9162 log with signed tree heads, inclusion and consistency proofs checked offline against the newest head seen, a monotonic release counter, code images reproducible; release keys pinned (2 of 3) and a log key, no signed release published yet; head gossip and revocation open. |
 | H8 | -- | Consent on every connection leads to blind approval; the host name on the sheet came from Pylon. | Short approval window per (host, key, user), never for sensitive hosts or attach; names from Symbolon's own host database (7.2). |
 | H9 | -- | The Pylon protocol had no proof obligation. | Tamarin/ProVerif models of bootstrap, handshake and attach before phase 2; external review before default-on (16). |
 | H10 | -- | Pylon required Symbolon; people who will not run it would keep using weaker clients. | Tiers B-D behind an explicit, acknowledged warning; only key custody changes (7.6). |
