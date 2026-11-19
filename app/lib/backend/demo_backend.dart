@@ -1,6 +1,8 @@
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'files.dart';
+import 'mem_files.dart';
 import 'model.dart';
 
 /// A backend with no core behind it, for previewing the interface (the
@@ -37,6 +39,9 @@ class DemoBackend implements Backend {
 
   @override
   Session open(Host h, int rows, int cols) => _DemoSession(h, rows, cols);
+
+  @override
+  FileSession openFiles(Host h) => MemFiles(h);
 
   @override
   bool get hasLocalShell => true;

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../backend/files.dart';
 import '../backend/model.dart';
 import '../backend/select.dart';
 
@@ -17,6 +18,31 @@ class AppState extends ChangeNotifier {
 
   /// Linux: the local shell gets the device's network (off: none).
   bool localShareNet = false;
+
+  /// Paths cut or copied on the Files page, for a paste on the same host.
+  FileClip? clip;
+
+  void setClip(FileClip? c) {
+    clip = c;
+    notifyListeners();
+  }
+
+  // Open file browsers, counted with live connections (Android's
+  // foreground service: the document picker puts Pylon in the background).
+  int _filesOpen = 0;
+
+  FileSession openFiles(Host h) {
+    final f = backend.openFiles(h);
+    _filesOpen++;
+    _report();
+    return f;
+  }
+
+  void closeFiles(FileSession f) {
+    f.close();
+    _filesOpen--;
+    _report();
+  }
 
   /// The desktop layout's way to open a host: in a tab, not a page.
   void Function(Host h)? openInTab;
@@ -97,9 +123,17 @@ class AppState extends ChangeNotifier {
   // connections, counted, keep Pylon's foreground service up meanwhile.
   int _reported = 0;
   void _report() {
-    final n = [for (final s in live) if (!s.local) s].length;
+    final n = [for (final s in live) if (!s.local) s].length + _filesOpen;
     if (n == _reported) return;
     _reported = n;
     keepConnections(n);
   }
+}
+
+/// What the Files page's cut or copy marked: canonical paths on one host.
+class FileClip {
+  FileClip(this.host, this.cut, this.paths);
+  final Host host;
+  final bool cut;
+  final List<Uint8List> paths;
 }

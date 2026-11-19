@@ -146,3 +146,137 @@ class ServiceConduit implements Conduit {
   @override
   void close() => platform.invokeMethod('localClose', _id);
 }
+
+// ---------------------------------------------------------------------------
+// Files on this device (the Files page's downloads and uploads)
+// ---------------------------------------------------------------------------
+
+/// Where a download goes: chosen by the principal, never by the server.
+abstract class LocalTarget {
+  /// What to call it in messages (a file name or path).
+  String get label;
+  Future<void> write(Uint8List chunk);
+
+  /// Done; when not [ok] a partial file is removed.
+  Future<void> finish(bool ok);
+}
+
+/// What an upload reads.
+abstract class LocalSource {
+  String get name;
+  int? get size;
+
+  /// The next chunk, or null at the end.
+  Future<Uint8List?> read();
+  Future<void> close();
+}
+
+/// Android: the system's document picker (no storage permission; Pylon
+/// sees only the one document the principal picked). Elsewhere the Files
+/// page asks for a path ([pathTarget], [pathSource]).
+bool get systemPicker => Platform.isAndroid;
+
+/// The picker's "save as" for [name]; null when the principal cancelled.
+Future<LocalTarget?> pickTarget(String name) async {
+  final r = await platform.invokeMethod<Map>('docCreate', {'name': name});
+  if (r == null) return null;
+  return _DocTarget(r['id'] as int, r['label'] as String? ?? name);
+}
+
+/// The picker's "open"; null when the principal cancelled.
+Future<LocalSource?> pickSource() async {
+  final r = await platform.invokeMethod<Map>('docOpen');
+  if (r == null) return null;
+  final size = r['size'] as int?;
+  return _DocSource(r['id'] as int, r['name'] as String? ?? 'upload', size != null && size >= 0 ? size : null);
+}
+
+class _DocTarget implements LocalTarget {
+  _DocTarget(this.id, this.label);
+  final int id;
+  @override
+  final String label;
+  @override
+  Future<void> write(Uint8List chunk) => platform.invokeMethod('docWrite', {'id': id, 'data': chunk});
+  @override
+  Future<void> finish(bool ok) => platform.invokeMethod('docClose', {'id': id, 'ok': ok});
+}
+
+class _DocSource implements LocalSource {
+  _DocSource(this.id, this.name, this.size);
+  final int id;
+  @override
+  final String name;
+  @override
+  final int? size;
+  @override
+  Future<Uint8List?> read() async {
+    final b = await platform.invokeMethod<Uint8List>('docRead', {'id': id, 'n': 262144});
+    return b == null || b.isEmpty ? null : b;
+  }
+
+  @override
+  Future<void> close() => platform.invokeMethod('docClose', {'id': id, 'ok': true});
+}
+
+/// Where downloads are offered by default on a desktop.
+String get downloadsDir {
+  final home = Platform.environment['HOME'] ?? '.';
+  final d = Directory('$home/Downloads');
+  return d.existsSync() ? d.path : home;
+}
+
+bool localExists(String path) => FileSystemEntity.typeSync(path) != FileSystemEntityType.notFound;
+
+/// A new file at [path] (a file there is replaced only with [replace]),
+/// written beside it and renamed into place when whole.
+Future<LocalTarget> pathTarget(String path, {bool replace = false}) async {
+  if (!replace && localExists(path)) throw FileSystemException('exists; not replaced', path);
+  if (FileSystemEntity.isDirectorySync(path)) throw FileSystemException('is a directory', path);
+  final part = File('$path.part');
+  final sink = await part.open(mode: FileMode.writeOnly);
+  return _PathTarget(path, part, sink);
+}
+
+class _PathTarget implements LocalTarget {
+  _PathTarget(this.label, this.part, this.f);
+  @override
+  final String label;
+  final File part;
+  final RandomAccessFile f;
+  @override
+  Future<void> write(Uint8List chunk) => f.writeFrom(chunk);
+  @override
+  Future<void> finish(bool ok) async {
+    await f.close();
+    if (ok) {
+      await part.rename(label);
+    } else if (await part.exists()) {
+      await part.delete();
+    }
+  }
+}
+
+Future<LocalSource> pathSource(String path) async {
+  final f = File(path);
+  if (!await f.exists()) throw FileSystemException('not a file', path);
+  final raf = await f.open();
+  return _PathSource(f.uri.pathSegments.isEmpty ? path : f.uri.pathSegments.last, await raf.length(), raf);
+}
+
+class _PathSource implements LocalSource {
+  _PathSource(this.name, this.size, this.f);
+  @override
+  final String name;
+  @override
+  final int? size;
+  final RandomAccessFile f;
+  @override
+  Future<Uint8List?> read() async {
+    final b = await f.read(262144);
+    return b.isEmpty ? null : b;
+  }
+
+  @override
+  Future<void> close() => f.close();
+}

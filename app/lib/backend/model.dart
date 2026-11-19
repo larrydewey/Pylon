@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'files.dart';
 
 enum Mode { ssh, pylon }
 
@@ -92,6 +93,9 @@ abstract class Backend {
   Future<Outcome> pin(Host h, String fingerprint);
   Future<Outcome> trustCa(String pattern, String key);
   Session open(Host h, int rows, int cols);
+
+  /// A file browser's connection to the host (SPEC 11), over SSH.
+  FileSession openFiles(Host h);
   bool get demo;
 
   /// Whether this device can run the local shell (SPEC 13).

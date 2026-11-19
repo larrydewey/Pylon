@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'files.dart';
 import 'frames.dart';
 import 'model.dart';
 
@@ -200,6 +201,9 @@ class ProcessBackend implements Backend {
       });
 
   @override
+  FileSession openFiles(Host h) => ProcFiles(this, h);
+
+  @override
   Session openLocal(int rows, int cols, {bool shareNet = false}) => ProcSession(this, Host.local(), rows, cols, () async {
         final lc = localConduit;
         if (lc != null) return lc(rows, cols);
@@ -372,4 +376,174 @@ AgentKeys keysIn(Uint8List? reply) {
   if (reply == null || reply.length < 9 || reply[4] != 12) return AgentKeys.unreachable;
   final n = (reply[5] << 24) | (reply[6] << 16) | (reply[7] << 8) | reply[8];
   return n == 0 ? AgentKeys.none : AgentKeys.some;
+}
+
+/// A file browser's session: `pylon sftp --app` (cli/sftp_shell.resid),
+/// framed both ways. From it: 3 an agent request, 4 ready (the login
+/// directory), 8 an answer (0 | result, or 1 | message), 9 a downloaded
+/// file's bytes; to it: 3 agent replies, 8 requests, 9 an uploaded file's
+/// bytes (an empty frame ends the file).
+class ProcFiles extends FileSession {
+  ProcFiles(this.b, Host h) : super(h) {
+    _start();
+  }
+
+  final ProcessBackend b;
+  ProcessConduit? _conn;
+  late final int _agentConn = ++b._conns;
+  final _reader = FrameReader();
+  final _ready = Completer<Uint8List>();
+  bool _closed = false;
+
+  // Requests wait their turn: the core answers one at a time.
+  Future<void> _tail = Future.value();
+  Completer<Uint8List>? _answer;
+  Future<void> Function(Uint8List)? _sink;
+  Future<void> _sinking = Future.value();
+
+  @override
+  Future<Uint8List> get ready => _ready.future;
+
+  Future<void> _start() async {
+    status = 'Connecting…';
+    changed();
+    try {
+      final args = ['sftp', '--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], host.target];
+      _conn = ProcessConduit(await Process.start(b.pylonPath, args, environment: await b._env()));
+    } catch (e) {
+      _end('Cannot start the Pylon core: $e');
+      return;
+    }
+    if (_closed) {
+      _conn?.close();
+      return;
+    }
+    _conn!.output.listen(_onFrames);
+    _conn!.messages.listen((m) {
+      status = (status.startsWith('Connecting') ? '' : status) + m;
+      changed();
+    });
+    _conn!.exitCode.then((c) => _end(status.trim().isEmpty ? 'The connection closed ($c)' : status.trim()));
+  }
+
+  void _end(String why) {
+    if (ended) return;
+    ended = true;
+    status = why;
+    if (!_ready.isCompleted) _ready.completeError(FileError(why));
+    _answer?.completeError(FileError(why));
+    _answer = null;
+    changed();
+  }
+
+  void _onFrames(List<int> d) {
+    for (final (t, p) in _reader.add(d)) {
+      if (t == 3) {
+        _agentRequest(Uint8List.fromList(p));
+      } else if (t == 4 && !_ready.isCompleted) {
+        status = '';
+        _ready.complete(Uint8List.fromList(p));
+        changed();
+      } else if (t == 9) {
+        final sink = _sink;
+        final chunk = Uint8List.fromList(p);
+        if (sink != null) _sinking = _sinking.then((_) => sink(chunk));
+      } else if (t == 8) {
+        final a = _answer;
+        _answer = null;
+        a?.complete(Uint8List.fromList(p));
+      }
+    }
+  }
+
+  Future<void> _agentRequest(Uint8List req) async {
+    final a = b.agent;
+    final reply = a == null ? null : await a(_agentConn, req);
+    if (a != null && req.length >= 5 && req[4] == 11 && keysIn(reply) != AgentKeys.some) {
+      status = keysIn(reply) == AgentKeys.none ? 'Symbolon offered no keys.' : 'Pylon cannot reach Symbolon.';
+      changed();
+    }
+    _conn?.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
+  }
+
+  // One request: sent when the ones before it are answered; [body] (an
+  // upload) runs after the request is sent.
+  Future<Uint8List> _call(int op, List<List<int>> args, {Future<void> Function()? body, Future<void> Function(Uint8List)? sink}) {
+    final out = Completer<Uint8List>();
+    _tail = _tail.then((_) async {
+      try {
+        if (ended) throw FileError(status);
+        await ready;
+        final answer = Completer<Uint8List>();
+        _answer = answer;
+        _sink = sink;
+        _sinking = Future.value();
+        _conn!.add(frame(8, request(op, args)));
+        if (body != null) await body();
+        final r = await answer.future;
+        await _sinking;
+        if (r.isEmpty || r[0] != 0) throw FileError(r.isEmpty ? 'an empty answer' : utf8.decode(r.sublist(1), allowMalformed: true));
+        out.complete(Uint8List.sublistView(r, 1));
+      } catch (e) {
+        out.completeError(e is FileError ? e : FileError('$e'));
+      } finally {
+        _sink = null;
+      }
+    });
+    return out.future;
+  }
+
+  @override
+  Future<List<RemoteEntry>> list(Uint8List dir) async => parseList(await _call(1, [dir]));
+  @override
+  Future<Uint8List> realPath(Uint8List path) => _call(2, [path]);
+  @override
+  Future<void> makeDir(Uint8List path) => _call(3, [path]);
+  @override
+  Future<TreeDone> remove(Uint8List path) async => parseDone(await _call(4, [path]));
+  @override
+  Future<void> move(Uint8List from, Uint8List to) => _call(5, [from, to]);
+  @override
+  Future<TreeDone> copy(Uint8List from, Uint8List to) async => parseDone(await _call(6, [from, to]));
+  @override
+  Future<RemoteEntry?> stat(Uint8List path) async => parseStat(path, await _call(9, [path]));
+  @override
+  Future<Uint8List> freeName(Uint8List dir, Uint8List name) => _call(10, [dir, name]);
+
+  @override
+  Future<int> download(Uint8List path, Future<void> Function(Uint8List chunk) sink) async => parseCount(await _call(7, [path], sink: sink));
+
+  @override
+  Future<int> upload(Uint8List path, Future<Uint8List?> Function() source, {bool replace = false}) async {
+    final r = await _call(8, [path, [replace ? 1 : 0]], body: () async {
+      // Every chunk goes, then the empty frame: the core reads the whole
+      // file even when it refused it (and then says why).
+      while (!ended) {
+        Uint8List? c;
+        try {
+          c = await source();
+        } catch (e) {
+          // The local file failed mid-way: the session ends rather than
+          // finish a partial file as if it were whole.
+          close();
+          throw FileError('Cannot read the local file: $e');
+        }
+        if (c == null || c.isEmpty) break;
+        for (var i = 0; i < c.length; i += 65536) {
+          _conn?.add(frame(9, Uint8List.sublistView(c, i, i + 65536 < c.length ? i + 65536 : c.length)));
+        }
+        await _conn?.p.stdin.flush().catchError((_) {});
+      }
+      _conn?.add(frame(9, const []));
+    });
+    return parseCount(r);
+  }
+
+  @override
+  void close() {
+    _closed = true;
+    b.agentClose?.call(_agentConn);
+    _conn?.close();
+    _end('Closed');
+  }
 }

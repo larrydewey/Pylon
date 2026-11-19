@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../backend/model.dart';
 import '../theme.dart';
 import 'app_state.dart';
+import 'files_page.dart';
 import 'host_edit_page.dart';
 import 'pin_page.dart';
 import 'terminal_page.dart';
@@ -98,9 +99,14 @@ class _HostsPageState extends State<HostsPage> {
             Text('${pin.alg.replaceAll('ssh-', '').replaceAll('ecdsa-sha2-nistp256', 'ecdsa')} ${pin.fingerprint}', style: const TextStyle(fontFamily: mono, fontSize: 12, color: P.muted))
           else
             const Text("Pylon won't connect until you pin this host's key from a source you trust.", style: TextStyle(fontSize: 13, color: Color(0xFFD9CBAE))),
-          Align(
-            alignment: Alignment.centerRight,
-            child: IconButton(
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            if (pinned)
+              IconButton(
+                tooltip: 'Files',
+                icon: const Icon(Icons.folder_outlined, color: P.muted),
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FilesPage(st: st, host: h))),
+              ),
+            IconButton(
               tooltip: 'Edit host',
               icon: const Icon(Icons.more_horiz, color: P.muted),
               onPressed: () async {
@@ -108,7 +114,7 @@ class _HostsPageState extends State<HostsPage> {
                 setState(() {});
               },
             ),
-          ),
+          ]),
         ]),
       ),
     );

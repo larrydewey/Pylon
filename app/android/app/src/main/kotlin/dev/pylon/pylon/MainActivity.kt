@@ -11,6 +11,10 @@ import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import java.io.InputStream
 import android.view.WindowManager
 import java.io.IOException
 import java.io.OutputStream
@@ -80,6 +84,69 @@ class MainActivity : FlutterActivity() {
         fun unbind() {
             if (binder != null || waiting.isNotEmpty()) {
                 try { unbindService(conn) } catch (_: IllegalArgumentException) {}
+            }
+        }
+    }
+
+    // Documents for the Files page (SPEC 11): only ones the principal picked
+    // in the system's document picker, so Pylon needs no storage
+    // permission and sees nothing else. Reads and writes run in order on
+    // [docIo]; a download that failed is deleted rather than left partial.
+    private class Doc(val uri: Uri, val input: InputStream?, val output: OutputStream?)
+    private val docs = HashMap<Int, Doc>()
+    private var nextDoc = 1
+    private val docIo = Executors.newSingleThreadExecutor()
+    private var docPending: MethodChannel.Result? = null
+    private var docName: String = ""
+    private val docCreateCode = 41
+    private val docOpenCode = 42
+
+    private fun docPick(code: Int, name: String, result: MethodChannel.Result) {
+        if (docPending != null) { result.error("doc", "a document picker is already open", null); return }
+        val i = if (code == docCreateCode) {
+            Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, name)
+        } else {
+            Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+        }
+        docPending = result
+        docName = name
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, code)
+        } catch (e: Exception) {
+            docPending = null
+            result.error("doc", "no document picker: ${e.message}", null)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != docCreateCode && requestCode != docOpenCode) return
+        val result = docPending ?: return
+        docPending = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) { result.success(null); return }
+        docIo.execute {
+            try {
+                var name = docName
+                var size = -1L
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        if (!c.isNull(0)) name = c.getString(0)
+                        if (!c.isNull(1)) size = c.getLong(1)
+                    }
+                }
+                val doc = if (requestCode == docCreateCode) Doc(uri, null, contentResolver.openOutputStream(uri, "wt")) else Doc(uri, contentResolver.openInputStream(uri), null)
+                if (doc.input == null && doc.output == null) throw IOException("cannot open the document")
+                runOnUiThread {
+                    val id = nextDoc++
+                    docs[id] = doc
+                    result.success(mapOf("id" to id, "name" to name, "label" to name, "size" to size))
+                }
+            } catch (e: Exception) {
+                runOnUiThread { result.error("doc", e.message ?: "cannot open the document", null) }
             }
         }
     }
@@ -256,6 +323,44 @@ class MainActivity : FlutterActivity() {
                     val out = if (id != null) shellOut[id] else null
                     if (out != null && data != null) writer.execute { try { out.write(data); out.flush() } catch (_: IOException) {} }
                     result.success(null)
+                }
+                "docCreate" -> docPick(docCreateCode, call.argument<String>("name") ?: "download", result)
+                "docOpen" -> docPick(docOpenCode, "", result)
+                "docWrite" -> {
+                    val doc = call.argument<Number>("id")?.toInt()?.let { docs[it] }
+                    val data = call.argument<ByteArray>("data")
+                    if (doc?.output == null || data == null) { result.error("doc", "no such document", null) } else {
+                        docIo.execute {
+                            try { doc.output.write(data); runOnUiThread { result.success(null) } }
+                            catch (e: IOException) { runOnUiThread { result.error("doc", e.message ?: "write failed", null) } }
+                        }
+                    }
+                }
+                "docRead" -> {
+                    val doc = call.argument<Number>("id")?.toInt()?.let { docs[it] }
+                    val n = call.argument<Number>("n")?.toInt() ?: 65536
+                    if (doc?.input == null) { result.error("doc", "no such document", null) } else {
+                        docIo.execute {
+                            try {
+                                val buf = ByteArray(n.coerceIn(1, 1048576))
+                                val got = doc.input.read(buf)
+                                runOnUiThread { result.success(if (got <= 0) ByteArray(0) else buf.copyOf(got)) }
+                            } catch (e: IOException) { runOnUiThread { result.error("doc", e.message ?: "read failed", null) } }
+                        }
+                    }
+                }
+                "docClose" -> {
+                    val id = call.argument<Number>("id")?.toInt()
+                    val ok = call.argument<Boolean>("ok") ?: true
+                    val doc = if (id != null) docs.remove(id) else null
+                    docIo.execute {
+                        try { doc?.input?.close() } catch (_: IOException) {}
+                        try { doc?.output?.close() } catch (_: IOException) {}
+                        if (doc?.output != null && !ok) {
+                            try { DocumentsContract.deleteDocument(contentResolver, doc.uri) } catch (_: Exception) {}
+                        }
+                        runOnUiThread { result.success(null) }
+                    }
                 }
                 "localClose" -> {
                     (call.arguments as? Number)?.toInt()?.let { closeShell(it) }

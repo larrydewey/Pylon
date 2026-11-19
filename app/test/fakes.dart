@@ -1,3 +1,7 @@
+import 'dart:typed_data';
+
+import 'package:pylon/backend/files.dart';
+import 'package:pylon/backend/mem_files.dart';
 import 'package:pylon/backend/model.dart';
 
 /// A session that records what the interface did to it.
@@ -39,6 +43,16 @@ class FakeBackend implements Backend {
   Future<Outcome> trustCa(String pattern, String key) async => Outcome(false, '');
   @override
   Session open(Host h, int rows, int cols) => _add(FakeSession(h));
+
+  /// The file sessions opened, newest last.
+  final List<MemFiles> files = [];
+  Map<String, Uint8List?>? tree;
+  @override
+  FileSession openFiles(Host h) {
+    final f = MemFiles(h, tree: tree);
+    files.add(f);
+    return f;
+  }
   @override
   Session openLocal(int rows, int cols, {bool shareNet = false}) => _add(FakeSession(Host.local()));
 
