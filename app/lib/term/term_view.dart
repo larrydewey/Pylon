@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -220,9 +222,14 @@ class TermViewState extends State<TermView> {
 
   bool get hasFocus => _focus.hasFocus;
 
+  Size? _cellCache;
+  double _cellFont = 0;
+
   Size _cell() {
+    if (_cellCache != null && _cellFont == widget.fontSize) return _cellCache!;
+    _cellFont = widget.fontSize;
     final tp = TextPainter(text: TextSpan(text: 'M', style: TextStyle(fontFamily: mono, fontSize: widget.fontSize, height: 1.25)), textDirection: TextDirection.ltr)..layout();
-    return Size(tp.width, tp.height);
+    return _cellCache = Size(tp.width, tp.height);
   }
 
   /// Takes the keyboard focus and shows the soft keyboard. When the hidden
@@ -718,12 +725,36 @@ class _ScreenPainter extends CustomPainter {
     return p == null || (x >= p.$1 && x <= p.$3 && y >= p.$2 && y <= p.$4);
   }
 
+  // Glyphs painted on their own (outside ASCII: wide or fallback-font
+  // characters keep to their cells), laid out once per style.
+  static final Map<(int, int, int, double), TextPainter> _glyphs = {};
+
+  TextStyle _style(int fg, int a) => TextStyle(
+        fontFamily: mono,
+        fontSize: fontSize,
+        height: 1.25,
+        color: Color(fg),
+        fontWeight: A.bold(a) ? FontWeight.w700 : FontWeight.w400,
+        fontStyle: A.italic(a) ? FontStyle.italic : FontStyle.normal,
+        decoration: TextDecoration.combine([if (A.underline(a)) TextDecoration.underline, if (A.strike(a)) TextDecoration.lineThrough]),
+      );
+
+  // The attribute bits that change how text is drawn (colours are apart).
+  static int _look(int a) => a & ((1 << 18) | (1 << 20) | (1 << 21) | (1 << 25));
+
+  /// Each row as runs: one rectangle per stretch of one background, and
+  /// one text layout per stretch of ASCII in one colour and style (a
+  /// monospaced font keeps every character in its cell), rather than a
+  /// layout per cell, which made every screen update cost thousands of
+  /// layouts and starved the UI thread.
   @override
   void paint(Canvas canvas, Size size) {
+    final cols = s.cols;
+    final fgs = Uint32List(cols), bgs = Uint32List(cols);
+    final bgPaint = Paint();
     for (var y = 0; y < s.rows; y++) {
-      for (var x = 0; x < s.cols; x++) {
-        final i = y * s.cols + x;
-        final a = s.attr[i];
+      for (var x = 0; x < cols; x++) {
+        final a = s.attr[y * cols + x];
         var fg = Palette.of(A.fg(a), fg: true);
         var bg = Palette.of(A.bg(a), fg: false);
         if (A.inverse(a)) {
@@ -731,37 +762,109 @@ class _ScreenPainter extends CustomPainter {
           fg = bg;
           bg = t;
         }
-        final cursorHere = s.cursorVisible && x == s.cx && y == s.cy;
-        if (cursorHere) {
+        if (s.cursorVisible && x == s.cx && y == s.cy) {
           bg = cursor;
           fg = P.ink2;
         }
         if (_selected(x, y)) bg = Color.alphaBlend(P.teal.withValues(alpha: 0.45), bg);
-        final r = Rect.fromLTWH(x * cell.width, y * cell.height, cell.width + 0.5, cell.height + 0.5);
-        if (bg != P.ink2) canvas.drawRect(r, Paint()..color = bg);
-        final c = s.cp[i];
-        if (c > 32 && !A.hidden(a)) {
-          final tp = TextPainter(
-            text: TextSpan(
-              text: String.fromCharCode(c),
-              style: TextStyle(
-                fontFamily: mono,
-                fontSize: fontSize,
-                height: 1.25,
-                color: A.dim(a) ? fg.withValues(alpha: 0.6) : fg,
-                fontWeight: A.bold(a) ? FontWeight.w700 : FontWeight.w400,
-                fontStyle: A.italic(a) ? FontStyle.italic : FontStyle.normal,
-                decoration: TextDecoration.combine([if (A.underline(a)) TextDecoration.underline, if (A.strike(a)) TextDecoration.lineThrough]),
-              ),
-            ),
-            textDirection: TextDirection.ltr,
-          )..layout();
-          tp.paint(canvas, Offset(x * cell.width, y * cell.height));
-        }
+        if (A.dim(a)) fg = fg.withValues(alpha: 0.6);
+        fgs[x] = fg.toARGB32();
+        bgs[x] = bg.toARGB32();
       }
+      final top = y * cell.height;
+      for (var x = 0; x < cols;) {
+        var x1 = x + 1;
+        while (x1 < cols && bgs[x1] == bgs[x]) {
+          x1++;
+        }
+        if (bgs[x] != P.ink2.toARGB32()) canvas.drawRect(Rect.fromLTWH(x * cell.width, top, (x1 - x) * cell.width + 0.5, cell.height + 0.5), bgPaint..color = Color(bgs[x]));
+        x = x1;
+      }
+      // The row's text, drawn once and kept as a picture while the row
+      // stays the same (an update usually changes a line or two).
+      final cps = Uint32List.sublistView(s.cp, y * cols, (y + 1) * cols);
+      final looks = Uint32List(cols);
+      for (var x = 0; x < cols; x++) {
+        final a = s.attr[y * cols + x];
+        looks[x] = A.hidden(a) ? 0xFFFFFFFF : _look(a);
+      }
+      final h = Object.hash(fontSize, cell.width, Object.hashAll(cps), Object.hashAll(fgs), Object.hashAll(looks));
+      var row = _rows[h];
+      if (row == null || !row.same(fontSize, cell.width, cps, fgs, looks)) {
+        final rec = ui.PictureRecorder();
+        _rowText(Canvas(rec), y, fgs);
+        row = _Row(fontSize, cell.width, Uint32List.fromList(cps), Uint32List.fromList(fgs), looks, rec.endRecording());
+        if (_rows.length >= 1024) {
+          for (final r in _rows.values) {
+            r.picture.dispose();
+          }
+          _rows.clear();
+        }
+        _rows[h]?.picture.dispose();
+        _rows[h] = row;
+      }
+      canvas.save();
+      canvas.translate(0, top);
+      canvas.drawPicture(row.picture);
+      canvas.restore();
+    }
+  }
+
+  static final Map<int, _Row> _rows = {};
+
+  // Row y's text at the origin, in runs.
+  void _rowText(Canvas canvas, int y, Uint32List fgs) {
+    final cols = s.cols;
+    for (var x = 0; x < cols;) {
+      final i = y * cols + x;
+      final c = s.cp[i];
+      final a = s.attr[i];
+      if (c <= 32 || A.hidden(a)) {
+        x++;
+        continue;
+      }
+      if (c >= 127) {
+        final key = (c, fgs[x], _look(a), fontSize);
+        final tp = _glyphs[key] ??= (TextPainter(text: TextSpan(text: String.fromCharCode(c), style: _style(fgs[x], a)), textDirection: TextDirection.ltr)..layout());
+        if (_glyphs.length > 4096) _glyphs.clear();
+        tp.paint(canvas, Offset(x * cell.width, 0));
+        x++;
+        continue;
+      }
+      final run = StringBuffer()..writeCharCode(c);
+      var x1 = x + 1;
+      while (x1 < cols) {
+        final c1 = s.cp[y * cols + x1];
+        final a1 = s.attr[y * cols + x1];
+        if (c1 >= 127 || c1 < 32 || A.hidden(a1) || fgs[x1] != fgs[x] || _look(a1) != _look(a)) break;
+        run.writeCharCode(c1);
+        x1++;
+      }
+      final tp = TextPainter(text: TextSpan(text: run.toString(), style: _style(fgs[x], a)), textDirection: TextDirection.ltr)..layout();
+      tp.paint(canvas, Offset(x * cell.width, 0));
+      tp.dispose();
+      x = x1;
     }
   }
 
   @override
   bool shouldRepaint(_ScreenPainter old) => !identical(old.s, s) || old.cell != cell || old.cursor != cursor || old.sel != sel || old.pane != pane;
+}
+
+/// One row's text as drawn, and what it was drawn from.
+class _Row {
+  _Row(this.fontSize, this.width, this.cp, this.fg, this.look, this.picture);
+  final double fontSize, width;
+  final Uint32List cp, fg, look;
+  final ui.Picture picture;
+
+  static bool _eq(Uint32List a, Uint32List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  bool same(double f, double w, Uint32List c, Uint32List g, Uint32List l) => f == fontSize && w == width && _eq(c, cp) && _eq(g, fg) && _eq(l, look);
 }

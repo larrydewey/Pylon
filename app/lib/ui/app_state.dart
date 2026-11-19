@@ -103,13 +103,22 @@ class AppState extends ChangeNotifier {
   Session openNew(Host h, int rows, int cols) {
     final s = h.local ? backend.openLocal(rows, cols, shareNet: localShareNet) : backend.open(h, rows, cols);
     sessions.add(s);
+    // Pages that list sessions show their title, status and how they
+    // ended; a new screen alone (every keystroke's echo, every line of
+    // output) is the terminal's own business and rebuilds nothing else.
+    var seen = _seen(s);
     s.changes.listen((_) {
+      final now = _seen(s);
+      if (now == seen) return;
+      seen = now;
       _report();
       notifyListeners();
     });
     _report();
     return s;
   }
+
+  static (int?, String, String, AgentKeys) _seen(Session s) => (s.exitCode, s.title, s.status, s.agentKeys);
 
   /// Ends a session and forgets it.
   void end(Session s) {

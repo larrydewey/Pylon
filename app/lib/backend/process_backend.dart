@@ -329,13 +329,12 @@ class ProcSession extends Session {
   }
 
   void _onTerm(List<int> d) {
+    // Each screen frame is a whole screen: of several that arrived
+    // together only the last is decoded.
+    Uint8List? last;
     for (final (t, p) in _fromTerm.add(d)) {
       if (t == 1) {
-        final s = Screen.decode(p);
-        if (s != null) {
-          screen = s;
-          if (_starting) status = '';
-        }
+        last = p;
       } else if (t == 2) {
         _toConn(frame(1, p)); // fixed-format replies go back to the host
       } else if (t == 3) {
@@ -345,6 +344,11 @@ class ProcSession extends Session {
       } else if (t == 6) {
         scrollback.take(Uint8List.fromList(p));
       }
+    }
+    final s = last == null ? null : Screen.decode(last);
+    if (s != null) {
+      screen = s;
+      if (_starting) status = '';
     }
     changed();
   }
