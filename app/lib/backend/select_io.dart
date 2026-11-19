@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import 'clip.dart';
 import 'demo_backend.dart';
 import 'frames.dart';
 import 'model.dart';
@@ -59,6 +60,21 @@ Future<Backend> makeBackend() async {
 /// Keeps terminal content out of screenshots and recents (Android).
 Future<void> setSecure(bool on) async {
   if (Platform.isAndroid) await platform.invokeMethod('secure', on);
+}
+
+final _clip = ExpiringClipboard();
+
+/// Copies [text] from the terminal (Pylon's own selection, or a program's
+/// OSC 52 write the principal allowed) as SPEC 15 asks: on Android marked
+/// sensitive and cleared after 60 seconds if still there (MainActivity's
+/// "clipCopy"); elsewhere cleared after 60 seconds if still there.
+Future<void> copySensitive(String text) async {
+  if (Platform.isAndroid) {
+    try {
+      if (await platform.invokeMethod<bool>('clipCopy', text) == true) return;
+    } catch (_) {}
+  }
+  await _clip.copy(text);
 }
 
 /// Tabs and splits (SPEC 15, Linux desktop); phones and tablets get the

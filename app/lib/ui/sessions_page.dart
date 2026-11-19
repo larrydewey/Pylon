@@ -45,7 +45,14 @@ class SessionsPage extends StatelessWidget {
               border: P.tealLine,
               onTap: st.openInTab != null ? null : () => _show(context, s.host),
               child: Row(children: [
-                Expanded(child: Text(s.title.isNotEmpty ? visible(s.title) : s.host.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
+                // The host's name as the principal gave it; the title the
+                // host set, if any, under it and subordinate.
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(s.host.name, key: Key('session-host-${s.host.name}'), maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                    if (s.title.isNotEmpty) RemoteTitle(s.title, key: Key('session-title-${s.host.name}')),
+                  ]),
+                ),
                 Chip2(s.host.mode == Mode.pylon ? 'Pylon · live' : 'SSH · live'),
                 IconButton(
                   key: Key('disconnect-${s.host.name}'),

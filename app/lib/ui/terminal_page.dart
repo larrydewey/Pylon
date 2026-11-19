@@ -90,7 +90,10 @@ class _TerminalPageState extends State<TerminalPage> {
     return InkWell(
       onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SessionPage(st: widget.st, host: h))),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(s.title.isNotEmpty ? visible(s.title) : h.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        // Always the name the principal gave the host: a title the host
+        // sets (OSC 0/2) is the host's word, shown below it, smaller.
+        Text(h.name, key: const Key('header-host'), maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        if (s.title.isNotEmpty) RemoteTitle(s.title, key: const Key('header-title')),
         Row(children: [
           Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : P.teal, shape: BoxShape.circle)),
           const SizedBox(width: 6),
@@ -106,6 +109,8 @@ class _TerminalPageState extends State<TerminalPage> {
       backgroundColor: local ? P.localInk : P.ink2,
       appBar: AppBar(
         titleSpacing: 0,
+        // Room for the host's own title under the host's name.
+        toolbarHeight: !local && s.title.isNotEmpty ? 68 : null,
         backgroundColor: local ? P.purpleDeep : P.ink,
         foregroundColor: local ? P.localText : P.text,
         shape: local ? const Border(bottom: BorderSide(color: P.purpleLine)) : null,

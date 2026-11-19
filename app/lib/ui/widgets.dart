@@ -58,13 +58,34 @@ class Row2 extends StatelessWidget {
       );
 }
 
+/// A terminal title a host set (OSC 0/2): the host's own words, so never in
+/// place of the host's name in Pylon's interface, only under it, smaller,
+/// muted and slanted, on one line, its control and direction characters
+/// shown as codes.
+class RemoteTitle extends StatelessWidget {
+  const RemoteTitle(this.title, {super.key});
+  final String title;
+
+  @override
+  Widget build(BuildContext context) => Text(
+        visible(title, oneLine: true),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: P.muted, fontWeight: FontWeight.w400),
+      );
+}
+
 /// Text from a host or the core, shown with control characters made
-/// visible (never interpreted), SPEC 11 and 12.
-String visible(String s) {
+/// visible (never interpreted), SPEC 11 and 12. Newlines are kept, unless
+/// [oneLine] (a title, a name: text that must stay on its line).
+String visible(String s, {bool oneLine = false}) {
   final b = StringBuffer();
   for (final r in s.runes) {
-    final bidi = (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F;
-    if ((r < 0x20 && r != 0x0a) || r == 0x7f || bidi) {
+    final bidi = (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F || r == 0x061C;
+    // C1 controls, and the line and paragraph separators, which break a
+    // line as a newline does.
+    final other = (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029;
+    if ((r < 0x20 && (r != 0x0a || oneLine)) || r == 0x7f || bidi || other) {
       b.write('<U+${r.toRadixString(16).toUpperCase().padLeft(4, '0')}>');
     } else {
       b.writeCharCode(r);

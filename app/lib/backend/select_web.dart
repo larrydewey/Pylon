@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'clip.dart';
 import 'demo_backend.dart';
 import 'model.dart';
 
@@ -8,6 +9,11 @@ Future<Backend> makeBackend() async => DemoBackend();
 Future<void> setSecure(bool on) async {}
 
 bool get desktopLayout => false;
+
+final _clip = ExpiringClipboard();
+
+/// Copies from the terminal, cleared after 60 seconds if still there.
+Future<void> copySensitive(String text) => _clip.copy(text);
 
 String get deviceName => 'this device';
 

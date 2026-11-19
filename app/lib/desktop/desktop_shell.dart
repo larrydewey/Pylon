@@ -257,7 +257,7 @@ class DesktopShellState extends State<DesktopShell> {
     final h = s.host;
     final label = s.local
         ? 'local · $deviceName · sandboxed${widget.st.localShareNet ? ', network shared' : ', no network'}'
-        : '${h.name}${s.title.isNotEmpty ? ' · ${visible(s.title)}' : ''} · ${h.mode == Mode.pylon ? 'Pylon' : 'SSH'}';
+        : '${h.name}${s.title.isNotEmpty ? ' · ${visible(s.title, oneLine: true)}' : ''} · ${h.mode == Mode.pylon ? 'Pylon' : 'SSH'}';
     return Container(
       color: s.local ? P.localInk : P.ink2,
       child: Column(children: [
