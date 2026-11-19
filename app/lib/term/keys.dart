@@ -56,7 +56,7 @@ class KeyEncoder {
   /// them, with any marker inside the text removed (it could end the paste
   /// early and run what follows), SPEC 12.
   static List<int> paste(String t, {required bool bracketed}) {
-    final clean = t.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
+    final clean = stripPasteMarkers(t);
     final body = utf8.encode(clean.replaceAll('\r\n', '\r').replaceAll('\n', '\r'));
     return bracketed ? [...utf8.encode('\x1b[200~'), ...body, ...utf8.encode('\x1b[201~')] : body;
   }
@@ -65,8 +65,21 @@ class KeyEncoder {
   /// line break or control characters and the program did not ask for
   /// bracketed paste (SPEC 12).
   static bool pasteNeedsConfirm(String t, {required bool bracketed}) {
-    if (bracketed) return t.contains('\x1b[201~');
+    if (bracketed) return stripPasteMarkers(t) != t;
     return t.codeUnits.any((c) => c < 0x20 && c != 0x09);
+  }
+
+  /// [t] without paste markers, removed until none is left: removing one
+  /// can join the text around it into another (`\x1b[20\x1b[201~1~`), so a
+  /// single pass is not enough.
+  static String stripPasteMarkers(String t) {
+    final marker = RegExp('\x1b\\[20[01]~');
+    var s = t;
+    while (true) {
+      final next = s.replaceAll(marker, '');
+      if (next == s) return s;
+      s = next;
+    }
   }
 }
 

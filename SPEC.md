@@ -213,6 +213,10 @@ A host key is accepted only through one of:
 1. **A host certificate** (`*-cert-v01@openssh.com`) signed by a CA the
    principal or their Symbolon organization trusts for that host name,
    within its validity window, with the host name among its principals.
+   A certificate vouches only for a host with no pin and no secure SSHFP
+   records of the key's type: a certified key other than the pinned one
+   is a changed key (6.2), and one the secure records do not name is
+   refused as in 2.
 2. **SSHFP records** (RFC 4255, SHA-256 only) for the host name, validated
    with DNSSEC by Pylon's own resolver (not the OS's AD bit), from the
    IANA root trust anchors down (6.4). Only a *secure* answer counts: a

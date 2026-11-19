@@ -23,6 +23,19 @@ void main() {
     expect(KeyEncoder.pasteNeedsConfirm('x\x1b[201~y', bracketed: true), true);
   });
 
+  test('paste: nested markers cannot leave a marker behind', () {
+    // Removing the inner marker of each joins its neighbours into another.
+    const hostile = 'ls\x1b[20\x1b[2\x1b[200~01~1~\nid>/tmp/pwned\n';
+    final body = utf8.decode(KeyEncoder.paste(hostile, bracketed: true));
+    final inner = body.substring(6, body.length - 6);
+    expect(body.startsWith('\x1b[200~') && body.endsWith('\x1b[201~'), true);
+    expect(inner.contains('\x1b[201~'), false);
+    expect(inner.contains('\x1b[200~'), false);
+    expect(KeyEncoder.pasteNeedsConfirm(hostile, bracketed: true), true);
+    expect(KeyEncoder.stripPasteMarkers('\x1b[20\x1b[201~1~'), '');
+    expect(KeyEncoder.pasteNeedsConfirm('plain\ntext', bracketed: true), false);
+  });
+
   test('frames: split and joined reads', () {
     final r = FrameReader();
     final f = frame(1, [1, 2, 3]) + frame(2, [9]);

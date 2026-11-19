@@ -168,6 +168,23 @@ check "certificate: expired is refused" 1 "expired" \
 start_sshd "HostKey $WORK/host_cert_untrusted" "HostCertificate $WORK/host_cert_untrusted-cert.pub"
 check "certificate: from an untrusted CA is refused" 1 "CA you do not trust" \
     env PYLON_HOME="$CAH" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+
+# A trusted CA does not override a pin (SPEC 6.1, 6.2): a valid
+# certificate for a key other than the pinned one is a changed key.
+CAP="$WORK/ca_pinned_home"; mkdir -p "$CAP"
+env PYLON_HOME="$CAP" "$PYLON" ca 127.0.0.1 "$(cat host_ca.pub)" > /dev/null
+start_sshd "HostKey $WORK/host_ed25519"
+check "certificate: pin a plain key with the CA trusted" 0 "pinned" \
+    env PYLON_HOME="$CAP" "$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_ed25519.pub)"
+start_sshd "HostKey $WORK/host_cert_good" "HostCertificate $WORK/host_cert_good-cert.pub"
+check "certificate: a valid one for another key does not override the pin" 1 "HOST KEY HAS CHANGED" \
+    env PYLON_HOME="$CAP" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo via-cert-over-pin"
+check "certificate: the override attempt is in the history" 0 "refused 127.0.0.1:$PORT $(fp host_ecdsa.pub)" \
+    env PYLON_HOME="$CAP" "$PYLON" history 127.0.0.1:$PORT
+check "certificate: re-pin the certified key out of band" 0 "pinned" \
+    env PYLON_HOME="$CAP" "$PYLON" pin -p $PORT 127.0.0.1 "$(fp host_ecdsa.pub)"
+check "certificate: accepted once its key is pinned" 0 "via-cert-pinned" \
+    env PYLON_HOME="$CAP" "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo via-cert-pinned"
 start_sshd "HostKey $WORK/host_ed25519"
 
 # --- SSHFP with DNSSEC (SPEC 6.1.2), no pins ----------------------------------

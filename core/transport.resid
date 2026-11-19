@@ -257,33 +257,50 @@ pub Str trust_refusal(Trust t, List(Int) blob) {
         Cert c = cert_of_blob(blob);
         // A pinned key is trusted with or without its certificate.
         if (c.ok && pinned_has(t.pinned, c.key.blob, 0)) { return ""; }
-        if (t.cas.len() > 0) { return cert_refusal(c, t.name, t.now, t.cas); }
-        return trust_refusal(Trust {.pinned = t.pinned, .probe = false, .cas = [], .name = t.name, .now = t.now, .dns = t.dns}, c.key.blob);
+        if (t.cas.len() == 0) {
+            return trust_refusal(Trust {.pinned = t.pinned, .probe = false, .cas = [], .name = t.name, .now = t.now, .dns = t.dns}, c.key.blob);
+        }
+        Str cr = cert_refusal(c, t.name, t.now, t.cas);
+        if (str_len(cr) > 0) { return cr; }
+        // A valid certificate does not override a pin or a DNSSEC-signed
+        // SSHFP record that names another key (SPEC 6.1, 6.2): a CA
+        // trusted for the name vouches only for hosts with neither.
+        if (t.pinned.len() > 0) { return changed_key(c.key.blob); }
+        if (sshfp_match(t.dns, c.key.blob) == "mismatch") { return sshfp_mismatch(c.key.blob, t.dns); }
+        return "";
     }
     if (t.pinned.len() == 0) {
         Str m = sshfp_match(t.dns, blob);
         if (m == "match") { return ""; }
         Str dl = if (str_len(t.dns.state) > 0) { verdict_line(t.dns) + "\n" } else { "" };
-        if (m == "mismatch") {
-            return "THE HOST KEY DOES NOT MATCH THE HOST'S DNSSEC-SIGNED SSHFP RECORDS.\n"
-                + "The connection was stopped before authenticating. The host presents\n"
-                + fingerprint(blob) + "; " + dl
-                + "Either the records are out of date or this is an interception. Compare the key\n"
-                + "with a value you get another way before you pin it: pylon pin HOST FINGERPRINT";
-        }
+        if (m == "mismatch") { return sshfp_mismatch(blob, t.dns); }
         return "this host is not pinned, and Pylon does not trust a key on first use.\n"
             + dl
             + "Its key is " + fingerprint(blob) + ". Compare that with a value you get another way\n"
             + "(the host's console: ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub), then run\n"
             + "  pylon pin HOST FINGERPRINT";
     }
-    if (!pinned_has(t.pinned, blob, 0)) {
-        return "THE HOST KEY HAS CHANGED. The connection was stopped before authenticating.\n"
-            + "The host now presents " + fingerprint(blob) + ", which is not the pinned key.\n"
-            + "This is what an interception looks like. If the change is expected, verify the\n"
-            + "new key out of band and pin it again with: pylon pin HOST FINGERPRINT";
-    }
+    if (!pinned_has(t.pinned, blob, 0)) { return changed_key(blob); }
     return "";
+}
+
+// The refusal of a key other than the pinned one. The CLI recognizes it
+// by its first words to record the refusal in the host's history.
+Str changed_key(List(Int) blob) {
+    return "THE HOST KEY HAS CHANGED. The connection was stopped before authenticating.\n"
+        + "The host now presents " + fingerprint(blob) + ", which is not the pinned key.\n"
+        + "This is what an interception looks like. If the change is expected, verify the\n"
+        + "new key out of band and pin it again with: pylon pin HOST FINGERPRINT";
+}
+
+// The refusal of a key the host's secure SSHFP records do not name.
+Str sshfp_mismatch(List(Int) blob, Verdict dns) {
+    Str dl = if (str_len(dns.state) > 0) { verdict_line(dns) + "\n" } else { "" };
+    return "THE HOST KEY DOES NOT MATCH THE HOST'S DNSSEC-SIGNED SSHFP RECORDS.\n"
+        + "The connection was stopped before authenticating. The host presents\n"
+        + fingerprint(blob) + "; " + dl
+        + "Either the records are out of date or this is an interception. Compare the key\n"
+        + "with a value you get another way before you pin it: pylon pin HOST FINGERPRINT";
 }
 
 Bool pinned_has(List(List(Int)) ps, List(Int) b, Int i) {

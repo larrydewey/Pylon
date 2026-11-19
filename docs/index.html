@@ -164,8 +164,8 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <article>
       <h3>A changed key is a hard stop</h3>
       <p>The screen names the old pin and when it was made. The only ways forward are to disconnect or to re-verify
-        from scratch; every re-pin is kept in <code>pylon history</code>. (Today a CA you trust for the name can still
-        vouch for a new key on a pinned host: a known gap.)</p>
+        from scratch; every re-pin is kept in <code>pylon history</code>. A certificate from a CA you trust doesn't override
+        a pin either.</p>
     </article>
   </div>
 </section>
@@ -392,7 +392,7 @@ alice@build:~$ <span class="cursor"> </span></pre>
     <ul class="checks">
       <li><b>Clipboard writes</b> need a per-host grant; clipboard reads don't exist.</li>
       <li><b>No read-back</b>: title reports and setting queries that echo attacker text as input are not implemented.</li>
-      <li><b>Pastes</b> with newlines or control characters are shown before they're sent, and pasted text can't end a bracketed paste early (known issue: a nested-marker bypass found in review).</li>
+      <li><b>Pastes</b> with newlines or control characters are shown before they're sent, and pasted text can't end a bracketed paste early.</li>
       <li><b>Links</b> show their real target before opening.</li>
       <li><b>Pylon's own prompts</b> are drawn outside the terminal, so output can't imitate them.</li>
       <li><b>Keystroke timing</b> is hidden in fixed 20 ms frames with chaff.</li>
