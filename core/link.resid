@@ -49,6 +49,7 @@ import "wire.resid";
 import "cipher.resid";
 import "proto.resid";
 import "addr.resid";
+import "word.resid";
 
 Int window_bytes() { return 262144; }
 Int chunk_bytes() { return 1100; }
@@ -61,7 +62,7 @@ pub Int key_life_ns() { return 180000000000; }
 // whether the peer's FIN arrived, when progress was last made; for an
 // external stream the bytes received and not yet taken, and the exit code
 // to put in (or taken from) the FIN, -1 when none.
-pub type St = { Int id; Int fd; Int acked; List(Int) unacked; Int next; Int recv; Bool eof; Int fin_at; Bool fin_in; Int progress;
+pub type St = { Int id; Int fd; Int acked; List(UInt(8)) unacked; Int skip; Int dups; Int next; Int recv; Bool eof; Int fin_at; Bool fin_in; Int progress;
     Bool ext; List(Int) inbox; Int code; List(Int) opening; Bool socks; };
 
 // What happened that the program must act on: terminals asked for
@@ -160,45 +161,70 @@ List(St) put(List(St) ss, Int i, St v) { return ss[0..i].concat([v]).concat(ss[i
 List(St) drop(List(St) ss, Int i) { return ss[0..i].concat(ss[i + 1..ss.len()]); }
 
 pub St st_new(Int id, Int fd, Int now) {
-    return St {.id = id, .fd = fd, .acked = 0, .unacked = [], .next = 0, .recv = 0, .eof = false, .fin_at = -1, .fin_in = false, .progress = now,
+    return St {.id = id, .fd = fd, .acked = 0, .unacked = [], .skip = 0, .dups = 0, .next = 0, .recv = 0, .eof = false, .fin_at = -1, .fin_in = false, .progress = now,
         .ext = fd < 0, .inbox = [], .code = -1, .opening = [], .socks = false};
 }
 
+// Bytes sent and not yet acknowledged: unacked from skip on, packed (a
+// window of List(Int) would be eight bytes a byte, copied at every send).
+Int ua_len(St s) { return s.unacked.len() - s.skip; }
+
 // Copies of a stream with one part changed.
-St st_sent(St s, List(Int) unacked, Int next, Int progress) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = unacked, .next = next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = progress,
+St st_sent(St s, List(UInt(8)) unacked, Int next, Int progress) {
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = unacked, .skip = 0, .dups = s.dups, .next = next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = progress,
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
+}
+
+St st_dups(St s, Int dups, Int next, Int progress) {
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = dups, .next = next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = progress,
+        .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
+}
+
+St st_next(St s, Int next) {
+    return st_sent_at(s, next);
+}
+
+St st_sent_at(St s, Int next) {
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
         .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_ended(St s, Int at, Int code, Int now) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = true, .fin_at = at, .fin_in = s.fin_in, .progress = now,
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = s.next, .recv = s.recv, .eof = true, .fin_at = at, .fin_in = s.fin_in, .progress = now,
         .ext = s.ext, .inbox = s.inbox, .code = code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_progress(St s, Int now) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = now,
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = now,
         .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_recv(St s, Int recv, List(Int) inbox) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = s.next, .recv = recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
         .ext = s.ext, .inbox = inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
+// The first d unacknowledged bytes acknowledged: skipped, and dropped
+// from the buffer only once they are at least half of it, so an ACK
+// costs nothing per byte still held (each held byte is copied at most
+// once by these drops, however many ACKs cover the window).
 St st_acked(St s, Int d, Int fin_at, Int now) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked + d, .unacked = s.unacked[d..s.unacked.len()], .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = fin_at, .fin_in = s.fin_in, .progress = now,
+    Int k = s.skip + d;
+    Bool drop = k * 2 >= s.unacked.len();
+    List(UInt(8)) ua = if (!drop) { s.unacked } else { if (k >= s.unacked.len()) { [] } else { s.unacked[k..s.unacked.len()] } };
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked + d, .unacked = ua, .skip = if (drop) { 0 } else { k }, .dups = 0, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = fin_at, .fin_in = s.fin_in, .progress = now,
         .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = s.opening, .socks = s.socks};
 }
 
 St st_fin_in(St s, Bool fin_in, Int code) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = fin_in, .progress = s.progress,
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = fin_in, .progress = s.progress,
         .ext = s.ext, .inbox = s.inbox, .code = if (code >= 0) { code } else { s.code }, .opening = s.opening, .socks = s.socks};
 }
 
 // A stream that waits for its peer's confirmation (an ACK or DATA): its
 // opening frame is sent again every rto until then.
 St st_opening(St s, List(Int) f, Bool socks) {
-    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
+    return St {.id = s.id, .fd = s.fd, .acked = s.acked, .unacked = s.unacked, .skip = s.skip, .dups = s.dups, .next = s.next, .recv = s.recv, .eof = s.eof, .fin_at = s.fin_at, .fin_in = s.fin_in, .progress = s.progress,
         .ext = s.ext, .inbox = s.inbox, .code = s.code, .opening = f, .socks = socks};
 }
 
@@ -303,26 +329,58 @@ pub Link resize(Link l, Int sid, Int rows, Int cols, Int now) {
 // Send what the window allows from position `from` of the unacked bytes.
 @requires(network, declassify)
 Link send_from(Link l, St s, Int from, Int budget, Int now) {
-    if (budget <= 0 || from >= s.unacked.len()) { return l; }
-    Int n = if (s.unacked.len() - from < chunk_bytes()) { s.unacked.len() - from } else { chunk_bytes() };
-    Link l2 = send_frame(l, f_data(s.id, s.acked + from, s.unacked[from..from + n]), now);
+    if (budget <= 0 || from >= ua_len(s)) { return l; }
+    Int n = if (ua_len(s) - from < chunk_bytes()) { ua_len(s) - from } else { chunk_bytes() };
+    Link l2 = send_frame(l, f_data(s.id, s.acked + from, bytes_int(s.unacked[s.skip + from..s.skip + from + n])), now);
     return send_from(l2, s, from + n, budget - 1, now);
+}
+
+// Stream i's held bytes from `from` (past acked), at most budget frames
+// of them; next (how far the stream has sent) moves past what goes.
+@requires(network, declassify)
+Link pump(Link l, Int i, Int from, Int budget, Int now) {
+    St s = l.streams[i];
+    Int n = min(budget * chunk_bytes(), ua_len(s) - from);
+    if (n <= 0) { return l; }
+    St s2 = st_next(s, s.acked + from + n);
+    return send_from(with_streams(l, put(l.streams, i, s2)), s2, from, budget, now);
+}
+
+// An ACK that moves nothing while bytes are out: the peer takes only the
+// next byte it expects, so a run of these means one went missing. On the
+// third, go back to it now (fast retransmit) rather than at rto; the
+// duplicates the rest of that flight still brings are then ignored
+// (dups goes below zero by a window's frames) until an ACK moves.
+@requires(network, declassify)
+Link dup_ack(Link l, Int i, St s, Int off, Int now) {
+    if (off != s.acked || ua_len(s) == 0 || s.next <= s.acked) { return l; }
+    Int d = s.dups + 1;
+    if (d < 3) { return with_streams(l, put(l.streams, i, st_dups(s, d, s.next, s.progress))); }
+    St s2 = st_dups(s, 0 - window_bytes() / chunk_bytes() - 3, s.next, now);
+    return pump(with_streams(l, put(l.streams, i, s2)), i, 0, 64, now);
 }
 
 // Room in stream i's window, 0 when it ended or is unknown.
 pub Int room(Link l, Int sid) {
     Int i = find(l.streams, sid, 0);
     if (i < 0 || l.streams[i].eof) { return 0; }
-    return window_bytes() - l.streams[i].unacked.len();
+    return window_bytes() - ua_len(l.streams[i]);
 }
 
 // Bytes from a stream's local end into its window, and sent.
 @requires(network, declassify)
 Link push_at(Link l, Int i, List(Int) d, Int now) {
     St s = l.streams[i];
-    Int start = s.unacked.len();
-    St s2 = st_sent(s, s.unacked.concat(d), s.acked + start + d.len(), if (start == 0) { now } else { s.progress });
-    return send_from(with_streams(l, put(l.streams, i, s2)), s2, start, 64, now);
+    Int start = ua_len(s);
+    // The append copies what is held anyway, so the acknowledged bytes
+    // before skip go with it.
+    List(UInt(8)) held = if (s.skip > 0) { s.unacked[s.skip..s.unacked.len()] } else { s.unacked };
+    // While a resend is under way (next behind what is held), new bytes
+    // wait their turn: the ACKs pump them out after what was lost.
+    Bool behind = s.next < s.acked + start;
+    St s2 = st_sent(s, held.concat(bytes_u8(d)), s.next, if (start == 0) { now } else { s.progress });
+    Link l1 = with_streams(l, put(l.streams, i, s2));
+    return if (behind) { l1 } else { pump(l1, i, start, 64, now) };
 }
 
 // The local end ended (code: a terminal's exit code, or -1).
@@ -330,7 +388,7 @@ Link push_at(Link l, Int i, List(Int) d, Int now) {
 Link eof_at(Link l, Int i, Int code, Int now) {
     St s = l.streams[i];
     if (s.eof) { return l; }
-    Int at = s.acked + s.unacked.len();
+    Int at = s.acked + ua_len(s);
     return send_frame(with_streams(l, put(l.streams, i, st_ended(s, at, code, now))), f_fin(s.id, at, code), now);
 }
 
@@ -369,7 +427,7 @@ pub Link take_inbox(Link l, Int sid, Int n) {
 // Bytes sent on a stream and not yet acknowledged (0 when unknown).
 pub Int unsent(Link l, Int sid) {
     Int i = find(l.streams, sid, 0);
-    return if (i < 0) { 0 } else { l.streams[i].unacked.len() };
+    return if (i < 0) { 0 } else { ua_len(l.streams[i]) };
 }
 
 // Whether a stream is still open (its id is known).
@@ -385,7 +443,7 @@ pub Bool peer_ended(Link l, Int sid) {
 @requires(network, declassify)
 Link read_local(Link l, Int i, Int now) {
     St s = l.streams[i];
-    Int rm = window_bytes() - s.unacked.len();
+    Int rm = window_bytes() - ua_len(s);
     if (rm <= 0 || s.eof || s.ext) { return l; }
     List(Int) d = resid_tcp_recv_some(s.fd, if (rm < 16384) { rm } else { 16384 });
     if (d.len() == 0) { return eof_at(l, i, -1, now); }
@@ -397,12 +455,14 @@ Link read_local(Link l, Int i, Int now) {
 pub Link retransmit(Link l, Int i, Int now) {
     if (i >= l.streams.len()) { return l; }
     St s = l.streams[i];
-    Bool waiting = s.unacked.len() > 0 || (s.fin_at >= 0 && s.acked <= s.fin_at) || s.opening.len() > 0;
+    Bool waiting = ua_len(s) > 0 || (s.fin_at >= 0 && s.acked <= s.fin_at) || s.opening.len() > 0;
     if (!waiting || now - s.progress < rto_ns()) { return retransmit(l, i + 1, now); }
     St s2 = st_progress(s, now);
     Link l0 = if (s.opening.len() > 0) { send_frame(l, s.opening, now) } else { l };
-    Link l1 = send_from(with_streams(l0, put(l0.streams, i, s2)), s2, 0, 64, now);
-    Link l2 = if (s.fin_at >= 0 && s.unacked.len() == 0) { send_frame(l1, f_fin(s.id, s.fin_at, s.code), now) } else { l1 };
+    // Go back: next rewinds to what this burst covers, and each ACK then
+    // sends on from there (on_stream), rather than one burst per rto.
+    Link l1 = pump(with_streams(l0, put(l0.streams, i, s2)), i, 0, 64, now);
+    Link l2 = if (s.fin_at >= 0 && ua_len(s) == 0) { send_frame(l1, f_fin(s.id, s.fin_at, s.code), now) } else { l1 };
     return retransmit(l2, i + 1, now);
 }
 
@@ -487,13 +547,18 @@ Link on_stream(Link l, Int t, Int sid, Int i, St s, List(Int) f, Int now) {
         return send_frame(with_streams(l, put(l.streams, i, s2)), f_ack(sid, recv), now);
     }
     if (t == 3) {
-        Int got = if (off > s.acked + s.unacked.len()) { s.acked + s.unacked.len() } else { off };
+        Int got = if (off > s.acked + ua_len(s)) { s.acked + ua_len(s) } else { off };
         Int done = got - s.acked;
         Bool fin_acked = s.fin_at >= 0 && off == s.fin_at + 1;
-        if (done <= 0 && !fin_acked) { return l; }
+        if (done <= 0 && !fin_acked) { return dup_ack(l, i, s, off, now); }
         Int d = if (done > 0) { done } else { 0 };
         St s2 = st_acked(s, d, if (fin_acked) { -2 } else { s.fin_at }, now);
-        return finish(with_streams(l, put(l.streams, i, s2)), i);
+        Link la = with_streams(l, put(l.streams, i, s2));
+        // Held bytes not sent since a loss (or past a push's burst): as
+        // many more frames as this ACK freed, clocked by the ACKs.
+        Bool behind = s2.next < s2.acked + ua_len(s2);
+        Link lb = if (behind) { pump(la, i, max(s2.next - s2.acked, 0), d / chunk_bytes() + 2, now) } else { la };
+        return finish(lb, i);
     }
     if (t == 4) {
         Bool here = off == s.recv;
@@ -556,7 +621,7 @@ pub Link refuse(Link l, Int sid, Int now) {
 // Forward sockets with room in their window.
 pub List(Int) stream_fds(List(St) ss, Int i, List(Int) acc) {
     if (i >= ss.len()) { return acc; }
-    Bool want = !ss[i].ext && !ss[i].eof && ss[i].unacked.len() < window_bytes();
+    Bool want = !ss[i].ext && !ss[i].eof && ua_len(ss[i]) < window_bytes();
     return stream_fds(ss, i + 1, if (want) { acc.concat([ss[i].fd]) } else { acc });
 }
 
