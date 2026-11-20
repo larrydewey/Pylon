@@ -25,6 +25,7 @@
 import "crypto.resid";
 import "hash.resid";
 import "wire.resid";
+import "sha256g.resid";
 
 pub Int file_chunk() { return 65536; }
 pub Int file_max() { return 67108864; }
@@ -61,27 +62,43 @@ pub List(Int) refusal(Str why) { return [1].concat(bytes_of(why)); }
 // pylond's answer to a get: the file at path from the first chunk the
 // client's hashes do not cover.
 @requires(filesystem(readonly))
-pub List(Int) get_reply(Str path, List(Int) hashes) {
-    if (!filesystem.exists(path)) { return refusal("no such file"); }
-    if (filesystem.is_dir(path)) { return refusal("is a directory"); }
-    List(Int) data = filesystem.read_bytes(path);
-    if (data.len() > file_max()) { return refusal("larger than 64 MiB (the Pylon protocol v1 limit)"); }
-    Int start = matching(data, hashes, 0) * file_chunk();
-    return [0].concat(u64_be(data.len())).concat(u64_be(start)).concat(sha256_bytes(data)).concat(data[start..data.len()]);
+// Packed, one byte to a byte: the file is the bulk of it, and as List(Int)
+// it would take eight bytes for each of its bytes.
+pub List(UInt(8)) get_reply(Str path, List(Int) hashes) {
+    if (!filesystem.exists(path)) { return bytes_u8(refusal("no such file")); }
+    if (filesystem.is_dir(path)) { return bytes_u8(refusal("is a directory")); }
+    List(UInt(8)) data = filesystem.read_bytes_u8(path);
+    if (data.len() > file_max()) { return bytes_u8(refusal("larger than 64 MiB (the Pylon protocol v1 limit)")); }
+    Int start = matching_u8(data, hashes, 0) * file_chunk();
+    List(Int) head = [0].concat(u64_be(data.len())).concat(u64_be(start)).concat(bytes_int(sha256g(data)));
+    return bytes_u8(head).concat(data[start..data.len()]);
 }
 
-// The bytes a put sends: put_head (start, size, hash), then the file
-// from start. The client sends the file's bytes from data itself rather
+// The client's side holds a file packed, a byte a byte
+// (filesystem.read_bytes_u8): as List(Int) it would hold eight.
+
+// chunk_hashes of a packed file.
+pub List(Int) chunk_hashes_u8(List(UInt(8)) data, Int i, List(Int) acc) {
+    Int at = i * file_chunk();
+    if (at + file_chunk() > data.len()) { return acc; }
+    return chunk_hashes_u8(data, i + 1, acc.concat(bytes_int(sha256g(data[at..at + file_chunk()]))));
+}
+
+// matching for a packed file.
+pub Int matching_u8(List(UInt(8)) data, List(Int) hashes, Int k) {
+    Int at = k * file_chunk();
+    if ((k + 1) * 32 > hashes.len() || at + file_chunk() > data.len()) { return k; }
+    if (!same_bytes(bytes_int(sha256g(data[at..at + file_chunk()])), hashes[k * 32..(k + 1) * 32])) { return k; }
+    return matching_u8(data, hashes, k + 1);
+}
+
+// The head of what a put sends (start, size, hash); the file from start
+// follows. The client sends the file's bytes from data itself rather
 // than from a copy: a copy made inside the transfer's loop lives in the
-// loop's region, and every compaction of that region copies it again.
-pub List(Int) put_head(List(Int) data, List(Int) hashes) {
-    Int start = matching(data, hashes, 0) * file_chunk();
-    return u64_be(start).concat(u64_be(data.len())).concat(sha256_bytes(data));
-}
-
-pub List(Int) put_body(List(Int) data, List(Int) hashes) {
-    List(Int) h = put_head(data, hashes);
-    return h.concat(data[be64_at(h, 0)..data.len()]);
+// loop's region, and compactions of that region would carry it too.
+pub List(Int) put_head(List(UInt(8)) data, List(Int) hashes) {
+    Int start = matching_u8(data, hashes, 0) * file_chunk();
+    return u64_be(start).concat(u64_be(data.len())).concat(bytes_int(sha256g(data)));
 }
 
 // ============================================================================
@@ -157,19 +174,24 @@ pub List(Int) xfer_req(Int op, Str path, List(Int) args) {
 // The helper's answer to one request (the body, unframed): the whole of
 // what the helper does for the daemon.
 @requires(filesystem)
-pub List(Int) xfer_answer(Str home, List(Int) req) {
-    if (req.len() < 3) { return refusal("malformed request"); }
+pub List(Int) xfer_answer(Str home, List(Int) req) { return bytes_int(xfer_answer_u8(home, req)); }
+
+// xfer_answer packed, as the helper sends it (a get's answer holds the file).
+@requires(filesystem)
+pub List(UInt(8)) xfer_answer_u8(Str home, List(Int) req) {
+    if (req.len() < 3) { return bytes_u8(refusal("malformed request")); }
     Int op = req[0];
     Int n = (req[1] << 8) | req[2];
-    if (op < 1 || op > 5 || req.len() < 3 + n || !path_ok(req[3..3 + n])) { return refusal("malformed request"); }
+    if (op < 1 || op > 5 || req.len() < 3 + n || !path_ok(req[3..3 + n])) { return bytes_u8(refusal("malformed request")); }
     List(Int) a = req[3 + n..req.len()];
     XPath p = xfer_path(home, ascii_text(req[3..3 + n]));
-    if (str_len(p.path) == 0) { return refusal(if (op == 1) { "cannot read the file: " + p.why } else { "cannot write the file: " + p.why }); }
-    if (op == 1) { return if (a.len() % 32 == 0 && a.len() <= 65536) { get_reply(p.path, a) } else { refusal("malformed request") }; }
-    if (op == 2) { return if (a.len() == 1) { put_open(p.path, a[0] == 1) } else { refusal("malformed request") }; }
-    if (op == 3) { return if (a.len() == 8) { put_start(p.path, be64_at(a, 0)) } else { refusal("malformed request") }; }
-    if (op == 4) { return if (a.len() == 0 || filesystem.append_bytes(p.path, a)) { [0] } else { refusal("cannot write the file") }; }
-    return if (a.len() == 40) { put_check(p.path, be64_at(a, 0), a[8..40]) } else { refusal("malformed request") };
+    if (str_len(p.path) == 0) { return bytes_u8(refusal(if (op == 1) { "cannot read the file: " + p.why } else { "cannot write the file: " + p.why })); }
+    if (op == 1) { return if (a.len() % 32 == 0 && a.len() <= 65536) { get_reply(p.path, a) } else { bytes_u8(refusal("malformed request")) }; }
+    List(Int) r = if (op == 2) { if (a.len() == 1) { put_open(p.path, a[0] == 1) } else { refusal("malformed request") } }
+        else { if (op == 3) { if (a.len() == 8) { put_start(p.path, be64_at(a, 0)) } else { refusal("malformed request") } }
+        else { if (op == 4) { if (a.len() == 0 || filesystem.append_bytes(p.path, a)) { [0] } else { refusal("cannot write the file") } }
+        else { if (a.len() == 40) { put_check(p.path, be64_at(a, 0), a[8..40]) } else { refusal("malformed request") } } } };
+    return bytes_u8(r);
 }
 
 // put-open: the size of what is there and (to resume) its chunk hashes.
@@ -177,8 +199,8 @@ pub List(Int) xfer_answer(Str home, List(Int) req) {
 List(Int) put_open(Str path, Bool resume) {
     if (filesystem.is_dir(path)) { return refusal("is a directory"); }
     Bool keep = resume && filesystem.exists(path);
-    List(Int) old = if (keep) { filesystem.read_bytes(path) } else { [] };
-    List(Int) hs = if (old.len() <= file_max()) { chunk_hashes(old, 0, []) } else { [] };
+    List(UInt(8)) old = if (keep) { filesystem.read_bytes_u8(path) } else { [] };
+    List(Int) hs = if (old.len() <= file_max()) { chunk_hashes_u8(old, 0, []) } else { [] };
     return [0].concat(u64_be(old.len())).concat(u32_be(hs.len() / 32)).concat(hs);
 }
 
@@ -186,7 +208,7 @@ List(Int) put_open(Str path, Bool resume) {
 @requires(filesystem)
 List(Int) put_start(Str path, Int start) {
     if (start == 0) { return if (filesystem.write_bytes(path, [])) { [0] } else { refusal("cannot write the file") }; }
-    List(Int) old = if (filesystem.exists(path) && !filesystem.is_dir(path)) { filesystem.read_bytes(path) } else { [] };
+    List(UInt(8)) old = if (filesystem.exists(path) && !filesystem.is_dir(path)) { filesystem.read_bytes_u8(path) } else { [] };
     if (old.len() < start) { return refusal("the file changed during the transfer"); }
     if (old.len() == start) { return [0]; }
     return if (filesystem.write_bytes(path, old[0..start])) { [0] } else { refusal("cannot write the file") };
@@ -195,6 +217,6 @@ List(Int) put_start(Str path, Int start) {
 // check: the whole file against the size and hash the client promised.
 @requires(filesystem(readonly))
 List(Int) put_check(Str path, Int size, List(Int) hash) {
-    List(Int) got = filesystem.read_bytes(path);
-    return if (got.len() == size && same_bytes(sha256_bytes(got), hash)) { [0] } else { refusal("the file does not match what was sent") };
+    List(UInt(8)) got = filesystem.read_bytes_u8(path);
+    return if (got.len() == size && same_bytes(bytes_int(sha256g(got)), hash)) { [0] } else { refusal("the file does not match what was sent") };
 }

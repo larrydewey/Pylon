@@ -105,7 +105,7 @@ type Tty = { Int id; Int peer; Int sid; Int fd; Int pid; Term t; Int seen; };
 // bytes to send and how many are sent; for a put, the size of the file as
 // it was (for --resume), where the new bytes start, the size and hash promised, how
 // many bytes were written, and the first error.
-type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(Int) out; Int sent; Int have; Int start; Int size; List(Int) hash; Int wrote; Str err; };
+type Xf = { Int peer; Int sid; Int op; Str path; Int stage; List(UInt(8)) out; Int sent; Int have; Int start; Int size; List(Int) hash; Int wrote; Str err; };
 
 // Load (SPEC 9.4): the cookie secret and the one before it (replaced
 // every two minutes), and how many handshakes were answered in the
@@ -321,7 +321,7 @@ Srv files(Srv v, Int pi, List(List(Int)) req, Int i, Int now) {
     Bool lost = r.len() == 0;
     // A put-open answer: 0 | size (8) | count (4) | hashes; the client gets 0 | count | hashes.
     Bool good = !lost && r[0] == 0 && r.len() >= 13;
-    List(Int) out = if (!put) { [] } else { if (good) { [0].concat(r[9..r.len()]) } else { if (lost) { refusal("the file helper is gone") } else { r } } };
+    List(UInt(8)) out = bytes_u8(if (!put) { [] } else { if (good) { [0].concat(r[9..r.len()]) } else { if (lost) { refusal("the file helper is gone") } else { r } } });
     Xf x = Xf {.peer = p.id, .sid = sid, .op = req[i][1], .path = path, .stage = if (put && !good) { 2 } else { 0 }, .out = out, .sent = 0,
         .have = if (good) { be64_at(r, 1) } else { 0 }, .start = 0, .size = 0, .hash = [], .wrote = 0, .err = ""};
     Srv v0 = if (lost) { xfer_lost(v) } else { v };
@@ -341,15 +341,54 @@ Srv xfer_lost(Srv v) {
 // One request to the file helper and its answer; empty when the helper
 // is gone or silent for two minutes (the caller then drops it).
 @requires(network)
-List(Int) xcall(Int fd, List(Int) req) {
+List(Int) xcall(Int fd, List(Int) req) { return bytes_int(xcall_u8(fd, req)); }
+
+// xcall's answer packed (a get's holds the whole file).
+@requires(network)
+List(UInt(8)) xcall_u8(Int fd, List(Int) req) {
     if (fd < 0) { return []; }
     if (!send_all(fd, u32_be(req.len()).concat(req), 0)) { return []; }
     List(Int) h = recv_full(fd, 4, [], 120000);
     if (h.len() != 4) { return []; }
     Int n = be32(h, 0);
     if (n < 1 || n > file_max() + 65536) { return []; }
-    List(Int) b = recv_full(fd, n, [], 120000);
+    List(List(UInt(8))) ps = recv_pieces(fd, n, [], 0, 120000);
+    List(UInt(8)) b = join_u8(ps, 0, ListBuf());
     return if (b.len() == n) { b } else { [] };
+}
+
+// n bytes from a Unix socket as packed pieces of up to a megabyte. The
+// loop carries only the pieces (a value its region can move, so each
+// piece's List(Int) dies with its step); recv_full's concat would copy
+// all it holds at every piece.
+@requires(network)
+List(List(UInt(8))) recv_pieces(Int fd, Int n, List(List(UInt(8))) acc, Int got, Int ms) {
+    if (got >= n) { return acc; }
+    List(Int) r = resid_tcp_poll([fd], [1], ms);
+    if (r.len() == 0 || (r[0] & 1) == 0) { return acc; }
+    List(Int) more = resid_unix_recv_some(fd, min(n - got, 1048576));
+    if (more.len() == 0) { return acc; }
+    return recv_pieces(fd, n, acc.concat([bytes_u8(more)]), got + more.len(), ms);
+}
+
+// The pieces one after another.
+List(UInt(8)) join_u8(List(List(UInt(8))) ps, Int i, ListBuf(UInt(8)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return join_u8(ps, i + 1, push_all_u8(acc, ps[i], 0));
+}
+
+ListBuf(UInt(8)) push_all_u8(ListBuf(UInt(8)) acc, List(UInt(8)) b, Int i) {
+    if (i >= b.len()) { return acc; }
+    return push_all_u8(acc.push(b[i]), b, i + 1);
+}
+
+// All of packed b on a Unix socket, a megabyte at a time.
+@requires(network)
+Bool send_all_u8(Int fd, List(UInt(8)) b, Int at) {
+    if (at >= b.len()) { return true; }
+    Int n = min(b.len() - at, 1048576);
+    if (!resid_unix_send(fd, b[at..at + n])) { return false; }
+    return send_all_u8(fd, b, at + n);
 }
 
 // All of b on a Unix socket, a megabyte at a time.
@@ -379,7 +418,7 @@ Str answer_err(List(Int) r) {
     return if (r[0] == 0) { "" } else { ascii_text(r[1..r.len()]) };
 }
 
-Xf xf_out(Xf x, Int stage, List(Int) out, Int sent) {
+Xf xf_out(Xf x, Int stage, List(UInt(8)) out, Int sent) {
     return Xf {.peer = x.peer, .sid = x.sid, .op = x.op, .path = x.path, .stage = stage, .out = out, .sent = sent, .have = x.have, .start = x.start, .size = x.size, .hash = x.hash, .wrote = x.wrote, .err = x.err};
 }
 
@@ -399,7 +438,7 @@ Srv xfers(Srv v, Int i, Int now) {
     XL a = if (x.op == 0) { get_step(v.peers[pi].l, x, v.xfer, now) } else { put_step(v.peers[pi].l, x, v.xfer, false, now) };
     // What is due to the client, within the stream's window.
     Int n = min(min(room(a.l, x.sid), 65536), a.x.out.len() - a.x.sent);
-    Link l1 = if (n > 0) { push_bytes(a.l, x.sid, a.x.out[a.x.sent..a.x.sent + n], now) } else { a.l };
+    Link l1 = if (n > 0) { push_bytes(a.l, x.sid, bytes_int(a.x.out[a.x.sent..a.x.sent + n]), now) } else { a.l };
     Bool end = a.x.stage == 2 && a.x.sent + n >= a.x.out.len();
     Link l2 = if (end) { push_eof(l1, x.sid, -1, now) } else { l1 };
     Xf x2 = xf_out(a.x, if (end) { 3 } else { a.x.stage }, a.x.out, a.x.sent + n);
@@ -416,8 +455,8 @@ XL get_step(Link l, Xf x, Int fd, Int now) {
     if (x.stage != 0 || !peer_ended(l, x.sid)) { return XL {.l = l, .x = x, .lost = false}; }
     List(Int) hs = inbox(l, x.sid);
     Bool well = hs.len() % 32 == 0 && hs.len() <= 65536;
-    List(Int) r = if (well) { xcall(fd, xfer_req(1, x.path, hs)) } else { refusal("malformed request") };
-    List(Int) out = if (r.len() == 0) { refusal("the file helper is gone") } else { r };
+    List(UInt(8)) r = if (well) { xcall_u8(fd, xfer_req(1, x.path, hs)) } else { bytes_u8(refusal("malformed request")) };
+    List(UInt(8)) out = if (r.len() == 0) { bytes_u8(refusal("the file helper is gone")) } else { r };
     return XL {.l = take_inbox(l, x.sid, hs.len()), .x = xf_out(x, 2, out, 0), .lost = r.len() == 0};
 }
 
@@ -430,7 +469,7 @@ XL put_step(Link l, Xf x, Int fd, Bool lost, Int now) {
     Bool ended = peer_ended(l, x.sid);
     if (x.stage == 2) { return XL {.l = take_inbox(l, x.sid, in.len()), .x = x, .lost = lost}; }
     if (x.stage == 0 && in.len() < 48) {
-        return if (ended) { XL {.l = l, .x = xf_out(x, 2, x.out.concat(refusal("malformed request")), x.sent), .lost = lost} } else { XL {.l = l, .x = x, .lost = lost} };
+        return if (ended) { XL {.l = l, .x = xf_out(x, 2, x.out.concat(bytes_u8(refusal("malformed request"))), x.sent), .lost = lost} } else { XL {.l = l, .x = x, .lost = lost} };
     }
     if (x.stage == 0) {
         Int start = be64_at(in, 0);
@@ -459,7 +498,7 @@ XL put_step(Link l, Xf x, Int fd, Bool lost, Int now) {
     if (!ended || inbox(l1, x.sid).len() > 0) { return XL {.l = l1, .x = x1, .lost = lost1}; }
     List(Int) c = if (str_len(err) == 0) { xcall(fd, xfer_req(5, x.path, u64_be(x.size).concat(x.hash))) } else { refusal(err) };
     List(Int) verdict = if (c.len() == 0) { refusal("the file helper is gone") } else { c };
-    return XL {.l = l1, .x = xf_out(x1, 2, x1.out.concat(verdict), x1.sent), .lost = lost1 || c.len() == 0};
+    return XL {.l = l1, .x = xf_out(x1, 2, x1.out.concat(bytes_u8(verdict)), x1.sent), .lost = lost1 || c.len() == 0};
 }
 
 // ============================================================================
@@ -495,8 +534,8 @@ Int xfer_loop(Int c, Str home) {
     if (n < 3 || n > file_max() + 65536) { return 1; }
     List(Int) req = recv_full(c, n, [], 30000);
     if (req.len() != n) { return 0; }
-    List(Int) a = xfer_answer(home, req);
-    if (!send_all(c, u32_be(a.len()).concat(a), 0)) { return 0; }
+    List(UInt(8)) a = xfer_answer_u8(home, req);
+    if (!send_all(c, u32_be(a.len()), 0) || !send_all_u8(c, a, 0)) { return 0; }
     return xfer_loop(c, home);
 }
 

@@ -343,12 +343,14 @@ Int cmd_put(Opts o, Int via) {
     if (!filesystem.exists(local) || filesystem.is_dir(local)) { eprintln("pylon: " + local + " is not a file"); return 1; }
     Bool resume = has_flag(o.pflags, "resume");
     if (resume && str_len(o.pylond) == 0) { eprintln("pylon: --resume needs --pylond (SFTP transfers start over)"); return 2; }
-    List(Int) data = filesystem.read_bytes(local);
     Authed a = login(r.user, r.host, o, via);
     if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
     if (str_len(o.pylond) > 0) { return pylon_transfer(a.c, r, local, 1, resume, o, via < 0); }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
+    // Read here, for SFTP only: the Pylon protocol reads it packed itself
+    // (pylon_transfer), and a List(Int) of it costs eight bytes a byte.
+    List(Int) data = filesystem.read_bytes(local);
     Copied c = put_file(s, data, r.path);
     if (str_len(c.s.err) > 0) { eprintln("pylon: " + c.s.err); return 1; }
     _ = disconnect(c.s.ch.c, "done");
@@ -383,7 +385,7 @@ Int cmd_sftp(Opts o, Int via) {
 @requires(network, filesystem, environment, declassify, clock)
 Int pylon_transfer(Conn c, Remote r, Str local, Int op, Bool resume, Opts o, Bool direct) {
     if (!path_ok(bytes_of(r.path))) { _ = disconnect(c, "done"); eprintln("pylon: the Pylon protocol (v1) takes remote paths of printable ASCII only"); return 2; }
-    List(Int) data = if (op == 1 || resume) { filesystem.read_bytes(local) } else { [] };
+    List(UInt(8)) data = if (op == 1 || resume) { filesystem.read_bytes_u8(local) } else { [] };
     if (data.len() > file_max()) { _ = disconnect(c, "done"); eprintln("pylon: " + local + " is larger than 64 MiB (the Pylon protocol v1 limit)"); return 1; }
     Up u = pylon_up(c, r.host, o.pylond, o.pflags, direct);
     if (u.code >= 0) { return u.code; }

@@ -223,13 +223,19 @@ Chan adjust(Chan ch) {
 // Send `b` as channel data within the server's window and packet size,
 // waiting for window adjusts when the window is closed.
 @requires(network, declassify, clock(readonly))
-pub Chan send_data(Chan ch, List(Int) b) {
-    if (!chan_ok(ch) || ch.closed || b.len() == 0) { return ch; }
-    if (ch.rwin <= 0) { return send_data(step(ch), b); }
-    Int n0 = if (b.len() < ch.rmax) { b.len() } else { ch.rmax };
+pub Chan send_data(Chan ch, List(Int) b) { return send_data_at(ch, b, 0); }
+
+// b from `at` on: each packet slices only its own bytes (slicing off the
+// rest at every packet would copy a large b once per packet).
+@requires(network, declassify, clock(readonly))
+Chan send_data_at(Chan ch, List(Int) b, Int at) {
+    if (!chan_ok(ch) || ch.closed || at >= b.len()) { return ch; }
+    if (ch.rwin <= 0) { return send_data_at(step(ch), b, at); }
+    Int left = b.len() - at;
+    Int n0 = if (left < ch.rmax) { left } else { ch.rmax };
     Int n = if (n0 < ch.rwin) { n0 } else { ch.rwin };
-    Conn c2 = send_packet(ch.c, [msg_channel_data()].concat(u32_be(ch.remote)).concat(sstring(b[0..n])));
-    return send_data(with_flow(ch, c2, ch.window, ch.rwin - n), b[n..b.len()]);
+    Conn c2 = send_packet(ch.c, [msg_channel_data()].concat(u32_be(ch.remote)).concat(sstring(b[at..at + n])));
+    return send_data_at(with_flow(ch, c2, ch.window, ch.rwin - n), b, at + n);
 }
 
 @requires(network, declassify, clock(readonly))

@@ -401,7 +401,7 @@ List(Int) response(List(List(Int)) xs, Int i) {
 // how much is sent, the size, start and hash pylond announced (get), the
 // bytes written, a test hook that stops after that many bytes (as an
 // interruption would), and the outcome ("" while running).
-pub type Fx = { Link l; Rk rk; Int sid; Int op; Str local; Int stage; List(Int) data; List(Int) buf; List(Int) out; Int sent;
+pub type Fx = { Link l; Rk rk; Int sid; Int op; Str local; Int stage; List(UInt(8)) data; List(Int) buf; List(Int) out; Int sent;
     Int size; Int start; List(Int) hash; Int wrote; Int stop; Str err; Bool done; };
 
 Fx fx_l(Fx x, Link l, Rk rk) {
@@ -419,7 +419,7 @@ Fx fx_buf(Fx x, Int stage, List(Int) buf, List(Int) out, Int sent, Int wrote) {
         .size = x.size, .start = x.start, .hash = x.hash, .wrote = wrote, .stop = x.stop, .err = x.err, .done = x.done};
 }
 
-Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(Int) data) {
+Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(UInt(8)) data) {
     return Fx {.l = x.l, .rk = x.rk, .sid = x.sid, .op = x.op, .local = x.local, .stage = 1, .data = data, .buf = x.buf, .out = x.out, .sent = x.sent,
         .size = size, .start = start, .hash = hash, .wrote = 0, .stop = x.stop, .err = x.err, .done = x.done};
 }
@@ -428,10 +428,10 @@ Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(Int) data) {
 // our end of the stream. data: the local file (put), or the part of it
 // kept for --resume (get).
 @requires(network, declassify, clock(readonly))
-pub Fx file_start(Link l, Rk rk, Int op, Bool resume, Str remote, Str local, List(Int) data, Int stop, Int now) {
+pub Fx file_start(Link l, Rk rk, Int op, Bool resume, Str remote, Str local, List(UInt(8)) data, Int stop, Int now) {
     Link l1 = open_file(l, op, if (resume) { 1 } else { 0 }, bytes_of(remote), now);
     Int sid = l1.next_sid - 2;
-    Link l2 = if (op == 0) { push_eof(push_bytes(l1, sid, if (resume) { chunk_hashes(data, 0, []) } else { [] }, now), sid, -1, now) } else { l1 };
+    Link l2 = if (op == 0) { push_eof(push_bytes(l1, sid, if (resume) { chunk_hashes_u8(data, 0, []) } else { [] }, now), sid, -1, now) } else { l1 };
     return Fx {.l = l2, .rk = rk, .sid = sid, .op = op, .local = local, .stage = 0, .data = data, .buf = [], .out = [], .sent = 0,
         .size = 0, .start = 0, .hash = [], .wrote = 0, .stop = stop, .err = "", .done = false};
 }
@@ -475,7 +475,7 @@ Int out_len(Fx x) { return x.out.len() + (if (x.op == 1 && x.stage >= 1) { x.dat
 List(Int) out_at(Fx x, Int a, Int b) {
     Int h = x.out.len();
     List(Int) hp = if (a < h) { x.out[a..min(b, h)] } else { [] };
-    return if (b <= h) { hp } else { hp.concat(x.data[x.start + max(a, h) - h..x.start + b - h]) };
+    return if (b <= h) { hp } else { hp.concat(bytes_int(x.data[x.start + max(a, h) - h..x.start + b - h])) };
 }
 
 // A refusal from pylond (1 | message, then its end), shown escaped.
@@ -496,19 +496,24 @@ Fx get_bytes(Fx x, Bool ended) {
         Bool fits = start % file_chunk() == 0 && start <= x.data.len() && start <= size && size <= file_max();
         if (!fits) { return fx_end(x, "pylond sent a malformed answer"); }
         // The local file cut back to the chunks pylond has too (or emptied).
-        Bool ready = if (x.data.len() == start && start > 0) { true } else { filesystem.write_bytes(x.local, x.data[0..start]) };
+        Bool ready = if (x.data.len() == start && start > 0) { true } else { filesystem.write_bytes(x.local, bytes_int(x.data[0..start])) };
         if (!ready) { return fx_end(x, "cannot write " + x.local); }
         Fx h = fx_head(x, size, start, x.buf[17..49], []);
         return get_bytes(fx_buf(h, 1, x.buf[49..x.buf.len()], h.out, h.sent, 0), ended);
     }
     Bool over = x.start + x.wrote + x.buf.len() > x.size;
     if (over) { return fx_end(x, "pylond sent more bytes than it announced"); }
-    Bool ok = x.buf.len() == 0 || filesystem.append_bytes(x.local, x.buf);
+    // Under the test hook no more than its limit is written, so where an
+    // interrupted get stops does not depend on how much one step brought.
+    List(Int) w = if (x.stop > 0 && x.wrote + x.buf.len() > x.stop) { x.buf[0..max(x.stop - x.wrote, 0)] } else { x.buf };
+    Bool ok = w.len() == 0 || filesystem.append_bytes(x.local, w);
     if (!ok) { return fx_end(x, "cannot write " + x.local); }
-    Fx x1 = fx_buf(x, 1, [], x.out, x.sent, x.wrote + x.buf.len());
+    Fx x1 = fx_buf(x, 1, [], x.out, x.sent, x.wrote + w.len());
     if (!ended) { return x1; }
-    List(Int) got = filesystem.read_bytes(x.local);
-    Bool good = got.len() == x.size && same_bytes(sha256_bytes(got), x.hash);
+    // The whole file, checked as it lies on disk: filesystem.sha256 reads
+    // it through without holding it (read_bytes would hold eight bytes
+    // for each of its bytes).
+    Bool good = x.start + x1.wrote == x.size && same_bytes(filesystem.sha256(x.local), x.hash);
     return fx_end(x1, if (good) { "" } else { "the file does not match pylond's (size or hash)" });
 }
 
