@@ -444,9 +444,11 @@ XL put_step(Link l, Xf x, Int fd, Bool lost, Int now) {
     // Stage 1: bytes to the file (none past the size promised), 8 KiB or
     // the rest at a time, so the helper is asked once per few datagrams,
     // not once per datagram. Not more: every datagram that arrives while
-    // the bytes wait is appended by copying those already held, so a
-    // 64 KiB batch copied about 2 MB per chunk and a 40 MB put ran pylond
-    // out of memory.
+    // the bytes wait is appended by copying those already held (a 64 KiB
+    // batch copies about 2 MB per chunk). That costs time, not memory:
+    // pylond stays near 20 MB through a 40 MB put at either size; the
+    // memory a large put took was the client's (core/pyclient.resid,
+    // put_head).
     if (!ended && in.len() < 8192) { return XL {.l = l, .x = x, .lost = lost}; }
     Bool over = x.start + x.wrote + in.len() > x.size;
     List(Int) r = if (in.len() == 0 || str_len(x.err) > 0 || over) { [0] } else { xcall(fd, xfer_req(4, x.path, in)) };
