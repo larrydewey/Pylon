@@ -8,7 +8,7 @@
 # build also links compiler-rt's builtins, which differ between NDK
 # releases. This image pins all of them: a base image by digest; clang, lld
 # and llvm-libs 23.1.3-4 from the Arch Linux Archive's snapshot of
-# 2026-10-23; and the aarch64 builtins of Android NDK r29 (29.0.14206865),
+# 2026-10-23; and the aarch64 builtins of Android NDK r30 (30.0.16248370),
 # at /opt/pylon-toolchain/libclang_rt.builtins-aarch64-android.a.
 #
 # Changing anything here changes every code image, so a release built with
@@ -22,10 +22,10 @@ RUN echo 'Server = https://archive.archlinux.org/repos/2026/10/23/$repo/os/$arch
 
 # The NDK is 780 MB; only the one archive is kept.
 RUN cd /tmp \
- && curl -fsSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
- && echo "4abbbcdc842f3d4879206e9695d52709603e52dd68d3c1fff04b3b5e7a308ecf  ndk.zip" | sha256sum -c - \
+ && curl -fsSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+ && echo "753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2  ndk.zip" | sha256sum -c - \
  && mkdir -p /opt/pylon-toolchain \
- && bsdtar -xOf ndk.zip android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a \
+ && bsdtar -xOf ndk.zip android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a \
       > /opt/pylon-toolchain/libclang_rt.builtins-aarch64-android.a \
  && rm ndk.zip \
- && echo "670aa9076a57337dc8b12f4249464bb6b4e19784ae9462cd431710850d3e5ee2  /opt/pylon-toolchain/libclang_rt.builtins-aarch64-android.a" | sha256sum -c -
+ && echo "7e900bcdd0bb6f05824fd7e96c9309ee9c47c22751a1b3c98242d1f4902e4632  /opt/pylon-toolchain/libclang_rt.builtins-aarch64-android.a" | sha256sum -c -
