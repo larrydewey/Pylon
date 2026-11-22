@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// The palette from the design canvas: ink ground, teal for trust and
 /// safe actions, amber for what needs attention, red for refusals,

@@ -2,7 +2,7 @@
 // was put away (Back, or its own hide key) while the hidden text field
 // still has the focus, and Enter sends a carriage return without putting
 // the keyboard away.
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pylon/term/screen.dart';

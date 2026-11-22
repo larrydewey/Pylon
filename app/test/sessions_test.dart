@@ -1,6 +1,6 @@
 // Ending sessions: disconnecting a live one (asked first), closing an
 // ended one, and clearing the ended ones from the sessions page.
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pylon/backend/model.dart';
 import 'package:pylon/theme.dart';
