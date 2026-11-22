@@ -25,21 +25,21 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OPENSSH_TAG: V_10_2_P1
+  OPENSSH_TAG: V_10_6_P2
 
 jobs:
   interop:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: pylon
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: larrydewey/Resid
           path: resid
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: openssh/openssh-portable
           ref: ${{ env.OPENSSH_TAG }}
@@ -93,7 +93,7 @@ jobs:
           test "${PIPESTATUS[0]}" = 0
           grep -q "^ok   openssh: mlkem768x25519-sha256 only, login works" "$RUNNER_TEMP/interop.log"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: interop-log-${{ github.run_id }}

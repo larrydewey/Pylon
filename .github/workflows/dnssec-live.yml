@@ -20,13 +20,13 @@ concurrency:
 
 jobs:
   live:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: pylon
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: larrydewey/Resid
           path: resid

@@ -51,7 +51,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Local shell | `pylon-local` (SPEC 13): a shell on the device that cannot reach Pylon's files, the agent, Pylon's processes or the network. Linux: an empty environment and new user, mount, pid and network namespaces with a root of its own (system directories read-only, its own home at `~/.local/share/pylon-local/home`); Android: an `isolatedProcess` service (its own UID, no permissions, no storage), not yet verified on a device. No SSH from it yet |
 | Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
 
-Tested against OpenSSH 9.6, against OpenSSH 10.2 in CI (`openssh10`
+Tested against OpenSSH 9.6, against OpenSSH 10.6p2 in CI (`openssh10`
 workflow: built from source, the post-quantum hybrid negotiated with
 OpenSSH itself), and the handshake against Dropbear 2022.83:
 230 interoperability, interactive, timing, forwarding (-L/-D/-R), SFTP,
