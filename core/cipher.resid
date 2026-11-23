@@ -33,6 +33,12 @@ List(Secret(UInt(8))) lift_acc(List(Int) b, Int i, ListBuf(Secret(UInt(8))) acc)
     return lift_acc(b, i + 1, acc.push(classify(wrapping_u8(b[i]))));
 }
 
+// Packed public bytes lifted the same way. Secret bytes are packed bytes
+// at run time (secret_split and classify erase), so this is no copy: the
+// packet path keeps its bytes packed, one byte a byte, from the socket
+// through the cipher and back.
+pub List(Secret(UInt(8))) lift_u8(List(UInt(8)) b) { return secret_split(classify(b)); }
+
 pub List(Int) ints_of(List(UInt(8)) b) { return ints_acc(b, 0, ListBuf()); }
 
 List(Int) ints_acc(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
@@ -40,9 +46,21 @@ List(Int) ints_acc(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
     return ints_acc(b, i + 1, acc.push((Int) b[i]));
 }
 
+// Bytes [from, to) of b as Ints, without slicing them out first.
+pub List(Int) ints_range(List(UInt(8)) b, Int from, Int to) { return ints_range_acc(b, from, to, ListBuf()); }
+
+List(Int) ints_range_acc(List(UInt(8)) b, Int i, Int to, ListBuf(Int) acc) {
+    if (i >= to) { return acc.finish(); }
+    return ints_range_acc(b, i + 1, to, acc.push((Int) b[i]));
+}
+
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
-pub List(Int) pub_sealed(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "sealed packet bytes are sent on the wire")); }
+pub List(UInt(8)) sealed_bytes(List(Secret(UInt(8))) s) { return declassify(secret_join(s), "sealed packet bytes are sent on the wire"); }
+
+@robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
+@requires(declassify)
+pub List(Int) pub_sealed(List(Secret(UInt(8))) s) { return ints_of(sealed_bytes(s)); }
 
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
@@ -50,7 +68,11 @@ List(Int) pub_length(List(Secret(UInt(8))) s) { return ints_of(declassify(secret
 
 @robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
 @requires(declassify)
-pub List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(declassify(secret_join(s), "packet payload after its tag verified")); }
+pub List(UInt(8)) plain_bytes(List(Secret(UInt(8))) s) { return declassify(secret_join(s), "packet payload after its tag verified"); }
+
+@robust_exempt(reason = "a network protocol: which packets arrive decides when sealed bytes are sent and authenticated payloads are opened; only ciphertext, tags, frame lengths and verified plaintext are published")
+@requires(declassify)
+pub List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(plain_bytes(s)); }
 
 // kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM. The GCM IV
 // is not secret (RFC 5647 7.1).
@@ -99,25 +121,34 @@ Int block_of(Dir d) { return if (d.kind == 2) { 16 } else { 8 }; }
 // Padding (RFC 4253 6): at least 4 random bytes, so that the padded part
 // is a multiple of the block size. Under AEAD the length field is not
 // part of that (it is the AAD or encrypted on its own).
-pub List(Int) frame(Dir d, List(Int) payload) {
+//
+// The payload is `head` then `data`: a message's fields, and the bulk
+// bytes it carries, packed (a channel's data). The two are framed
+// together, so channel data is never first copied into a payload list of
+// its own. body: the padding length, the payload and the padding, which
+// is what the cipher seals after the length field len4.
+pub type Framed = { List(Int) len4; List(UInt(8)) body; };
+
+pub Framed frame(Dir d, List(Int) head, List(UInt(8)) data) {
     Int bs = block_of(d);
-    Int counted = if (d.kind == 0) { 5 + payload.len() } else { 1 + payload.len() };
+    Int n = head.len() + data.len();
+    Int counted = if (d.kind == 0) { 5 + n } else { 1 + n };
     Int pad0 = bs - (counted % bs);
     Int pad = if (pad0 < 4) { pad0 + bs } else { pad0 };
-    List(Int) body = [pad].concat(payload).concat(random_bytes(pad));
-    return u32_be(body.len()).concat(body);
+    List(UInt(8)) body = bytes_u8([pad].concat(head)).concat(data).concat(bytes_u8(random_bytes(pad)));
+    return Framed {.len4 = u32_be(1 + n + pad), .body = body};
 }
 
-pub type Sealed = { Dir d; List(Int) out; };
+pub type Sealed = { Dir d; List(UInt(8)) out; };
 
 @requires(declassify)
-pub Sealed seal(Dir d, List(Int) payload) {
-    List(Int) pkt = frame(d, payload);
-    if (d.kind == 0) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = pkt}; }
-    if (d.kind == 1) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = cc_seal(d.key, d.seq, pkt)}; }
-    List(Int) ct = pub_sealed(aes_gcmg_seal(d.key, d.iv, lift(pkt[4..pkt.len()]), pkt[0..4]));
+pub Sealed seal(Dir d, List(Int) head, List(UInt(8)) data) {
+    Framed f = frame(d, head, data);
+    if (d.kind == 0) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = bytes_u8(f.len4).concat(f.body)}; }
+    if (d.kind == 1) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = cc_seal(d.key, d.seq, f)}; }
+    List(UInt(8)) ct = sealed_bytes(aes_gcmg_seal(d.key, d.iv, lift_u8(f.body), f.len4));
     Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
-    return Sealed {.d = nd, .out = pkt[0..4].concat(ct)};
+    return Sealed {.d = nd, .out = bytes_u8(f.len4).concat(ct)};
 }
 
 // ============================================================================
@@ -131,16 +162,16 @@ pub Sealed seal(Dir d, List(Int) payload) {
 
 List(Int) cc_nonce(Int seq) { return [0, 0, 0, 0].concat(u64_be(seq)); }
 
+// The ciphertext stays secret-typed until the whole packet (length,
+// body, tag) is published at once.
 @requires(declassify)
-List(Int) cc_seal(List(Secret(UInt(8))) key, Int seq, List(Int) pkt) {
+List(UInt(8)) cc_seal(List(Secret(UInt(8))) key, Int seq, Framed f) {
     List(Secret(UInt(8))) k2 = key[0..32];
     List(Secret(UInt(8))) k1 = key[32..64];
     List(Int) n = cc_nonce(seq);
-    List(Int) enc_len = pub_sealed(chachag_xor(k1, 0, n, lift(pkt[0..4])));
-    List(Int) enc_body = pub_sealed(chachag_xor(k2, 1, n, lift(pkt[4..pkt.len()])));
+    List(Secret(UInt(8))) ct = chachag_xor(k1, 0, n, lift(f.len4)).concat(chachag_xor(k2, 1, n, lift_u8(f.body)));
     List(Secret(UInt(8))) poly_key = chachag_block(k2, 0, n)[0..32];
-    List(Int) ct = enc_len.concat(enc_body);
-    return ct.concat(pub_sealed(poly1305g(poly_key, lift(ct))));
+    return sealed_bytes(ct.concat(poly1305g(poly_key, ct)));
 }
 
 // The packet length from the first four received bytes, decrypted with
@@ -186,38 +217,45 @@ pub Int need_after_len(Dir d, List(Int) first4) {
     return n + tag;
 }
 
-pub type Opened = { Dir d; Bool ok; List(Int) payload; };
+// A packet opened: body is the decrypted padding length, payload and
+// padding, and the payload is body[from..to] (bounds, so the payload is
+// not copied out of the body here; the transport takes what it needs).
+pub type Opened = { Dir d; Bool ok; List(UInt(8)) body; Int from; Int to; };
 
-Opened open_bad(Dir d) { return Opened {.d = d, .ok = false, .payload = []}; }
+Opened open_bad(Dir d) { return Opened {.d = d, .ok = false, .body = [], .from = 0, .to = 0}; }
 
-// `pkt` is one whole packet as received: length field, body, tag.
+// The packet is bytes [at, at + len) of buf, as received: length field,
+// body, tag. It is read where it lies in the receive buffer.
 @requires(declassify)
-pub Opened open(Dir d, List(Int) pkt) {
-    if (pkt.len() < 4) { return open_bad(d); }
-    if (d.kind == 0) { return unpad(dir_seq(d, next_seq(d.seq)), pkt[4..pkt.len()]); }
-    if (pkt.len() < 4 + 16) { return open_bad(d); }
+pub Opened open(Dir d, List(UInt(8)) buf, Int at, Int len) {
+    if (len < 4 || at < 0 || at + len > buf.len()) { return open_bad(d); }
+    Int end = at + len;
+    if (d.kind == 0) { return unpad(dir_seq(d, next_seq(d.seq)), buf[at + 4..end]); }
+    if (len < 4 + 16) { return open_bad(d); }
     if (d.kind == 1) {
         List(Secret(UInt(8))) k2 = d.key[0..32];
         List(Int) n = cc_nonce(d.seq);
-        Int tag_at = pkt.len() - 16;
+        Int tag_at = end - 16;
         List(Secret(UInt(8))) poly_key = chachag_block(k2, 0, n)[0..32];
-        List(Secret(UInt(8))) want = poly1305g(poly_key, lift(pkt[0..tag_at]));
+        List(Secret(UInt(8))) want = poly1305g(poly_key, lift_u8(buf[at..tag_at]));
         // The MAC is checked (publishing one bit) before anything is decrypted.
-        if (!ct_same(want, lift(pkt[tag_at..pkt.len()]))) { return open_bad(d); }
-        List(Int) body = pub_plain(chachag_xor(k2, 1, n, lift(pkt[4..tag_at])));
+        if (!ct_same(want, lift_u8(buf[tag_at..end]))) { return open_bad(d); }
+        List(UInt(8)) body = plain_bytes(chachag_xor(k2, 1, n, lift_u8(buf[at + 4..tag_at])));
         return unpad(dir_seq(d, next_seq(d.seq)), body);
     }
-    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(d.key, d.iv, pkt[4..pkt.len()], pkt[0..4]);
+    // aes_gcmg_decrypt takes the received bytes as Ints: they are widened
+    // once, here, straight out of the buffer.
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(d.key, d.iv, ints_range(buf, at + 4, end), ints_range(buf, at, at + 4));
     Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
     return match pt {
         None => open_bad(d),
-        Some(body) => unpad(nd, pub_plain(body)),
+        Some(body) => unpad(nd, plain_bytes(body)),
     };
 }
 
-Opened unpad(Dir nd, List(Int) body) {
+Opened unpad(Dir nd, List(UInt(8)) body) {
     if (body.len() < 1) { return open_bad(nd); }
-    Int pad = body[0];
+    Int pad = (Int) body[0];
     if (pad < 4 || 1 + pad > body.len()) { return open_bad(nd); }
-    return Opened {.d = nd, .ok = true, .payload = body[1..body.len() - pad]};
+    return Opened {.d = nd, .ok = true, .body = body, .from = 1, .to = body.len() - pad};
 }

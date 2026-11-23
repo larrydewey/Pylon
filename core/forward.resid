@@ -292,13 +292,13 @@ Mux read_one(Mux m, Int k) {
     FC f = m.chans[k];
     Int want0 = if (f.rmax < f.rwin) { f.rmax } else { f.rwin };
     Int want = if (want0 > 16384) { 16384 } else { want0 };
-    List(Int) d = resid_tcp_recv_some(f.fd, want);
+    List(UInt(8)) d = resid_tcp_recv_some_u8(f.fd, want);
     if (d.len() == 0) {
         Conn c1 = send_packet(m.c, [msg_channel_eof()].concat(u32_be(f.remote)));
         Conn c2 = send_packet(c1, [msg_channel_close()].concat(u32_be(f.remote)));
         return with_chans(m, c2, put(m.chans, k, fc_state(f, 2)));
     }
-    Conn c3 = send_packet(m.c, [msg_channel_data()].concat(u32_be(f.remote)).concat(sstring(d)));
+    Conn c3 = send_data_packet(m.c, [msg_channel_data()].concat(u32_be(f.remote)).concat(u32_be(d.len())), d);
     return with_chans(m, c3, put(m.chans, k, fc_flow(f, f.window, f.rwin - d.len())));
 }
 
@@ -331,10 +331,13 @@ Mux on_packet(Mux m) {
         return with_chans(m, k.c, drop(m.chans, i));
     }
     if (t == msg_channel_data()) {
-        Got d = rd_str(rc.r);
-        if (!rd_ok(d.r) || d.v.len() > fwd_max_packet() || d.v.len() > f.window) { return with_err(m, "the server exceeded a channel's window or packet size"); }
-        _ = resid_tcp_send_bin(f.fd, d.v);
-        Int w = f.window - d.v.len();
+        // The data's bytes came apart from the message, packed (Held in
+        // transport.resid); its length field must say as much.
+        GotInt dl = rd_u32(rc.r);
+        Int n = k.d.len();
+        if (!rd_ok(dl.r) || dl.v != n || n > fwd_max_packet() || n > f.window) { return with_err(m, "the server exceeded a channel's window or packet size"); }
+        _ = resid_tcp_send_bin(f.fd, k.d);
+        Int w = f.window - n;
         Bool low = w <= fwd_window() / 2;
         Conn c2 = if (low) { send_packet(k.c, [msg_channel_window_adjust()].concat(u32_be(f.remote)).concat(u32_be(fwd_window() - w))) } else { k.c };
         return with_chans(m, c2, put(m.chans, i, fc_flow(f, if (low) { fwd_window() } else { w }, f.rwin)));

@@ -44,7 +44,7 @@ pub Arch host_arch(Conn c0) {
     Chan done = pump(send_eof(exec(capturing(ch), "uname -m")));
     if (!chan_ok(done)) { return Arch {.c = done.c, .arch = "", .err = done.err}; }
     // uname's line without its newline (ascii_text would show it as "?").
-    Str a = str_trim(ascii_text(no_eol(done.inbox)));
+    Str a = str_trim(ascii_text(no_eol(kept(done))));
     return Arch {.c = done.c, .arch = if (a == "arm64") { "aarch64" } else { a }, .err = ""};
 }
 
@@ -63,7 +63,7 @@ pub Pushed push_pylond(Conn c0, List(Int) bin, Str hash) {
     Chan sent = send_eof(send_data(ex, bin));
     Chan done = pump(sent);
     if (!chan_ok(done)) { return Pushed {.c = done.c, .err = done.err}; }
-    Bool ok = str_contains(ascii_text(done.inbox), "PYLOND-OK");
+    Bool ok = str_contains(ascii_text(kept(done)), "PYLOND-OK");
     return Pushed {.c = done.c, .err = if (ok) { "" } else { "the host did not store pylond with the expected hash" }};
 }
 
@@ -80,8 +80,8 @@ pub Started start_pylond_b(Conn c0, Str hash, Int idle, Bool ephemeral, Bool unc
     Chan ex = exec(capturing(ch), run_command_b(hash, idle, ephemeral, unconfined, busy));
     Chan sent = send_data(ex, boot_hello(bc));
     Chan got = await_bytes(sent, boot_reply_len());
-    if (!chan_ok(got) || got.inbox.len() < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }
-    Boot b = boot_finish(bc, got.inbox[0..boot_reply_len()]);
+    if (!chan_ok(got) || kept_len(got) < boot_reply_len()) { return Started {.c = got.c, .b = boot_finish(bc, []), .bc = bc, .err = "pylond did not answer the bootstrap"}; }
+    Boot b = boot_finish(bc, kept_ints(got, 0, boot_reply_len()));
     return Started {.c = got.c, .b = b, .bc = bc, .err = if (b.ok) { "" } else { "pylond sent a malformed bootstrap reply" }};
 }
 

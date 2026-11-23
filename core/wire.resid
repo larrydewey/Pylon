@@ -59,6 +59,12 @@ pub Int be32(List(Int) b, Int i) {
     return (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3];
 }
 
+// be32 over packed bytes.
+pub Int be32_u8(List(UInt(8)) b, Int i) {
+    if (i < 0 || i + 4 > b.len()) { return -1; }
+    return ((Int) b[i] << 24) | ((Int) b[i + 1] << 16) | ((Int) b[i + 2] << 8) | (Int) b[i + 3];
+}
+
 pub GotInt rd_byte(Rd r) {
     Got g = take(r, 1);
     return GotInt {.r = g.r, .v = if (rd_ok(g.r)) { g.v[0] } else { -1 }};

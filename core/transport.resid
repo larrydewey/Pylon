@@ -35,12 +35,25 @@ pub Str our_version() { return "SSH-2.0-Pylon_0.1"; }
 // m: the traffic under the current keys, which decides when Pylon rekeys.
 // held: packets that arrived, in order, while Pylon waited for the
 // server's answer to a rekey it started; next_once hands them out first.
+// buf: bytes received, packed (one byte a byte); those before `at` are
+// already read. Packets are opened where they lie in buf and `at` moves
+// past them: what follows a packet is not copied out at every packet,
+// only when more is received (fill).
 pub type Conn = {
-    Int fd; Dir tx; Dir rx; List(Int) buf; Bool eof; Str err;
+    Int fd; Dir tx; Dir rx; List(UInt(8)) buf; Int at; Bool eof; Str err;
     Str v_s; List(Int) sid; List(Int) host_blob; List(Int) host_sig; Str host_alg;
     Bool strict; List(Str) sig_algs; Bool hostbound; Bool ping;
-    Meter m; List(List(Int)) held;
+    Meter m; List(Held) held;
 };
+
+// A packet's payload as the connection hands it out: p, the message
+// (Ints, for the parsers), and d, the bulk bytes of channel data, packed.
+// For CHANNEL_DATA and CHANNEL_EXTENDED_DATA whose string fits the
+// payload, p ends with the string's length field and d is the string;
+// for anything else p is the whole payload and d is empty. Channel data
+// so stays packed from the socket to where it is written, and is never
+// widened to eight bytes a byte on its way.
+pub type Held = { List(Int) p; List(UInt(8)) d; };
 
 // Rekeying (SPEC 5): after 1 GiB in either direction, one hour, or 2^31
 // packets in either direction under the same keys, whichever comes first.
@@ -78,34 +91,34 @@ pub Conn rekey_limits(Conn c, Int bytes, Int pkts, Int secs) {
     Int ns = if (secs > 0 && secs < 3600) { secs * 1000000000 } else { rekey_ns() };
     Meter m = Meter {.tx_b = c.m.tx_b, .rx_b = c.m.rx_b, .tx_p = c.m.tx_p, .rx_p = c.m.rx_p, .at = c.m.at,
         .max_b = lower(bytes, rekey_bytes()), .max_p = lower(pkts, rekey_packets()), .max_ns = ns};
-    return mk(c, c.tx, c.rx, c.buf, c.eof, c.err, m, c.held);
+    return mk(c, c.tx, c.rx, c.buf, c.at, c.eof, c.err, m, c.held);
 }
 
-Conn mk(Conn c, Dir tx, Dir rx, List(Int) buf, Bool eof, Str err, Meter m, List(List(Int)) held) {
-    return Conn {.fd = c.fd, .tx = tx, .rx = rx, .buf = buf, .eof = eof, .err = err,
+Conn mk(Conn c, Dir tx, Dir rx, List(UInt(8)) buf, Int at, Bool eof, Str err, Meter m, List(Held) held) {
+    return Conn {.fd = c.fd, .tx = tx, .rx = rx, .buf = buf, .at = at, .eof = eof, .err = err,
         .v_s = c.v_s, .sid = c.sid, .host_blob = c.host_blob, .host_sig = c.host_sig, .host_alg = c.host_alg,
         .strict = c.strict, .sig_algs = c.sig_algs, .hostbound = c.hostbound, .ping = c.ping,
         .m = m, .held = held};
 }
 
-pub Conn conn_err(Conn c, Str e) { return mk(c, c.tx, c.rx, c.buf, c.eof, e, c.m, c.held); }
+pub Conn conn_err(Conn c, Str e) { return mk(c, c.tx, c.rx, c.buf, c.at, c.eof, e, c.m, c.held); }
 
-Conn with_io(Conn c, Dir tx, Dir rx, List(Int) buf, Bool eof) { return mk(c, tx, rx, buf, eof, c.err, c.m, c.held); }
+Conn with_io(Conn c, Dir tx, Dir rx, List(UInt(8)) buf, Int at, Bool eof) { return mk(c, tx, rx, buf, at, eof, c.err, c.m, c.held); }
 
-Conn with_held(Conn c, List(List(Int)) held) { return mk(c, c.tx, c.rx, c.buf, c.eof, c.err, c.m, held); }
+Conn with_held(Conn c, List(Held) held) { return mk(c, c.tx, c.rx, c.buf, c.at, c.eof, c.err, c.m, held); }
 
 // Whether a packet can be had without reading the socket: event loops
 // poll without waiting then.
-pub Bool pending(Conn c) { return c.buf.len() > 0 || c.held.len() > 0; }
+pub Bool pending(Conn c) { return c.buf.len() > c.at || c.held.len() > 0; }
 
 // The connection as it is, rebuilt field by field. Transport functions
 // return this rather than their argument itself, so Resid's key-entropy
 // check (E0270) keeps each field's origin apart instead of treating the
 // whole record as one value (SPEC I6).
-pub Conn same(Conn c) { return with_io(c, c.tx, c.rx, c.buf, c.eof); }
+pub Conn same(Conn c) { return with_io(c, c.tx, c.rx, c.buf, c.at, c.eof); }
 
 pub Conn conn_new(Int fd) {
-    return Conn {.fd = fd, .tx = dir_none(), .rx = dir_none(), .buf = [], .eof = false, .err = "",
+    return Conn {.fd = fd, .tx = dir_none(), .rx = dir_none(), .buf = [], .at = 0, .eof = false, .err = "",
         .v_s = "", .sid = [], .host_blob = [], .host_sig = [], .host_alg = "",
         .strict = false, .sig_algs = [], .hostbound = false, .ping = false, .m = meter_new(), .held = []};
 }
@@ -116,17 +129,31 @@ pub Bool conn_ok(Conn c) { return str_len(c.err) == 0; }
 // Bytes
 // ============================================================================
 
-// Read until the buffer holds at least n bytes or the peer is done.
+// Read until at least n bytes are unread or the peer is done. The bytes
+// already read are dropped here, when more arrive: what is still unread
+// (part of a packet) moves to the front of the new buffer once per
+// receive, rather than at every packet. (One expression for the new
+// buffer, not a choice between keeping and compacting it: alternatives
+// there make the key-entropy check, E0270, lose the connection's fields
+// apart.)
 @requires(network, declassify)
 Conn fill(Conn c, Int n) {
-    if (c.buf.len() >= n || c.eof) { return same(c); }
-    List(Int) more = resid_tcp_recv_some(c.fd, 65536);
-    if (more.len() == 0) { return with_io(c, c.tx, c.rx, c.buf, true); }
-    return fill(with_io(c, c.tx, c.rx, c.buf.concat(more), false), n);
+    if (c.buf.len() - c.at >= n || c.eof) { return same(c); }
+    List(UInt(8)) more = resid_tcp_recv_some_u8(c.fd, 65536);
+    if (more.len() == 0) { return with_io(c, c.tx, c.rx, c.buf, c.at, true); }
+    List(UInt(8)) nb = c.buf[c.at..c.buf.len()].concat(more);
+    return fill(with_io(c, c.tx, c.rx, nb, 0, false), n);
 }
 
 @requires(network, declassify)
 pub Conn send_raw(Conn c, List(Int) b) {
+    if (!conn_ok(c)) { return same(c); }
+    if (!resid_tcp_send_bin(c.fd, b)) { return conn_err(c, "the connection closed while sending"); }
+    return same(c);
+}
+
+@requires(network, declassify)
+Conn send_raw_u8(Conn c, List(UInt(8)) b) {
     if (!conn_ok(c)) { return same(c); }
     if (!resid_tcp_send_bin(c.fd, b)) { return conn_err(c, "the connection closed while sending"); }
     return same(c);
@@ -148,26 +175,28 @@ pub Conn version_exchange(Conn c0) {
 Conn read_version(Conn c, Int lines) {
     if (!conn_ok(c)) { return same(c); }
     if (lines > 1024) { return conn_err(c, "the server sent no version line"); }
-    Int nl = index_of_nl(c.buf, 0);
+    Int k = index_of_nl(c.buf, c.at);
+    Int nl = if (k < 0) { -1 } else { k - c.at };
     if (nl < 0) {
-        if (c.buf.len() > 255) { return conn_err(c, "the server's banner line is too long"); }
+        if (c.buf.len() - c.at > 255) { return conn_err(c, "the server's banner line is too long"); }
         if (c.eof) { return conn_err(c, "the server closed the connection before its version line"); }
-        return read_version(fill(c, c.buf.len() + 1), lines);
+        return read_version(fill(c, c.buf.len() - c.at + 1), lines);
     }
     if (nl > 255) { return conn_err(c, "the server's banner line is too long"); }
-    Int end = if (nl > 0 && c.buf[nl - 1] == 13) { nl - 1 } else { nl };
-    Str line = ascii_text(c.buf[0..end]);
-    Conn rest = with_io(c, c.tx, c.rx, c.buf[nl + 1..c.buf.len()], c.eof);
+    Int end = if (nl > 0 && c.buf[c.at + nl - 1] == 13) { nl - 1 } else { nl };
+    Str line = ascii_text(ints_range(c.buf, c.at, c.at + end));
+    Conn rest = with_io(c, c.tx, c.rx, c.buf, c.at + nl + 1, c.eof);
     if (!str_starts_with(line, "SSH-")) { return read_version(rest, lines + 1); }
     if (!str_starts_with(line, "SSH-2.0-") && !str_starts_with(line, "SSH-1.99-")) { return conn_err(rest, "the server does not speak SSH 2.0"); }
-    return Conn {.fd = rest.fd, .tx = rest.tx, .rx = rest.rx, .buf = rest.buf, .eof = rest.eof, .err = "",
+    return Conn {.fd = rest.fd, .tx = rest.tx, .rx = rest.rx, .buf = rest.buf, .at = rest.at, .eof = rest.eof, .err = "",
         .v_s = line, .sid = [], .host_blob = [], .host_sig = [], .host_alg = "",
         .strict = false, .sig_algs = [], .hostbound = false, .ping = false, .m = rest.m, .held = []};
 }
 
-Int index_of_nl(List(Int) b, Int i) {
+// The index of the first newline in b from i on, or -1.
+Int index_of_nl(List(UInt(8)) b, Int i) {
     if (i >= b.len()) { return -1; }
-    if (b[i] == 10) { return i; }
+    if (b[i] == wrapping_u8(10)) { return i; }
     return index_of_nl(b, i + 1);
 }
 
@@ -178,45 +207,72 @@ Int index_of_nl(List(Int) b, Int i) {
 // A connection-level packet: a rekey first, when one is due.
 @requires(network, declassify, clock(readonly))
 pub Conn send_packet(Conn c, List(Int) payload) {
-    return send_now(rekey_if_due(c), payload);
+    return send_parts(rekey_if_due(c), payload, []);
 }
 
-// A packet sent as it is: the key exchange's own, and DISCONNECT. A
-// sequence number is never used twice under one key: rather than let it
-// wrap, the connection ends.
+// The same for a message that carries bulk bytes (channel data): its
+// fields `head`, then `data`, packed, framed together without being
+// joined into one payload first.
+@requires(network, declassify, clock(readonly))
+pub Conn send_data_packet(Conn c, List(Int) head, List(UInt(8)) data) {
+    return send_parts(rekey_if_due(c), head, data);
+}
+
+// A packet sent as it is: the key exchange's own, and DISCONNECT.
 @requires(network, declassify)
-Conn send_now(Conn c, List(Int) payload) {
+Conn send_now(Conn c, List(Int) payload) { return send_parts(c, payload, []); }
+
+// A sequence number is never used twice under one key: rather than let
+// it wrap, the connection ends.
+@requires(network, declassify)
+Conn send_parts(Conn c, List(Int) head, List(UInt(8)) data) {
     if (!conn_ok(c)) { return same(c); }
     if (seq_spent(c.tx)) { return conn_err(c, "the outgoing packet sequence number would wrap and repeat a nonce; ending the connection"); }
-    Sealed s = seal(c.tx, payload);
-    Conn c2 = mk(c, s.d, c.rx, c.buf, c.eof, c.err, meter_sent(c.m, s.out.len()), c.held);
-    return send_raw(c2, s.out);
+    Sealed s = seal(c.tx, head, data);
+    Conn c2 = mk(c, s.d, c.rx, c.buf, c.at, c.eof, c.err, meter_sent(c.m, s.out.len()), c.held);
+    return send_raw_u8(c2, s.out);
 }
 
-pub type Pkt = { Conn c; List(Int) p; };
+// p and d as in Held.
+pub type Pkt = { Conn c; List(Int) p; List(UInt(8)) d; };
 
-Pkt pkt_err(Conn c, Str e) { return Pkt {.c = conn_err(c, e), .p = []}; }
+Pkt pkt_err(Conn c, Str e) { return Pkt {.c = conn_err(c, e), .p = [], .d = []}; }
+
+// CHANNEL_DATA and CHANNEL_EXTENDED_DATA (RFC 4254 5.2): their bytes are
+// kept apart from the message (Held).
+Int data_msg() { return 94; }
+Int ext_data_msg() { return 95; }
+
+// The payload body[from..to] (not empty) as a Held.
+Held split(List(UInt(8)) body, Int from, Int to) {
+    Int t = (Int) body[from];
+    Int hdr = if (t == data_msg()) { 9 } else { if (t == ext_data_msg()) { 13 } else { 0 } };
+    Int n = if (hdr > 0 && to - from >= hdr) { be32_u8(body, from + hdr - 4) } else { -1 };
+    if (n < 0 || n > to - from - hdr) { return Held {.p = ints_range(body, from, to), .d = []}; }
+    return Held {.p = ints_range(body, from, from + hdr), .d = body[from + hdr..from + hdr + n]};
+}
 
 // The next packet's payload, whatever its type. Written with one success
 // and one failure return (not one per check), which also keeps the
 // compiler's key-entropy check precise about the connection's fields.
 @requires(network, declassify)
 pub Pkt recv_packet(Conn c0) {
-    if (!conn_ok(c0)) { return Pkt {.c = same(c0), .p = []}; }
+    if (!conn_ok(c0)) { return Pkt {.c = same(c0), .p = [], .d = []}; }
     Conn c = fill(c0, 4);
-    Int need = if (c.buf.len() < 4) { -2 } else { need_after_len(c.rx, c.buf[0..4]) };
+    Int need = if (c.buf.len() - c.at < 4) { -2 } else { need_after_len(c.rx, ints_range(c.buf, c.at, c.at + 4)) };
     Conn c2 = if (need >= 0) { fill(c, 4 + need) } else { same(c) };
-    Bool whole = need >= 0 && c2.buf.len() >= 4 + need;
+    Bool whole = need >= 0 && c2.buf.len() - c2.at >= 4 + need;
     Bool spent = seq_spent(c2.rx);
-    Opened o = if (whole && !spent) { open(c2.rx, c2.buf[0..4 + need]) } else { Opened {.d = c2.rx, .ok = false, .payload = []} };
+    Opened o = if (whole && !spent) { open(c2.rx, c2.buf, c2.at, 4 + need) } else { Opened {.d = c2.rx, .ok = false, .body = [], .from = 0, .to = 0} };
     Str err = if (spent) { "the incoming packet sequence number would wrap and repeat a nonce; ending the connection" }
         else { if (need == -2) { "the server closed the connection" }
         else { if (need < 0) { "the server sent a malformed packet" }
         else { if (!whole) { "the server closed the connection mid-packet" }
         else { if (!o.ok) { "a packet from the server failed authentication" }
-        else { if (o.payload.len() == 0) { "the server sent an empty packet" } else { "" } } } } } };
-    if (str_len(err) > 0) { return Pkt {.c = conn_err(c2, err), .p = []}; }
-    return Pkt {.c = mk(c2, c2.tx, o.d, c2.buf[4 + need..c2.buf.len()], c2.eof, c2.err, meter_got(c2.m, 4 + need), c2.held), .p = o.payload};
+        else { if (o.to <= o.from) { "the server sent an empty packet" } else { "" } } } } } };
+    if (str_len(err) > 0) { return Pkt {.c = conn_err(c2, err), .p = [], .d = []}; }
+    Held h = split(o.body, o.from, o.to);
+    return Pkt {.c = mk(c2, c2.tx, o.d, c2.buf, c2.at + 4 + need, c2.eof, c2.err, meter_got(c2.m, 4 + need), c2.held), .p = h.p, .d = h.d};
 }
 
 // The reason a DISCONNECT gives, made safe to print.
@@ -234,7 +290,7 @@ pub Str disconnect_reason(List(Int) p) {
 @requires(network, declassify, clock(readonly))
 pub Pkt next_msg(Conn c0) {
     Pkt k = next_once(c0);
-    if (!conn_ok(k.c) || k.p.len() > 0) { return Pkt {.c = same(k.c), .p = k.p}; }
+    if (!conn_ok(k.c) || k.p.len() > 0) { return Pkt {.c = same(k.c), .p = k.p, .d = k.d}; }
     return next_msg(k.c);
 }
 
@@ -247,19 +303,19 @@ pub Pkt next_msg(Conn c0) {
 @requires(network, declassify, clock(readonly))
 pub Pkt next_once(Conn c0) {
     Conn c1 = rekey_if_due(c0);
-    Pkt k = if (conn_ok(c1) && c1.held.len() > 0) { Pkt {.c = with_held(c1, c1.held[1..c1.held.len()]), .p = c1.held[0]} } else { recv_packet(c1) };
-    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p}; }
+    Pkt k = if (conn_ok(c1) && c1.held.len() > 0) { Pkt {.c = with_held(c1, c1.held[1..c1.held.len()]), .p = c1.held[0].p, .d = c1.held[0].d} } else { recv_packet(c1) };
+    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p, .d = k.d}; }
     Int t = k.p[0];
-    if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return Pkt {.c = k.c, .p = []}; }
+    if (t == msg_ignore() || t == msg_debug() || t == msg_unimplemented()) { return Pkt {.c = k.c, .p = [], .d = []}; }
     if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
-    if (t == msg_ext_info()) { return Pkt {.c = ext_info(k.c, k.p), .p = []}; }
+    if (t == msg_ext_info()) { return Pkt {.c = ext_info(k.c, k.p), .p = [], .d = []}; }
     if (t == msg_global_request()) {
         GotText name = rd_text(rd_at(k.p, 1));
         GotInt want = rd_bool(name.r);
         Conn c2 = if (want.v == 1) { send_packet(k.c, [msg_request_failure()]) } else { k.c };
-        return Pkt {.c = c2, .p = []};
+        return Pkt {.c = c2, .p = [], .d = []};
     }
-    if (t == msg_kexinit()) { return Pkt {.c = rekey(k.c, k.p), .p = []}; }
+    if (t == msg_kexinit()) { return Pkt {.c = rekey(k.c, k.p), .p = [], .d = []}; }
     return k;
 }
 
@@ -278,7 +334,7 @@ Conn ext_acc(Conn c, Rd r, Int left) {
     List(Str) algs = if (name.v == "server-sig-algs") { str_split(ascii_text(val.v), ",") } else { c.sig_algs };
     Bool hb = c.hostbound || name.v == "publickey-hostbound@openssh.com";
     Bool pg = c.ping || name.v == "ping@openssh.com";
-    Conn nc = Conn {.fd = c.fd, .tx = c.tx, .rx = c.rx, .buf = c.buf, .eof = c.eof, .err = c.err,
+    Conn nc = Conn {.fd = c.fd, .tx = c.tx, .rx = c.rx, .buf = c.buf, .at = c.at, .eof = c.eof, .err = c.err,
         .v_s = c.v_s, .sid = c.sid, .host_blob = c.host_blob, .host_sig = c.host_sig, .host_alg = c.host_alg,
         .strict = c.strict, .sig_algs = algs, .hostbound = hb, .ping = pg, .m = c.m, .held = c.held};
     return ext_acc(nc, val.r, left - 1);
@@ -396,7 +452,7 @@ pub Handshake handshake(Conn c0, Trust trust, Bool allow_no_strict) {
     if (!ch.strict && !allow_no_strict) {
         return Handshake {.c = conn_err(k1.c, "the server does not support strict key exchange (the Terrapin fix); update it, or allow this host as an exception"), .host = no_key(), .fingerprint = ""};
     }
-    Conn c3 = Conn {.fd = k1.c.fd, .tx = k1.c.tx, .rx = k1.c.rx, .buf = k1.c.buf, .eof = k1.c.eof, .err = "",
+    Conn c3 = Conn {.fd = k1.c.fd, .tx = k1.c.tx, .rx = k1.c.rx, .buf = k1.c.buf, .at = k1.c.at, .eof = k1.c.eof, .err = "",
         .v_s = k1.c.v_s, .sid = [], .host_blob = [], .host_sig = [], .host_alg = ch.hostkey,
         .strict = ch.strict, .sig_algs = [], .hostbound = false, .ping = false, .m = k1.c.m, .held = []};
     return run_kex(c3, ch, i_c, k1.p, trust);
@@ -428,7 +484,7 @@ Handshake run_kex(Conn c, Chosen ch, List(Int) i_c, List(Int) i_s, Trust trust) 
     if (!conn_ok(nk.c)) { return Handshake {.c = nk.c, .host = x.host, .fingerprint = fp}; }
     if (nk.p.len() != 1 || nk.p[0] != msg_newkeys()) { return Handshake {.c = conn_err(nk.c, "expected NEWKEYS"), .host = x.host, .fingerprint = fp}; }
     Keys ks = new_keys(ch, nk.c.strict, x.m, nk.c.tx.seq, nk.c.rx.seq);
-    Conn done = Conn {.fd = nk.c.fd, .tx = ks.tx, .rx = ks.rx, .buf = nk.c.buf, .eof = nk.c.eof, .err = "",
+    Conn done = Conn {.fd = nk.c.fd, .tx = ks.tx, .rx = ks.rx, .buf = nk.c.buf, .at = nk.c.at, .eof = nk.c.eof, .err = "",
         .v_s = nk.c.v_s, .sid = sid, .host_blob = rep.host_blob, .host_sig = hsig, .host_alg = nk.c.host_alg,
         .strict = nk.c.strict, .sig_algs = nk.c.sig_algs, .hostbound = nk.c.hostbound, .ping = nk.c.ping,
         .m = meter_reset(nk.c.m, clock.monotonic_ns()), .held = nk.c.held};
@@ -447,7 +503,7 @@ List(Str) key_types(List(List(Int)) ps, Int i, List(Str) acc) {
 @requires(network, declassify)
 Pkt kex_packet(Conn c) {
     Pkt k = recv_packet(c);
-    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p}; }
+    if (!conn_ok(k.c)) { return Pkt {.c = same(k.c), .p = k.p, .d = k.d}; }
     Int t = k.p[0];
     if (t == msg_disconnect()) { return pkt_err(k.c, disconnect_reason(k.p)); }
     if (!k.c.strict && (t == msg_ignore() || t == msg_debug())) { return kex_packet(k.c); }
@@ -504,14 +560,14 @@ Pkt await_kexinit(Conn c, Int held_b) {
     Int t = if (conn_ok(k.c)) { k.p[0] } else { -1 };
     Bool skip = t == msg_ignore() || t == msg_debug() || t == msg_unimplemented();
     Bool hold = t >= 0 && !skip && t != msg_kexinit() && t != msg_disconnect() && (t < msg_kexinit() || t >= 50);
-    Int nb = if (hold) { held_b + k.p.len() } else { held_b };
+    Int nb = if (hold) { held_b + k.p.len() + k.d.len() } else { held_b };
     Str err = if (!conn_ok(k.c)) { k.c.err }
         else { if (t == msg_disconnect()) { disconnect_reason(k.p) }
         else { if (t > msg_kexinit() && t < 50) { "unexpected key exchange message before the server's KEXINIT" }
         else { if (nb > max_held()) { "the server did not answer a rekey" } else { "" } } } };
-    if (str_len(err) > 0) { return Pkt {.c = conn_err(k.c, err), .p = []}; }
-    if (t == msg_kexinit()) { return Pkt {.c = same(k.c), .p = k.p}; }
-    List(List(Int)) held = if (hold) { k.c.held.concat([k.p]) } else { k.c.held };
+    if (str_len(err) > 0) { return Pkt {.c = conn_err(k.c, err), .p = [], .d = []}; }
+    if (t == msg_kexinit()) { return Pkt {.c = same(k.c), .p = k.p, .d = []}; }
+    List(Held) held = if (hold) { k.c.held.concat([Held {.p = k.p, .d = k.d}]) } else { k.c.held };
     return await_kexinit(with_held(k.c, held), nb);
 }
 
