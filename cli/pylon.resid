@@ -348,10 +348,8 @@ Int cmd_put(Opts o, Int via) {
     if (str_len(o.pylond) > 0) { return pylon_transfer(a.c, r, local, 1, resume, o, via < 0); }
     Sftp s = sftp_start(open_session(a.c));
     if (str_len(s.err) > 0) { eprintln("pylon: " + s.err); return 1; }
-    // Read here, for SFTP only (the Pylon protocol reads it itself), and
-    // packed: a List(Int) of it would cost eight bytes a byte.
-    List(UInt(8)) data = filesystem.read_bytes_u8(local);
-    Copied c = put_packed(s, data, bytes_of(r.path), true);
+    // Read in pieces as it is sent (the Pylon protocol reads it itself).
+    Copied c = put_local(s, local, bytes_of(r.path), true);
     if (str_len(c.s.err) > 0) { eprintln("pylon: " + c.s.err); return 1; }
     _ = disconnect(c.s.ch.c, "done");
     eprintln("pylon: " + f"{c.bytes}" + " bytes to " + r.host + ":" + display_text(bytes_of(r.path)));

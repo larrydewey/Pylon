@@ -75,14 +75,17 @@ pub List(UInt(8)) plain_bytes(List(Secret(UInt(8))) s) { return declassify(secre
 pub List(Int) pub_plain(List(Secret(UInt(8))) s) { return ints_of(plain_bytes(s)); }
 
 // kind: 0 none, 1 chacha20-poly1305@openssh.com, 2 AES-GCM. The GCM IV
-// is not secret (RFC 5647 7.1).
-pub type Dir = { Int kind; List(Secret(UInt(8))) key; List(Int) iv; Int seq; };
+// is not secret (RFC 5647 7.1). gk: the AES key schedule and GHASH key,
+// expanded once when the keys are made rather than for every packet; a
+// direction that is not AES-GCM gets one from an unrelated random key,
+// never used.
+pub type Dir = { Int kind; List(Secret(UInt(8))) key; AesGcmKeyG(Secret(UInt(128)), Secret(UInt(32))) gk; List(Int) iv; Int seq; };
 
 // Before the first NEWKEYS nothing is encrypted and the key is never
 // used; it is random rather than empty so that no constant can ever flow
 // into a cipher call (the compiler's key-entropy check, E0270, sees one
 // Dir type for both states).
-pub Dir dir_none() { return Dir {.kind = 0, .key = random_secret(64), .iv = [], .seq = 0}; }
+pub Dir dir_none() { return Dir {.kind = 0, .key = random_secret(64), .gk = aes_gcmg_key(random_secret(32)), .iv = [], .seq = 0}; }
 
 pub Int cipher_key_len(Str name) {
     if (name == "chacha20-poly1305@openssh.com") { return 64; }
@@ -95,12 +98,12 @@ pub Int cipher_iv_len(Str name) { return if (str_ends_with(name, "-gcm@openssh.c
 
 pub Dir dir_new(Str name, List(Secret(UInt(8))) key, List(Int) iv, Int seq) {
     Int k = if (name == "chacha20-poly1305@openssh.com") { 1 } else { if (str_ends_with(name, "-gcm@openssh.com")) { 2 } else { 0 } };
-    return Dir {.kind = k, .key = key, .iv = iv, .seq = seq};
+    return Dir {.kind = k, .key = key, .gk = aes_gcmg_key(if (k == 2) { key } else { random_secret(32) }), .iv = iv, .seq = seq};
 }
 
 // The same keys with the sequence number set (strict kex resets it to 0
 // at every NEWKEYS).
-pub Dir dir_seq(Dir d, Int seq) { return Dir {.kind = d.kind, .key = d.key, .iv = d.iv, .seq = seq}; }
+pub Dir dir_seq(Dir d, Int seq) { return Dir {.kind = d.kind, .key = d.key, .gk = d.gk, .iv = d.iv, .seq = seq}; }
 
 // Sequence numbers are uint32 and wrap (RFC 4253 6.4). The sequence
 // number is chacha20-poly1305's nonce, so a wrap under one key would
@@ -146,8 +149,8 @@ pub Sealed seal(Dir d, List(Int) head, List(UInt(8)) data) {
     Framed f = frame(d, head, data);
     if (d.kind == 0) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = bytes_u8(f.len4).concat(f.body)}; }
     if (d.kind == 1) { return Sealed {.d = dir_seq(d, next_seq(d.seq)), .out = cc_seal(d.key, d.seq, f)}; }
-    List(UInt(8)) ct = sealed_bytes(aes_gcmg_seal(d.key, d.iv, lift_u8(f.body), f.len4));
-    Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
+    List(UInt(8)) ct = sealed_bytes(aes_gcmg_seal_k(d.gk, d.iv, lift_u8(f.body), bytes_u8(f.len4)));
+    Dir nd = Dir {.kind = 2, .key = d.key, .gk = d.gk, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
     return Sealed {.d = nd, .out = bytes_u8(f.len4).concat(ct)};
 }
 
@@ -243,10 +246,9 @@ pub Opened open(Dir d, List(UInt(8)) buf, Int at, Int len) {
         List(UInt(8)) body = plain_bytes(chachag_xor(k2, 1, n, lift_u8(buf[at + 4..tag_at])));
         return unpad(dir_seq(d, next_seq(d.seq)), body);
     }
-    // aes_gcmg_decrypt takes the received bytes as Ints: they are widened
-    // once, here, straight out of the buffer.
-    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(d.key, d.iv, ints_range(buf, at + 4, end), ints_range(buf, at, at + 4));
-    Dir nd = Dir {.kind = 2, .key = d.key, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
+    // The received bytes go in packed, as they lie in the buffer.
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt_k(d.gk, d.iv, buf[at + 4..end], buf[at..at + 4]);
+    Dir nd = Dir {.kind = 2, .key = d.key, .gk = d.gk, .iv = gcm_next_iv(d.iv), .seq = next_seq(d.seq)};
     return match pt {
         None => open_bad(d),
         Some(body) => unpad(nd, plain_bytes(body)),

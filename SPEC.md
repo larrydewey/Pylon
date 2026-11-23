@@ -1124,7 +1124,10 @@ authentication required, and expire after 12 hours regardless.
   was asked (a short read asks again for the rest), and EOF must fall
   exactly where the delivered bytes end; after an error nothing more is
   asked and the replies still owed are read, so the session stays in
-  step. An upload reads the local file packed (a byte a byte).
+  step. A download is written through one open handle and an upload read
+  in 32 KiB pieces as they are sent, so neither holds the file whole (a
+  1 GiB upload peaks near 11 MB). The AES-GCM key schedule is expanded
+  once per direction and key, not for every packet.
   On a machine with AES and carry-less multiply instructions Pylon
   offers AES-GCM before chacha20-poly1305 (both are offered everywhere),
   as it is several times faster there.

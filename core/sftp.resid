@@ -772,17 +772,24 @@ pub Copied fetch(Sftp s0, List(Int) remote, Str local, Bool app) {
     if (st.found && st.a.kind == 1) { return Copied {.s = sftp_err(st.s, shown(remote) + " is a directory"), .bytes = 0}; }
     Reply o = open_remote(st.s, remote, pf_read(), 0);
     if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    if (!app && !filesystem.write_bytes(local, [])) { return Copied {.s = sftp_err(close_remote(o.s, o.body), "cannot write " + local), .bytes = 0}; }
-    Copied c = pulled(get_run(pull_new(o.s, o.body, [], if (st.found) { st.a.size } else { 0 }), local, app));
-    return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
+    // LOCAL is created (or emptied) once and written through one handle.
+    // The app's bytes go to standard output instead; its handle is for an
+    // empty path, which never opens, and is never written.
+    File out = filesystem.create(if (app) { "" } else { local });
+    if (!app && !filesystem.is_open(out)) { return Copied {.s = sftp_err(close_remote(o.s, o.body), "cannot write " + local), .bytes = 0}; }
+    Copied c = pulled(get_run(pull_new(o.s, o.body, [], if (st.found) { st.a.size } else { 0 }), out, local, app));
+    // Closing is where a write the system deferred can still fail.
+    Bool closed = app || filesystem.close(out);
+    Sftp s2 = if (closed || !sftp_good(c.s)) { c.s } else { sftp_err(c.s, "cannot write " + local) };
+    return Copied {.s = close_remote(s2, o.body), .bytes = c.bytes};
 }
 
 @requires(network, declassify, filesystem, clock(readonly))
-Pull get_run(Pull p0, Str local, Bool app) {
+Pull get_run(Pull p0, File out, Str local, Bool app) {
     Pull p = pull_fill(p0);
     if (p.out.len() == 0) { return p; }
     PullR g = pull_recv(p);
-    return get_run(get_take(g.p, g.off, g.v, local, app), local, app);
+    return get_run(get_take(g.p, g.off, g.v, out, local, app), out, local, app);
 }
 
 Int seg_at(List(Seg) h, Int off, Int i) {
@@ -792,20 +799,20 @@ Int seg_at(List(Seg) h, Int off, Int i) {
 }
 
 // A piece is written when it is the next one, else held until it is.
-// Each piece is its own append: gathering pieces into larger lists to
-// write fewer times was slower (large lists cost more to allocate and
-// wipe than the appends they save).
+// Each piece is its own write through the open handle: gathering pieces
+// into larger lists to write fewer times was slower (large lists cost
+// more to allocate and wipe than the writes they save).
 @requires(filesystem)
-Pull get_take(Pull p, Int off, List(UInt(8)) v, Str local, Bool app) {
+Pull get_take(Pull p, Int off, List(UInt(8)) v, File out, Str local, Bool app) {
     if (v.len() == 0 || str_len(p.fail) > 0) { return p; }
     if (off != p.done) { return pl(p, p.s, p.done, p.out, p.inflight, p.held.concat([Seg {.off = off, .v = v}]), p.eof_at, p.fail, p.pace); }
-    Bool wrote = if (app) { print_bytes(app_frame(9, bytes_int(v))) } else { filesystem.append_bytes(local, v) };
+    Bool wrote = if (app) { print_bytes(app_frame(9, bytes_int(v))) } else { filesystem.write_handle(out, v) };
     if (!wrote) { return pl(p, p.s, p.done, p.out, p.inflight, [], p.eof_at, first_fail(p.fail, "cannot write " + local), p.pace); }
     Int k = seg_at(p.held, p.done + v.len(), 0);
     Pull q = pl(p, p.s, p.done + v.len(), p.out, p.inflight, p.held, p.eof_at, p.fail, p.pace);
     if (k < 0) { return q; }
     Seg nx = p.held[k];
-    return get_take(pl(q, q.s, q.done, q.out, q.inflight, p.held[0..k].concat(p.held[k + 1..p.held.len()]), q.eof_at, q.fail, q.pace), nx.off, nx.v, local, app);
+    return get_take(pl(q, q.s, q.done, q.out, q.inflight, p.held[0..k].concat(p.held[k + 1..p.held.len()]), q.eof_at, q.fail, q.pace), nx.off, nx.v, out, local, app);
 }
 
 // ============================================================================
@@ -824,9 +831,8 @@ Push ps(Push p, Sftp s, Int at, Int acked, List(Req) out, Int inflight, Str fail
 @requires(clock(readonly))
 Push push_new(Sftp s, List(Int) h) { return Push {.s = s, .h = h, .at = 0, .acked = 0, .out = [], .inflight = 0, .fail = "", .pace = pace_new(clock.monotonic_ns())}; }
 
-// data[i..] from offset p.at on, with no more than the target in flight.
-// The bytes are packed (a whole file read with read_bytes_u8 is one byte
-// a byte, not eight) and stay so to the cipher.
+// data[i..] from offset p.at on, with no more than the target in flight
+// (the app's upload frames).
 @requires(network, declassify, clock(readonly))
 Push push_packed(Push p, List(UInt(8)) data, Int i) {
     if (i >= data.len() || !sftp_good(p.s) || str_len(p.fail) > 0) { return p; }
@@ -865,23 +871,35 @@ Copied push_end(Push p) {
     return Copied {.s = p.s, .bytes = p.at};
 }
 
-// The bytes `data` into REMOTE (created or truncated, mode 0600 if new);
-// with `replace` false, a REMOTE that exists is refused (O_EXCL).
-@requires(network, declassify, clock(readonly))
-pub Copied put_bytes(Sftp s0, List(Int) data, List(Int) remote, Bool replace) {
+// The local file LOCAL into REMOTE (created or truncated, mode 0600 if
+// new; with `replace` false a REMOTE that exists is refused, O_EXCL),
+// read in pieces as they are sent, so it is never held whole: memory
+// stays flat whatever its size.
+@requires(network, declassify, filesystem, clock(readonly))
+pub Copied put_local(Sftp s0, Str local, List(Int) remote, Bool replace) {
+    File f = filesystem.open(local);
+    if (!filesystem.is_open(f)) { return Copied {.s = sftp_err(s0, "cannot read " + local), .bytes = 0}; }
     Reply o = open_remote(s0, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
-    if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    Copied c = push_end(push_packed(push_new(o.s, o.body), bytes_u8(data), 0));
+    if (str_len(o.s.err) > 0) { _ = filesystem.close(f); return Copied {.s = o.s, .bytes = 0}; }
+    Push p = push_file(push_new(o.s, o.body), f, local);
+    _ = filesystem.close(f);
+    Copied c = push_end(p);
     return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
 }
 
-// put_bytes from packed bytes.
-@requires(network, declassify, clock(readonly))
-pub Copied put_packed(Sftp s0, List(UInt(8)) data, List(Int) remote, Bool replace) {
-    Reply o = open_remote(s0, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
-    if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    Copied c = push_end(push_packed(push_new(o.s, o.body), data, 0));
-    return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
+// The file's next pieces, with no more than the target in flight. An
+// empty piece is the end of the file while the handle is open; a read
+// that fails closes it.
+@requires(network, declassify, filesystem, clock(readonly))
+Push push_file(Push p, File f, Str local) {
+    if (!sftp_good(p.s) || str_len(p.fail) > 0) { return p; }
+    Int w = write_piece(p.s, p.h);
+    if ((p.inflight + w > p.pace.target || owed(p.s)) && p.out.len() > 0) { return push_file(push_recv(p), f, local); }
+    List(UInt(8)) v = filesystem.read_some(f, w);
+    if (v.len() == 0) {
+        return if (filesystem.is_open(f)) { p } else { ps(p, p.s, p.at, p.acked, p.out, p.inflight, first_fail(p.fail, "cannot read " + local), p.pace) };
+    }
+    return push_file(push_piece(p, v), f, local);
 }
 
 // A file opened for writing, to be fed in pieces (the app's uploads); the

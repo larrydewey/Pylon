@@ -498,7 +498,7 @@ Fsh cmd_put(Fsh x, List(List(Int)) a0) {
     if (there.found && there.a.kind == 1) { eprintln("put: " + shown(rp) + " is a directory"); return with_s(x, there.s); }
     if (there.found && !f.on) { eprintln("put: " + shown(rp) + " exists; not replaced (put -f replaces it)"); return with_s(x, there.s); }
     // O_EXCL still guards a file that appears meanwhile.
-    Copied c = put_packed(there.s, filesystem.read_bytes_u8(lp), rp, f.on);
+    Copied c = put_local(there.s, lp, rp, f.on);
     _ = if (sftp_good(c.s)) { println(f"{c.bytes}" + " bytes to " + shown(rp)) } else { true };
     return reported(x, c.s);
 }
