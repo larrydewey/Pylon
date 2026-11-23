@@ -1,0 +1,44 @@
+// SFTP pipelining (core/sftp.resid): how much a transfer keeps in flight.
+
+import "crypto.resid";
+import "../core/sftp.resid";
+
+// A target's worth over a link with this round trip (ms) and rate (bytes
+// per ms): one round trip, or longer when the link is the limit.
+Pace over(Pace p, Int rtt, Int rate) {
+    Int ms = if (p.target / rate > rtt) { p.target / rate } else { rtt };
+    return paced(p, p.target, p.mark_t + ms * 1000000);
+}
+
+Pace overs(Pace p, Int rtt, Int rate, Int n) {
+    if (n <= 0) { return p; }
+    return overs(over(p, rtt, rate), rtt, rate, n - 1);
+}
+
+test "pace starts at 256 KiB" {
+    Pace p = pace_new(0);
+    assert(p.target == 262144 && !p.full, "the first target");
+    Pace q = paced(p, 100000, 5000000);
+    assert(q.target == 262144 && q.bytes == 100000, "less than a target's worth changes nothing");
+}
+
+test "pace doubles while the round trip is the limit, up to the cap" {
+    // A 50 ms round trip on a link far faster than any target fills.
+    Pace p = overs(pace_new(0), 50, 100000000, 4);
+    assert(p.target == 262144 * 16 && !p.full, "four doublings");
+    Pace q = overs(p, 50, 100000000, 12);
+    assert(q.target == pace_cap(), "at the cap");
+    assert(!q.full, "the cap is not taken for a full link");
+}
+
+test "pace stops when the link is full" {
+    // 50 ms and 40 MiB/s: 2 MiB in flight fills it.
+    Pace p = overs(pace_new(0), 50, 41943, 7);
+    assert(p.full, "full after three windows without gain");
+    assert(p.target == 4194304, "about twice what fills the link");
+    Pace q = overs(p, 50, 41943, 5);
+    assert(q.full && q.target == 4194304, "and it stays there");
+    // The link gets much faster: doubling resumes.
+    Pace r = over(q, 5, 100000000);
+    assert(!r.full && r.target == 8388608, "a window much faster again resumes doubling");
+}

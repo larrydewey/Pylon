@@ -17,7 +17,7 @@ WORK="$(mktemp -d)"
 PORT=$((20000 + RANDOM % 20000))
 PASS=0
 FAIL=0
-trap 'kill $(cat "$WORK"/sshd.pid "$WORK"/target.pid "$WORK"/dns.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $(cat "$WORK"/sshd.pid "$WORK"/target.pid "$WORK"/dns.pid "$WORK"/delay.pid 2>/dev/null) 2>/dev/null; kill $SSH_AGENT_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 
 cd "$WORK"
 for t in ed25519 ecdsa rsa; do
@@ -431,6 +431,19 @@ check "sftp: a missing remote file"            1 "cannot open" \
     "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/nope" nope.bin
 check "sftp: escape bytes in a name are shown escaped" 1 'x1b.31mred on the server' \
     "$PYLON" get -p $PORT "$USER_NAME@127.0.0.1:$RDIR/$(printf '\033[31mred')" red.bin
+
+# A 100 ms round trip: with requests in flight 8 MiB takes about a second
+# each way; one request per round trip (32 KiB each) would take 26 s.
+DPORT=$((PORT + 2)); head -c 8388608 /dev/urandom > far.bin
+python3 "$(dirname "$HOSTILE")/delay_proxy.py" $DPORT $PORT 50 & echo $! > delay.pid
+sleep 0.5; "$PYLON" pin -p $DPORT 127.0.0.1 "$(fp host_ed25519.pub)" > /dev/null
+timed() { local s=$SECONDS; "$@" > /dev/null 2>&1 || return 1; echo "$((SECONDS - s)) s"; [ $((SECONDS - s)) -le 8 ]; }
+check "sftp: put 8 MiB over a 100 ms round trip in seconds" 0 "" \
+    timed "$PYLON" put -p $DPORT far.bin "$USER_NAME@127.0.0.1:$RDIR/far.bin"
+check "sftp: get 8 MiB over a 100 ms round trip in seconds" 0 "" \
+    timed "$PYLON" get -p $DPORT "$USER_NAME@127.0.0.1:$RDIR/far.bin" far_down.bin
+check "sftp: the far file is intact both ways" 0 "" cmp far.bin far_down.bin
+kill "$(cat delay.pid)" 2>/dev/null
 
 # --- pylon sftp: the interactive browser, and the app's framed requests --------
 SD="$WORK/sftpdir"; mkdir -p "$SD/a/b"; echo hello > "$SD/a/f.txt"; echo x > "$SD/a/b/g"; ln -s f.txt "$SD/a/link"

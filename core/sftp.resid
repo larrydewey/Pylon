@@ -14,13 +14,14 @@
 // which fails rather than replaces; a copy opens its target with
 // O_EXCL). Trees are walked without following symbolic links: a link is
 // removed as a link, and a copy skips it. Server messages and names are
-// shown escaped. Requests are sequential (one outstanding at a time),
-// 32 KiB each.
+// shown escaped. File contents go as many 32 KiB requests in flight
+// (Pipelining, below); everything else is one request at a time.
 
 import "crypto.resid";
 import "wire.resid";
 import "transport.resid";
 import "session.resid";
+import "word.resid";
 
 Int fx_init() { return 1; }
 Int fx_version() { return 2; }
@@ -54,6 +55,10 @@ Int pf_creat() { return 8; }
 Int pf_trunc() { return 16; }
 Int pf_excl() { return 32; }
 
+// The piece a READ or WRITE moves. Larger pieces need fewer requests but
+// cost more than they save: a 255 KiB piece is a 2 MiB list here, and
+// allocating and wiping those halved the speed on a local link. In-flight
+// requests, not piece size, are what fill a long link (Pipelining).
 pub Int chunk() { return 32768; }
 // The largest SFTP packet accepted from the server (a 32 KiB data reply,
 // or a directory's worth of names, with room to spare).
@@ -70,7 +75,8 @@ pub Sftp sftp_err(Sftp s, Str e) { return Sftp {.ch = s.ch, .id = s.id, .err = e
 pub Sftp sftp_ok(Sftp s) { return Sftp {.ch = s.ch, .id = s.id, .err = "", .exts = s.exts}; }
 pub Bool sftp_good(Sftp s) { return str_len(s.err) == 0; }
 
-// A reply: type, request id (or the version for VERSION), the rest.
+// A reply: type, request id (or the version for VERSION), the rest
+// (for DATA, the data).
 pub type Reply = { Sftp s; Int t; Int id; List(Int) body; };
 
 Reply reply_err(Sftp s, Str e) { return Reply {.s = sftp_err(s, e), .t = -1, .id = -1, .body = []}; }
@@ -116,17 +122,21 @@ Reply next_reply(Sftp s) {
     if (n < 5 || n > max_packet()) { return reply_err(on_chan(s, closed_chan(a)), "the server sent a malformed SFTP packet"); }
     Chan b = await_bytes(a, 4 + n);
     if (!chan_ok(b) || b.inbox.len() < 4 + n) { return reply_err(on_chan(s, closed_chan(b)), "the SFTP session ended mid-packet"); }
-    List(Int) pkt = b.inbox[4..4 + n];
+    Int t = b.inbox[4];
+    Int id = be32(b.inbox, 5);
+    // DATA's body is its data (the string's length checked here; empty
+    // when it is wrong): copied once out of the inbox, not three times.
+    Bool data = t == fx_data() && n >= 9 && be32(b.inbox, 9) == n - 9;
+    List(Int) body = if (data) { b.inbox[13..4 + n] } else { if (t == fx_data()) { [] } else { b.inbox[9..4 + n] } };
     Chan rest = consume(b, 4 + n);
-    Int id = be32(pkt, 1);
-    return Reply {.s = Sftp {.ch = rest, .id = s.id, .err = "", .exts = s.exts}, .t = pkt[0], .id = id, .body = pkt[5..pkt.len()]};
+    return Reply {.s = Sftp {.ch = rest, .id = s.id, .err = "", .exts = s.exts}, .t = t, .id = id, .body = body};
 }
 
 Sftp on_chan(Sftp s, Chan ch) { return Sftp {.ch = ch, .id = s.id, .err = s.err, .exts = s.exts}; }
 
 // A channel the session can no longer use (the stream is out of step).
 Chan closed_chan(Chan ch) {
-    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .capture = ch.capture, .inbox = [], .err = ch.err};
+    return Chan {.c = ch.c, .remote = ch.remote, .window = ch.window, .wmax = ch.wmax, .rwin = ch.rwin, .rmax = ch.rmax, .status = ch.status, .closed = true, .raw = ch.raw, .capture = ch.capture, .inbox = [], .err = ch.err};
 }
 
 // A request and its reply, matched by id.
@@ -504,7 +514,7 @@ Copied copy_file(Sftp s, List(Int) from, List(Int) to, Int mode) {
     if (str_len(src.s.err) > 0) { return Copied {.s = src.s, .bytes = 0}; }
     Reply dst = open_remote(src.s, to, pf_write() | pf_creat() | pf_excl(), if (mode == 0) { 384 } else { mode });
     if (str_len(dst.s.err) > 0) { return Copied {.s = close_remote(dst.s, src.body), .bytes = 0}; }
-    Copied c = if (dst.s.exts.contains("copy-data")) { copy_data(dst.s, src.body, dst.body, from) } else { relay(dst.s, src.body, dst.body, 0) };
+    Copied c = if (dst.s.exts.contains("copy-data")) { copy_data(dst.s, src.body, dst.body, from) } else { relay(dst.s, src.body, dst.body) };
     return Copied {.s = close_remote(close_remote(c.s, dst.body), src.body), .bytes = c.bytes};
 }
 
@@ -521,18 +531,195 @@ Copied copy_data(Sftp s, List(Int) rh, List(Int) wh, List(Int) from) {
     return Copied {.s = f.s, .bytes = n};
 }
 
+
+// ============================================================================
+// Pipelining
+// ============================================================================
+//
+// A file goes as many requests in flight, so the link sets the speed, not
+// the round trip: one request at a time moves one piece per round trip
+// (32 KiB every 50 ms is 0.6 MiB/s, whatever the link). How much is in
+// flight follows what the link delivers (Pace). Every reply is still
+// checked: its id must be one in flight (anything else ends the session,
+// as before), DATA brings at most what was asked, a short read asks again
+// for the rest. After a failure nothing more is asked, and the replies
+// still owed are read and dropped, so the session stays in step for the
+// next request.
+
+// Bytes in flight. It starts at 256 KiB and doubles each time a target's
+// worth arrives at least a quarter faster than the best so far; after three
+// that are not, the link is taken as full and the target goes back by the
+// last two doublings (leaving about twice what filled the link). A later
+// one a quarter faster again resumes the doubling. At most pace_cap():
+// 32 MiB, 320 MiB/s at 100 ms.
+pub type Pace = { Int target; Int bytes; Int mark_b; Int mark_t; Int best; Int flat; Bool full; };
+
+pub Int pace_first() { return 262144; }
+pub Int pace_cap() { return 33554432; }
+
+pub Pace pace_new(Int now) { return Pace {.target = pace_first(), .bytes = 0, .mark_b = 0, .mark_t = now, .best = 0, .flat = 0, .full = false}; }
+
+// n more bytes delivered at `now` (monotonic ns).
+pub Pace paced(Pace p, Int n, Int now) {
+    Int b = p.bytes + n;
+    if (b - p.mark_b < p.target) { return Pace {.target = p.target, .bytes = b, .mark_b = p.mark_b, .mark_t = p.mark_t, .best = p.best, .flat = p.flat, .full = p.full}; }
+    Int dt = if (now - p.mark_t < 1) { 1 } else { now - p.mark_t };
+    Int rate = (b - p.mark_b) * 1000000 / dt;   // bytes per ms
+    Bool faster = rate * 4 >= p.best * 5 && rate > 0;
+    // At the cap the target cannot grow, so the rate cannot either: that
+    // says nothing about the link, and never backs off.
+    Bool capped = p.target >= pace_cap();
+    Int flat = if (faster || capped) { 0 } else { p.flat + 1 };
+    Bool full = !faster && (p.full || flat >= 3);
+    Int t1 = if (full && !p.full) { p.target / 4 } else { if (full) { p.target } else { p.target * 2 } };
+    Int t2 = if (t1 > pace_cap()) { pace_cap() } else { if (t1 < pace_first()) { pace_first() } else { t1 } };
+    return Pace {.target = t2, .bytes = b, .mark_b = b, .mark_t = now, .best = if (rate > p.best) { rate } else { p.best }, .flat = flat, .full = full};
+}
+
+// A request in flight: its id, type (READ or WRITE), offset and length.
+type Req = { Int id; Int t; Int off; Int len; };
+
+// Where request `id` is in `out`, or -1 (replies come in order from
+// OpenSSH, so it is almost always the first).
+Int req_at(List(Req) out, Int id, Int i) {
+    if (i >= out.len()) { return -1; }
+    if (out[i].id == id) { return i; }
+    return req_at(out, id, i + 1);
+}
+
+List(Req) req_gone(List(Req) out, Int i) { return out[0..i].concat(out[i + 1..out.len()]); }
+
+// Packets held while a rekey Pylon started waited for the server's
+// KEXINIT: they are read before anything more is sent, as the next rekey
+// can start only once they are (rekey_if_due), and a sender that only
+// sends would otherwise keep one key past its limits.
+Bool owed(Sftp s) { return s.ch.c.held.len() > 0; }
+
+// A request sent without waiting for its reply (its id is s.id).
 @requires(network, declassify, clock(readonly))
-Copied relay(Sftp s, List(Int) rh, List(Int) wh, Int off) {
-    Reply r = call(s, fx_read(), sstring(rh).concat(u64_be(off)).concat(u32_be(chunk())));
-    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
-    if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Copied {.s = r.s, .bytes = off}; }
-    if (r.t == fx_status()) { return Copied {.s = sftp_err(r.s, "read failed: " + status_text(r.body)), .bytes = off}; }
-    Got d = rd_str(rd(r.body));
-    if (r.t != fx_data() || !rd_ok(d.r) || d.v.len() == 0 || d.v.len() > chunk()) { return Copied {.s = sftp_err(r.s, "the server sent a malformed data reply"), .bytes = off}; }
-    Reply w = call(r.s, fx_write(), sstring(wh).concat(u64_be(off)).concat(sstring(d.v)));
-    if (str_len(w.s.err) > 0) { return Copied {.s = w.s, .bytes = off}; }
-    if (w.t != fx_status() || status_code(w.body) != fx_ok()) { return Copied {.s = sftp_err(w.s, "write failed: " + status_text(w.body)), .bytes = off}; }
-    return relay(w.s, rh, wh, off + d.v.len());
+Sftp issue(Sftp s, Int t, List(Int) args) {
+    return send(Sftp {.ch = s.ch, .id = s.id + 1, .err = s.err, .exts = s.exts}, [t].concat(u32_be(s.id)).concat(args));
+}
+
+// ----------------------------------------------------------------------------
+// Reading: get, and a copy on the server without copy-data
+// ----------------------------------------------------------------------------
+
+// A piece of the file that arrived before the ones ahead of it.
+type Seg = { Int off; List(Int) v; };
+
+// A pipelined read of handle h, in pieces of `len` (chunk()); with a write handle
+// wh, each piece is written to that file on the server (a relay).
+// size: the size the server reported; past it reads go one at a time
+// until EOF (a file that grew is still read whole). next: the next offset
+// to ask for. done: bytes delivered in order (get) or written (relay).
+// held: pieces waiting for done to reach them. eof_at: where EOF was
+// answered, -1 before. fail: the first failure (the session is still in
+// step); a session that is not (s.err) stops at once.
+type Pull = { Sftp s; List(Int) h; List(Int) wh; Int len; Int size; Int next; Int done; List(Req) out; Int inflight; List(Seg) held; Int eof_at; Str fail; Pace pace; };
+
+Pull pl(Pull p, Sftp s, Int done, List(Req) out, Int inflight, List(Seg) held, Int eof_at, Str fail, Pace pace) {
+    return Pull {.s = s, .h = p.h, .wh = p.wh, .len = p.len, .size = p.size, .next = p.next, .done = done, .out = out, .inflight = inflight, .held = held, .eof_at = eof_at, .fail = fail, .pace = pace};
+}
+
+@requires(clock(readonly))
+Pull pull_new(Sftp s, List(Int) h, List(Int) wh, Int size) {
+    return Pull {.s = s, .h = h, .wh = wh, .len = chunk(), .size = size, .next = 0, .done = 0, .out = [], .inflight = 0, .held = [], .eof_at = -1, .fail = "", .pace = pace_new(clock.monotonic_ns())};
+}
+
+Str first_fail(Str had, Str now) { return if (str_len(had) > 0) { had } else { now }; }
+
+// Reads asked for while the target allows (one at least, while the file
+// is not done), with the channel's window raised to hold them.
+@requires(network, declassify, clock(readonly))
+Pull pull_fill(Pull p0) {
+    Pull p = pl(p0, on_chan(p0.s, grant(p0.s.ch, p0.pace.target + 2 * p0.len + 1048576)), p0.done, p0.out, p0.inflight, p0.held, p0.eof_at, p0.fail, p0.pace);
+    return pull_ask(p);
+}
+
+@requires(network, declassify, clock(readonly))
+Pull pull_ask(Pull p) {
+    Bool room = (p.inflight + p.len <= p.pace.target && !owed(p.s)) || p.out.len() == 0;
+    Bool more = p.next < p.size || p.out.len() == 0;
+    if (!sftp_good(p.s) || str_len(p.fail) > 0 || p.eof_at >= 0 || !room || !more) { return p; }
+    Sftp s1 = issue(p.s, fx_read(), sstring(p.h).concat(u64_be(p.next)).concat(u32_be(p.len)));
+    Pull q = pl(p, s1, p.done, p.out.concat([Req {.id = p.s.id, .t = fx_read(), .off = p.next, .len = p.len}]), p.inflight + p.len, p.held, p.eof_at, p.fail, p.pace);
+    return pull_ask(Pull {.s = q.s, .h = q.h, .wh = q.wh, .len = q.len, .size = q.size, .next = p.next + p.len, .done = q.done, .out = q.out, .inflight = q.inflight, .held = q.held, .eof_at = q.eof_at, .fail = q.fail, .pace = q.pace});
+}
+
+// One reply, and the piece of the file it brought (off, v; v empty for
+// none).
+type PullR = { Pull p; Int off; List(Int) v; };
+
+PullR no_piece(Pull p) { return PullR {.p = p, .off = 0, .v = []}; }
+
+@requires(network, declassify, clock(readonly))
+PullR pull_recv(Pull p) {
+    Reply r = next_reply(p.s);
+    if (str_len(r.s.err) > 0) { return no_piece(pl(p, r.s, p.done, [], 0, p.held, p.eof_at, p.fail, p.pace)); }
+    Int i = req_at(p.out, r.id, 0);
+    if (i < 0) { return no_piece(pl(p, sftp_err(on_chan(r.s, closed_chan(r.s.ch)), "the server answered another SFTP request"), p.done, [], 0, p.held, p.eof_at, p.fail, p.pace)); }
+    Req q = p.out[i];
+    List(Req) out = req_gone(p.out, i);
+    Int infl = p.inflight - q.len;
+    // A relay's write: the bytes are on the server.
+    if (q.t == fx_write()) {
+        Bool ok = r.t == fx_status() && status_code(r.body) == fx_ok();
+        Str why = if (r.t == fx_status()) { status_text(r.body) } else { "unexpected reply" };
+        Pace pw = if (ok) { paced(p.pace, q.len, clock.monotonic_ns()) } else { p.pace };
+        return no_piece(pl(p, r.s, if (ok) { p.done + q.len } else { p.done }, out, infl, p.held, p.eof_at, if (ok) { p.fail } else { first_fail(p.fail, "write failed: " + why) }, pw));
+    }
+    if (r.t == fx_status()) {
+        Bool eof = status_code(r.body) == fx_eof();
+        Int e = if (!eof) { p.eof_at } else { if (p.eof_at < 0 || q.off < p.eof_at) { q.off } else { p.eof_at } };
+        return no_piece(pl(p, r.s, p.done, out, infl, p.held, e, if (eof) { p.fail } else { first_fail(p.fail, "read failed: " + status_text(r.body)) }, p.pace));
+    }
+    List(Int) dv = r.body;
+    Bool good = r.t == fx_data() && dv.len() > 0 && dv.len() <= q.len;
+    if (!good) { return no_piece(pl(p, r.s, p.done, out, infl, p.held, p.eof_at, first_fail(p.fail, "the server sent a malformed data reply"), p.pace)); }
+    if (str_len(p.fail) > 0) { return no_piece(pl(p, r.s, p.done, out, infl, p.held, p.eof_at, p.fail, p.pace)); }
+    // A short read: the rest of the piece is asked for again.
+    Int n = dv.len();
+    Bool part = n < q.len;
+    Sftp s2 = if (part) { issue(r.s, fx_read(), sstring(p.h).concat(u64_be(q.off + n)).concat(u32_be(q.len - n))) } else { r.s };
+    List(Req) out2 = if (part) { out.concat([Req {.id = r.s.id, .t = fx_read(), .off = q.off + n, .len = q.len - n}]) } else { out };
+    Int infl2 = if (part) { infl + q.len - n } else { infl };
+    Pace pr = if (p.wh.len() > 0) { p.pace } else { paced(p.pace, n, clock.monotonic_ns()) };
+    return PullR {.p = pl(p, s2, p.done, out2, infl2, p.held, p.eof_at, p.fail, pr), .off = q.off, .v = dv};
+}
+
+// How a read ended: what it delivered, or why it stopped. EOF must have
+// come exactly where the delivered bytes end.
+Copied pulled(Pull p) {
+    if (!sftp_good(p.s)) { return Copied {.s = p.s, .bytes = p.done}; }
+    if (str_len(p.fail) > 0) { return Copied {.s = sftp_err(p.s, p.fail), .bytes = p.done}; }
+    if (p.held.len() > 0 || p.done != p.eof_at) { return Copied {.s = sftp_err(p.s, "the file changed on the server while it was read"), .bytes = p.done}; }
+    return Copied {.s = p.s, .bytes = p.done};
+}
+
+@requires(network, declassify, clock(readonly))
+Copied relay(Sftp s, List(Int) rh, List(Int) wh) {
+    Reply f = call(s, 8, sstring(rh));   // SSH_FXP_FSTAT: the size to read
+    if (str_len(f.s.err) > 0) { return Copied {.s = f.s, .bytes = 0}; }
+    GotAttrs g = rd_attrs(rd(f.body));
+    Int size = if (f.t == fx_attrs() && rd_ok(g.r)) { g.a.size } else { 0 };
+    return pulled(relay_run(pull_new(f.s, rh, wh, size)));
+}
+
+@requires(network, declassify, clock(readonly))
+Pull relay_run(Pull p0) {
+    Pull p = pull_fill(p0);
+    if (p.out.len() == 0) { return p; }
+    PullR g = pull_recv(p);
+    return relay_run(relay_take(g.p, g.off, g.v));
+}
+
+// A piece read is written at the same offset (writes need no order).
+@requires(network, declassify, clock(readonly))
+Pull relay_take(Pull p, Int off, List(Int) v) {
+    if (v.len() == 0 || !sftp_good(p.s) || str_len(p.fail) > 0) { return p; }
+    Sftp s2 = issue(p.s, fx_write(), sstring(p.wh).concat(u64_be(off)).concat(sstring(v)));
+    return pl(p, s2, p.done, p.out.concat([Req {.id = p.s.id, .t = fx_write(), .off = off, .len = v.len()}]), p.inflight + v.len(), p.held, p.eof_at, p.fail, p.pace);
 }
 
 // ============================================================================
@@ -553,69 +740,149 @@ pub Copied fetch(Sftp s0, List(Int) remote, Str local, Bool app) {
     Reply o = open_remote(st.s, remote, pf_read(), 0);
     if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
     if (!app && !filesystem.write_bytes(local, [])) { return Copied {.s = sftp_err(close_remote(o.s, o.body), "cannot write " + local), .bytes = 0}; }
-    Copied c = get_loop(o.s, o.body, local, app, 0);
+    Copied c = pulled(get_run(pull_new(o.s, o.body, [], if (st.found) { st.a.size } else { 0 }), local, app));
     return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
 }
 
 @requires(network, declassify, filesystem, clock(readonly))
-Copied get_loop(Sftp s, List(Int) handle, Str local, Bool app, Int off) {
-    Reply r = call(s, fx_read(), sstring(handle).concat(u64_be(off)).concat(u32_be(chunk())));
-    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = off}; }
-    if (r.t == fx_status() && status_code(r.body) == fx_eof()) { return Copied {.s = r.s, .bytes = off}; }
-    if (r.t == fx_status()) { return Copied {.s = sftp_err(r.s, "read failed: " + status_text(r.body)), .bytes = off}; }
-    Got d = rd_str(rd(r.body));
-    if (r.t != fx_data() || !rd_ok(d.r) || d.v.len() == 0 || d.v.len() > chunk()) { return Copied {.s = sftp_err(r.s, "the server sent a malformed data reply"), .bytes = off}; }
-    Bool wrote = if (app) { print_bytes(app_frame(9, d.v)) } else { filesystem.append_bytes(local, d.v) };
-    if (!wrote) { return Copied {.s = sftp_err(r.s, "cannot write " + local), .bytes = off}; }
-    return get_loop(r.s, handle, local, app, off + d.v.len());
+Pull get_run(Pull p0, Str local, Bool app) {
+    Pull p = pull_fill(p0);
+    if (p.out.len() == 0) { return p; }
+    PullR g = pull_recv(p);
+    return get_run(get_take(g.p, g.off, g.v, local, app), local, app);
+}
+
+Int seg_at(List(Seg) h, Int off, Int i) {
+    if (i >= h.len()) { return -1; }
+    if (h[i].off == off) { return i; }
+    return seg_at(h, off, i + 1);
+}
+
+// A piece is written when it is the next one, else held until it is.
+// Each piece is its own append: gathering pieces into larger lists to
+// write fewer times was slower (large lists cost more to allocate and
+// wipe than the appends they save).
+@requires(filesystem)
+Pull get_take(Pull p, Int off, List(Int) v, Str local, Bool app) {
+    if (v.len() == 0 || str_len(p.fail) > 0) { return p; }
+    if (off != p.done) { return pl(p, p.s, p.done, p.out, p.inflight, p.held.concat([Seg {.off = off, .v = v}]), p.eof_at, p.fail, p.pace); }
+    Bool wrote = if (app) { print_bytes(app_frame(9, v)) } else { filesystem.append_bytes(local, v) };
+    if (!wrote) { return pl(p, p.s, p.done, p.out, p.inflight, [], p.eof_at, first_fail(p.fail, "cannot write " + local), p.pace); }
+    Int k = seg_at(p.held, p.done + v.len(), 0);
+    Pull q = pl(p, p.s, p.done + v.len(), p.out, p.inflight, p.held, p.eof_at, p.fail, p.pace);
+    if (k < 0) { return q; }
+    Seg nx = p.held[k];
+    return get_take(pl(q, q.s, q.done, q.out, q.inflight, p.held[0..k].concat(p.held[k + 1..p.held.len()]), q.eof_at, q.fail, q.pace), nx.off, nx.v, local, app);
 }
 
 // ============================================================================
 // put
 // ============================================================================
 
-// The bytes `data` into REMOTE (created or truncated, mode 0600 if new).
-@requires(network, declassify, clock(readonly))
-pub Copied put_file(Sftp s0, List(Int) data, Str remote) { return put_bytes(s0, data, bytes_of(remote), true); }
+// A pipelined write to handle h: at, the next offset; acked, the bytes
+// the server confirmed; fail, the first failure (later data is dropped
+// and the replies owed are still read).
+pub type Push = { Sftp s; List(Int) h; Int at; Int acked; List(Req) out; Int inflight; Str fail; Pace pace; };
 
-// With `replace` false, a REMOTE that exists is refused (O_EXCL).
+Push ps(Push p, Sftp s, Int at, Int acked, List(Req) out, Int inflight, Str fail, Pace pace) {
+    return Push {.s = s, .h = p.h, .at = at, .acked = acked, .out = out, .inflight = inflight, .fail = fail, .pace = pace};
+}
+
+@requires(clock(readonly))
+Push push_new(Sftp s, List(Int) h) { return Push {.s = s, .h = h, .at = 0, .acked = 0, .out = [], .inflight = 0, .fail = "", .pace = pace_new(clock.monotonic_ns())}; }
+
+// data[i..] from offset p.at on, with no more than the target in flight.
+@requires(network, declassify, clock(readonly))
+Push push_data(Push p, List(Int) data, Int i) {
+    if (i >= data.len() || !sftp_good(p.s) || str_len(p.fail) > 0) { return p; }
+    Int n = if (data.len() - i < chunk()) { data.len() - i } else { chunk() };
+    if ((p.inflight + n > p.pace.target || owed(p.s)) && p.out.len() > 0) { return push_data(push_recv(p), data, i); }
+    return push_data(push_piece(p, data[i..i + n]), data, i + n);
+}
+
+// The same from packed bytes (a whole file read with read_bytes_u8 is one
+// byte a byte, not eight); each piece is widened as it goes.
+@requires(network, declassify, clock(readonly))
+Push push_packed(Push p, List(UInt(8)) data, Int i) {
+    if (i >= data.len() || !sftp_good(p.s) || str_len(p.fail) > 0) { return p; }
+    Int n = if (data.len() - i < chunk()) { data.len() - i } else { chunk() };
+    if ((p.inflight + n > p.pace.target || owed(p.s)) && p.out.len() > 0) { return push_packed(push_recv(p), data, i); }
+    return push_packed(push_piece(p, bytes_int(data[i..i + n])), data, i + n);
+}
+
+// One WRITE of v at p.at, not waited for.
+@requires(network, declassify, clock(readonly))
+Push push_piece(Push p, List(Int) v) {
+    Sftp s1 = issue(p.s, fx_write(), sstring(p.h).concat(u64_be(p.at)).concat(sstring(v)));
+    return ps(p, s1, p.at + v.len(), p.acked, p.out.concat([Req {.id = p.s.id, .t = fx_write(), .off = p.at, .len = v.len()}]), p.inflight + v.len(), p.fail, p.pace);
+}
+
+@requires(network, declassify, clock(readonly))
+Push push_recv(Push p) {
+    Reply r = next_reply(p.s);
+    if (str_len(r.s.err) > 0) { return ps(p, r.s, p.at, p.acked, [], 0, p.fail, p.pace); }
+    Int i = req_at(p.out, r.id, 0);
+    if (i < 0) { return ps(p, sftp_err(on_chan(r.s, closed_chan(r.s.ch)), "the server answered another SFTP request"), p.at, p.acked, [], 0, p.fail, p.pace); }
+    Req q = p.out[i];
+    Bool ok = r.t == fx_status() && status_code(r.body) == fx_ok();
+    Str why = if (r.t == fx_status()) { status_text(r.body) } else { "unexpected reply" };
+    return ps(p, r.s, p.at, if (ok) { p.acked + q.len } else { p.acked }, req_gone(p.out, i), p.inflight - q.len,
+        if (ok) { p.fail } else { first_fail(p.fail, "write failed: " + why) }, if (ok) { paced(p.pace, q.len, clock.monotonic_ns()) } else { p.pace });
+}
+
+// Every reply owed, then how the writes ended.
+@requires(network, declassify, clock(readonly))
+Copied push_end(Push p) {
+    if (p.out.len() > 0 && sftp_good(p.s)) { return push_end(push_recv(p)); }
+    if (!sftp_good(p.s)) { return Copied {.s = p.s, .bytes = p.acked}; }
+    if (str_len(p.fail) > 0) { return Copied {.s = sftp_err(p.s, p.fail), .bytes = p.acked}; }
+    return Copied {.s = p.s, .bytes = p.at};
+}
+
+// The bytes `data` into REMOTE (created or truncated, mode 0600 if new);
+// with `replace` false, a REMOTE that exists is refused (O_EXCL).
 @requires(network, declassify, clock(readonly))
 pub Copied put_bytes(Sftp s0, List(Int) data, List(Int) remote, Bool replace) {
     Reply o = open_remote(s0, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
     if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
-    Copied c = put_loop(o.s, o.body, data, 0, 0);
+    Copied c = push_end(push_data(push_new(o.s, o.body), data, 0));
     return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
 }
 
-// A file opened for writing, to be fed in pieces (the app's uploads).
-pub type Upload = { Sftp s; List(Int) handle; Int off; };
+// put_bytes from packed bytes.
+@requires(network, declassify, clock(readonly))
+pub Copied put_packed(Sftp s0, List(UInt(8)) data, List(Int) remote, Bool replace) {
+    Reply o = open_remote(s0, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
+    if (str_len(o.s.err) > 0) { return Copied {.s = o.s, .bytes = 0}; }
+    Copied c = push_end(push_packed(push_new(o.s, o.body), data, 0));
+    return Copied {.s = close_remote(c.s, o.body), .bytes = c.bytes};
+}
+
+// A file opened for writing, to be fed in pieces (the app's uploads); the
+// writes stay in flight from one piece to the next. No handle: nothing
+// was opened (p.s says why).
+pub type Upload = { Push p; };
+
+@requires(clock(readonly))
+pub Upload upload_refused(Sftp s) { return Upload {.p = push_new(s, [])}; }
 
 @requires(network, declassify, clock(readonly))
 pub Upload upload_start(Sftp s, List(Int) remote, Bool replace) {
     Reply o = open_remote(s, remote, pf_write() | pf_creat() | if (replace) { pf_trunc() } else { pf_excl() }, 384);
-    return Upload {.s = o.s, .handle = if (str_len(o.s.err) > 0) { [] } else { o.body }, .off = 0};
+    return Upload {.p = push_new(o.s, if (str_len(o.s.err) > 0) { [] } else { o.body })};
 }
 
 @requires(network, declassify, clock(readonly))
 pub Upload upload_more(Upload u, List(Int) data) {
-    if (!sftp_good(u.s)) { return u; }
-    Copied c = put_loop(u.s, u.handle, data, 0, u.off);
-    return Upload {.s = c.s, .handle = u.handle, .off = c.bytes};
+    if (u.p.h.len() == 0) { return u; }
+    return Upload {.p = push_data(u.p, data, 0)};
 }
+
+pub Sftp upload_session(Upload u) { return u.p.s; }
 
 @requires(network, declassify, clock(readonly))
 pub Copied upload_end(Upload u) {
-    if (u.handle.len() == 0) { return Copied {.s = u.s, .bytes = 0}; }
-    return Copied {.s = close_remote(u.s, u.handle), .bytes = u.off};
-}
-
-// data[i..] written at file offset `at` onward; bytes: the offset reached.
-@requires(network, declassify, clock(readonly))
-Copied put_loop(Sftp s, List(Int) handle, List(Int) data, Int i, Int at) {
-    if (i >= data.len()) { return Copied {.s = s, .bytes = at}; }
-    Int n = if (data.len() - i < chunk()) { data.len() - i } else { chunk() };
-    Reply r = call(s, fx_write(), sstring(handle).concat(u64_be(at)).concat(sstring(data[i..i + n])));
-    if (str_len(r.s.err) > 0) { return Copied {.s = r.s, .bytes = at}; }
-    if (r.t != fx_status() || status_code(r.body) != fx_ok()) { return Copied {.s = sftp_err(r.s, "write failed: " + status_text(r.body)), .bytes = at}; }
-    return put_loop(r.s, handle, data, i + n, at + n);
+    if (u.p.h.len() == 0) { return Copied {.s = u.p.s, .bytes = 0}; }
+    Copied c = push_end(u.p);
+    return Copied {.s = close_remote(c.s, u.p.h), .bytes = c.bytes};
 }

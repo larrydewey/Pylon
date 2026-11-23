@@ -498,7 +498,7 @@ Fsh cmd_put(Fsh x, List(List(Int)) a0) {
     if (there.found && there.a.kind == 1) { eprintln("put: " + shown(rp) + " is a directory"); return with_s(x, there.s); }
     if (there.found && !f.on) { eprintln("put: " + shown(rp) + " exists; not replaced (put -f replaces it)"); return with_s(x, there.s); }
     // O_EXCL still guards a file that appears meanwhile.
-    Copied c = put_bytes(there.s, filesystem.read_bytes(lp), rp, f.on);
+    Copied c = put_packed(there.s, filesystem.read_bytes_u8(lp), rp, f.on);
     _ = if (sftp_good(c.s)) { println(f"{c.bytes}" + " bytes to " + shown(rp)) } else { true };
     return reported(x, c.s);
 }
@@ -711,14 +711,14 @@ Int serve_put(Sftp s, List(Int) path, Bool replace, List(Int) buf) {
     Stat st = stat_path(s, path, true);
     Bool taken = sftp_good(st.s) && st.found && (!replace || st.a.kind != 0);
     Str why = if (st.a.kind == 0) { shown(path) + " already exists; not replaced" } else { shown(path) + " exists and is not a file" };
-    Upload u = if (!sftp_good(st.s)) { Upload {.s = st.s, .handle = [], .off = 0} } else { if (taken) { Upload {.s = sftp_err(st.s, why), .handle = [], .off = 0} } else { upload_start(st.s, path, replace) } };
+    Upload u = if (!sftp_good(st.s)) { upload_refused(st.s) } else { if (taken) { upload_refused(sftp_err(st.s, why)) } else { upload_start(st.s, path, replace) } };
     return put_frames(u, buf);
 }
 
 @requires(network, declassify, filesystem, clock(readonly))
 Int put_frames(Upload u, List(Int) buf) {
     AppMsg m = next_in(buf);
-    if (m.eof) { _ = disconnect(u.s.ch.c, "done"); return 0; }
+    if (m.eof) { _ = disconnect(upload_session(u).ch.c, "done"); return 0; }
     if (m.t != 9) { return put_frames(u, m.buf); }
     if (m.p.len() > 0) { return put_frames(upload_more(u, m.p), m.buf); }
     Copied c = upload_end(u);

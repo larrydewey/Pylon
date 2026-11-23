@@ -171,7 +171,7 @@ algorithm not listed is neither offered nor accepted.
 |---|---|
 | Key exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `curve25519-sha256` (and `@libssh.org` alias) |
 | Host key | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `rsa-sha2-512`, `rsa-sha2-256` (RSA ≥ 2048 bits), and their `-cert-v01@openssh.com` forms |
-| Cipher | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` |
+| Cipher | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`; with AES and carry-less multiply instructions, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`, `chacha20-poly1305@openssh.com` (section 11, Files) |
 | MAC | none (AEAD only; no `hmac-*`, no encrypt-and-MAC or MAC-then-encrypt modes) |
 | Compression | `none` |
 | User signature | as host key, plus whatever the agent supports among them |
@@ -1114,6 +1114,20 @@ authentication required, and expire after 12 hours regardless.
   download or an upload goes through the system document picker: Pylon
   holds no storage permission and sees only the document picked, and a
   download that fails is deleted rather than left partial.
+  A file's contents (get, put, and a copy that passes through Pylon) go
+  as many 32 KiB requests in flight, so a transfer runs at the link's
+  speed rather than one piece per round trip. How much is in flight
+  starts at 256 KiB and doubles while each doubling still makes the
+  transfer faster (at most 32 MiB); a download raises its channel's
+  window to match, never past what it has asked for plus a margin.
+  Every reply must answer a request in flight, DATA brings no more than
+  was asked (a short read asks again for the rest), and EOF must fall
+  exactly where the delivered bytes end; after an error nothing more is
+  asked and the replies still owed are read, so the session stays in
+  step. An upload reads the local file packed (a byte a byte).
+  On a machine with AES and carry-less multiply instructions Pylon
+  offers AES-GCM before chacha20-poly1305 (both are offered everywhere),
+  as it is several times faster there.
 
 ## 12. The terminal emulator
 

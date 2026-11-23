@@ -49,7 +49,17 @@ pub PubKey host_key_of(List(Int) blob, Str alg) {
     return ok else { no_key() };
 }
 
-pub List(Str) our_ciphers() { return ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "aes128-gcm@openssh.com"]; }
+// The AEAD ciphers, in order of preference. All three are constant time
+// and offered everywhere; the order is speed. With AES and carry-less
+// multiply instructions (AES-NI and PCLMULQDQ, or ARMv8 AES and PMULL)
+// AES-GCM is several times faster than chacha20-poly1305 in software, so
+// it goes first; without them chacha20-poly1305 does (software AES is
+// much slower).
+pub List(Str) our_ciphers() {
+    Bool hw = resid_cpu_has_aesni() && resid_cpu_has_clmul();
+    return if (hw) { ["aes256-gcm@openssh.com", "aes128-gcm@openssh.com", "chacha20-poly1305@openssh.com"] }
+        else { ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "aes128-gcm@openssh.com"] };
+}
 
 // The host key algorithms offered, with those matching a pinned key's type
 // first: offering an algorithm whose key we have not pinned would only
