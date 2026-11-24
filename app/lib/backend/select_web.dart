@@ -17,6 +17,9 @@ Future<void> copySensitive(String text) => _clip.copy(text);
 
 String get deviceName => 'this device';
 
+/// No camera in the demo.
+bool get canScan => false;
+
 String get agentNote => 'Demo';
 
 /// No key-holding app in the demo.

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../backend/files.dart';
@@ -42,6 +44,32 @@ class AppState extends ChangeNotifier {
     f.close();
     _filesOpen--;
     _report();
+  }
+
+  // `pylon authorize` runs, counted with the connections as well: one
+  // waits on Symbolon's consent sheet, with Pylon in the background.
+  int _authorizing = 0;
+
+  Authorize authorize(Host h, List<String> keys, {bool ca = false}) {
+    final a = backend.authorize(h, keys, ca: ca);
+    _authorizing++;
+    _report();
+    var counted = true;
+    late final StreamSubscription<void> sub;
+    sub = a.changes.listen((_) {
+      if (a.ok == null || !counted) return;
+      counted = false;
+      _authorizing--;
+      _report();
+      sub.cancel();
+    });
+    return a;
+  }
+
+  /// Every pinned key of [h] (a host may have several, one per type).
+  List<Pin> pinsFor(Host h) {
+    final t = '${h.address.toLowerCase()}:${h.port}';
+    return [for (final p in pinList) if (p.token == t) p];
   }
 
   /// The desktop layout's way to open a host: in a tab, not a page.
@@ -132,7 +160,7 @@ class AppState extends ChangeNotifier {
   // connections, counted, keep Pylon's foreground service up meanwhile.
   int _reported = 0;
   void _report() {
-    final n = [for (final s in live) if (!s.local) s].length + _filesOpen;
+    final n = [for (final s in live) if (!s.local) s].length + _filesOpen + _authorizing;
     if (n == _reported) return;
     _reported = n;
     keepConnections(n);

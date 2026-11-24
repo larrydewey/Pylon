@@ -3,10 +3,12 @@ import 'dart:typed_data';
 
 import 'package:material_ui/material_ui.dart';
 
+import '../backend/access.dart';
 import '../backend/files.dart';
 import '../backend/model.dart';
 import '../backend/select.dart';
 import '../theme.dart';
+import 'access_help.dart';
 import 'app_state.dart';
 import 'widgets.dart';
 
@@ -677,33 +679,48 @@ class _FilesPageState extends State<FilesPage> {
     );
   }
 
-  Widget _message(String text, {required bool retry}) => Center(
-    child: Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+  Widget _message(String text, {required bool retry}) {
+    final reconnect = FilledButton(
+      style: _compact,
+      onPressed: () {
+        fs.unlisten(_onSession);
+        st.closeFiles(fs);
+        setState(() => cwd = null);
+        _connect();
+      },
+      child: const Text('Reconnect'),
+    );
+    // The host refused every key: what to do about it, then a way back.
+    final refusal = retry ? parseKeyRefusal(text) : null;
+    if (refusal != null) {
+      return ListView(
+        padding: const EdgeInsets.only(bottom: 24),
         children: [
-          Text(
-            visible(text),
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: P.red),
-          ),
+          KeyRefusalCard(refusal: refusal, host: widget.host, st: st),
           const SizedBox(height: 16),
-          if (retry)
-            FilledButton(
-              style: _compact,
-              onPressed: () {
-                fs.unlisten(_onSession);
-                st.closeFiles(fs);
-                setState(() => cwd = null);
-                _connect();
-              },
-              child: const Text('Reconnect'),
-            )
-          else
-            TextButton(onPressed: home == null ? null : () => _go(home!), child: const Text('Go home')),
+          Center(child: reconnect),
         ],
+      );
+    }
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              visible(text),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: P.red),
+            ),
+            const SizedBox(height: 16),
+            if (retry)
+              reconnect
+            else
+              TextButton(onPressed: home == null ? null : () => _go(home!), child: const Text('Go home')),
+          ],
+        ),
       ),
-    ),
-  );
+    );
+  }
 }

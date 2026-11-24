@@ -98,6 +98,10 @@ Future<void> keepConnections(int live) async {
 /// Where signatures come from, for the desktop's title bar.
 String get agentNote => Platform.isAndroid ? 'Symbolon' : (Platform.environment['SSH_AUTH_SOCK'] != null ? 'Agent at SSH_AUTH_SOCK' : 'No agent (SSH_AUTH_SOCK unset)');
 
+/// Whether this device can scan a QR code with its camera (Android:
+/// QrScanner.kt; a computer has no camera to point).
+bool get canScan => Platform.isAndroid;
+
 /// What "this device" is called in the interface.
 String get deviceName => Platform.isAndroid || Platform.isIOS ? 'this phone' : 'this computer';
 

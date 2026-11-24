@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'access.dart';
 import 'files.dart';
 import 'mem_files.dart';
 import 'model.dart';
@@ -42,6 +44,9 @@ class DemoBackend implements Backend {
 
   @override
   FileSession openFiles(Host h) => MemFiles(h);
+
+  @override
+  Authorize authorize(Host h, List<String> keys, {bool ca = false}) => _DemoAuthorize(h, keys, ca);
 
   @override
   bool get hasLocalShell => true;
@@ -102,4 +107,35 @@ class _DemoSession extends Session {
 
   @override
   void close() {}
+}
+
+/// What `pylon authorize` would report, said to be a demo first.
+class _DemoAuthorize extends Authorize {
+  _DemoAuthorize(super.host, super.keys, bool ca) : super(ca: ca) {
+    _timer = Timer(const Duration(milliseconds: 600), _run);
+  }
+
+  Timer? _timer;
+
+  void _run() {
+    lines.add(const ReportLine(ReportKind.warning, 'Demo mode: no connection is made and nothing is installed.'));
+    final shown = keys.isEmpty ? ['ecdsa-sha2-nistp256 AAAA symbolon-pylon'] : keys;
+    for (final k in shown) {
+      final w = k.split(' ');
+      lines.add(ReportLine(ReportKind.added, '${w[0]} SHA256:demo${w.length > 2 ? ' ${w[2]}' : ''}'));
+    }
+    lines.add(const ReportLine(ReportKind.fixed, '~/.ssh/authorized_keys was writable by others; now 600'));
+    lines.add(const ReportLine(ReportKind.done, ''));
+    ok = true;
+    changed();
+  }
+
+  @override
+  void close() {
+    _timer?.cancel();
+    if (ok != null) return;
+    ok = false;
+    messages = 'Stopped.';
+    changed();
+  }
 }

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'access.dart';
 import 'files.dart';
 import 'frames.dart';
 import 'model.dart';
@@ -202,6 +203,9 @@ class ProcessBackend implements Backend {
 
   @override
   FileSession openFiles(Host h) => ProcFiles(this, h);
+
+  @override
+  Authorize authorize(Host h, List<String> keys, {bool ca = false}) => ProcAuthorize(this, h, keys, ca: ca);
 
   @override
   Session openLocal(int rows, int cols, {bool shareNet = false}) => ProcSession(this, Host.local(), rows, cols, () async {
@@ -549,5 +553,95 @@ class ProcFiles extends FileSession {
     b.agentClose?.call(_agentConn);
     _conn?.close();
     _end('Closed');
+  }
+}
+
+/// `pylon authorize --app`, framed both ways: from it, 1 report lines
+/// (UTF-8, newline-separated) and 3 agent requests (Symbolon's consent
+/// sheet comes up as for a terminal); to it, 3 agent replies. Why it
+/// failed comes as text on its error output.
+class ProcAuthorize extends Authorize {
+  ProcAuthorize(this.b, super.host, super.keys, {super.ca}) {
+    _start();
+  }
+
+  final ProcessBackend b;
+  ProcessConduit? _conn;
+  late final int _agentConn = ++b._conns;
+  final _reader = FrameReader();
+  final _text = BytesBuilder();
+  int? _reported;
+  bool _closed = false;
+
+  Future<void> _start() async {
+    try {
+      final args = ['authorize', '--app', '-p', '${host.port}', if (host.jump.isNotEmpty) ...['-J', host.jump], if (ca) '--ca', host.target, ...keys];
+      _conn = ProcessConduit(await Process.start(b.pylonPath, args, environment: await b._env()));
+    } catch (e) {
+      _end(255, 'Cannot start the Pylon core: $e');
+      return;
+    }
+    if (_closed) {
+      _conn?.close();
+      return;
+    }
+    _conn!.output.listen(_onFrames);
+    _conn!.messages.listen((m) {
+      messages += m;
+      changed();
+    });
+    _conn!.exitCode.then((c) => _end(_reported ?? c, null));
+  }
+
+  void _onFrames(List<int> d) {
+    for (final (t, p) in _reader.add(d)) {
+      if (t == 1) {
+        _text.add(p);
+        _report(false);
+      } else if (t == 3) {
+        _agentRequest(Uint8List.fromList(p));
+      } else if (t == 5 && p.length == 1) {
+        _reported = p[0];
+      }
+    }
+  }
+
+  // The report's whole lines so far; at the end, the rest too.
+  void _report(bool all) {
+    final got = _text.takeBytes();
+    final cut = all ? got.length : got.lastIndexOf(10) + 1;
+    for (final l in utf8.decode(got.sublist(0, cut), allowMalformed: true).split('\n')) {
+      if (l.trim().isNotEmpty) lines.add(parseReportLine(l));
+    }
+    _text.add(got.sublist(cut));
+    changed();
+  }
+
+  Future<void> _agentRequest(Uint8List req) async {
+    final a = b.agent;
+    final reply = a == null ? null : await a(_agentConn, req);
+    if (a != null && req.length >= 5 && req[4] == 11 && keysIn(reply) != AgentKeys.some) {
+      agentNote = keysIn(reply) == AgentKeys.none ? 'Symbolon offered no keys.' : 'Pylon cannot reach Symbolon.';
+      changed();
+    }
+    _conn?.add(frame(3, reply ?? Uint8List.fromList([0, 0, 0, 1, 5])));
+  }
+
+  void _end(int code, String? why) {
+    if (ok != null) return;
+    _report(true);
+    if (why != null) messages += why;
+    ok = code == 0;
+    if (code != 0 && messages.trim().isEmpty) messages = 'pylon authorize stopped ($code)';
+    b.agentClose?.call(_agentConn);
+    changed();
+  }
+
+  @override
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    _conn?.close();
+    _end(255, 'Stopped.');
   }
 }

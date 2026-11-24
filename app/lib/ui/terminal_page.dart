@@ -143,7 +143,7 @@ class _TerminalPageState extends State<TerminalPage> {
       ),
       body: Column(children: [
         if (s.agentKeys == AgentKeys.none || s.agentKeys == AgentKeys.unreachable) _KeysCard(session: s),
-        SessionNote(session: s),
+        SessionNote(session: s, st: widget.st),
         Expanded(
           child: TermView(
             key: view,

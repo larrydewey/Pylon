@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import '../term/screen.dart';
+import 'access.dart';
 import 'files.dart';
 
 enum Mode { ssh, pylon }
@@ -86,6 +87,40 @@ abstract class Session {
   void close();
 }
 
+/// A `pylon authorize` run: logs in to the host with the agent's keys and
+/// adds public keys (or a CA) to the user's ~/.ssh/authorized_keys there,
+/// never removing any. [changes] fires on each report line and at the end.
+abstract class Authorize {
+  Authorize(this.host, this.keys, {this.ca = false});
+  final Host host;
+
+  /// The key lines to add; none: every key the agent offers.
+  final List<String> keys;
+
+  /// [keys] are certificate authorities, trusted for certificates issued
+  /// to [Host.user].
+  final bool ca;
+
+  /// What it did so far (added, present, fixed, warning, done).
+  final List<ReportLine> lines = [];
+
+  /// The core's messages: why it failed, when it did.
+  String messages = '';
+
+  /// What the agent said, when that is the trouble (no keys, unreachable).
+  String agentNote = '';
+
+  /// Null while it runs; then whether it succeeded.
+  bool? ok;
+
+  final _changes = StreamController<void>.broadcast();
+  Stream<void> get changes => _changes.stream;
+  void changed() => _changes.add(null);
+
+  /// Stops it (if still running).
+  void close();
+}
+
 abstract class Backend {
   Future<List<Host>> loadHosts();
   Future<void> saveHosts(List<Host> hosts);
@@ -96,6 +131,10 @@ abstract class Backend {
 
   /// A file browser's connection to the host (SPEC 11), over SSH.
   FileSession openFiles(Host h);
+
+  /// Adds [keys] to the host's authorized_keys (none: the agent's own
+  /// keys), as `pylon authorize --app` (with [ca], as CA keys).
+  Authorize authorize(Host h, List<String> keys, {bool ca = false});
   bool get demo;
 
   /// Whether this device can run the local shell (SPEC 13).

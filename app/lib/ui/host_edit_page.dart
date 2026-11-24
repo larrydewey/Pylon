@@ -4,7 +4,11 @@ import 'package:material_ui/material_ui.dart';
 
 import '../backend/model.dart';
 import '../theme.dart';
+import 'access_help.dart';
 import 'app_state.dart';
+import 'authorize_page.dart';
+import 'pin_page.dart';
+import 'share_pin_page.dart';
 import 'widgets.dart';
 
 class HostEditPage extends StatefulWidget {
@@ -49,14 +53,22 @@ class _HostEditPageState extends State<HostEditPage> {
       ..port = p
       ..jump = jump.text.trim()
       ..mode = mode;
-    if (widget.host == null) widget.st.hosts.add(h);
+    final added = widget.host == null;
+    if (added) widget.st.hosts.add(h);
     await widget.st.save();
-    if (mounted) Navigator.pop(context);
+    if (!mounted) return;
+    // A new host has no pin yet: what to do next, in place of the editor.
+    if (added && widget.st.pinFor(h) == null) {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => AccessPage(st: widget.st, host: h)));
+    } else {
+      Navigator.pop(context);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final pin = widget.host == null ? null : widget.st.pinFor(widget.host!);
+    final h = widget.host;
+    final pins = h == null ? const <Pin>[] : widget.st.pinsFor(h);
     return Scaffold(
       appBar: AppBar(title: Text(widget.host == null ? 'Add host' : widget.host!.name)),
       body: ListView(padding: const EdgeInsets.all(16), children: [
@@ -80,14 +92,63 @@ class _HostEditPageState extends State<HostEditPage> {
         const SizedBox(height: 8),
         Text(mode == Mode.pylon ? "Pylon copies its small server into your account over SSH, checks it by hash, then keeps your sessions through network changes and sleep." : 'Plain SSH, with every protection of the profile.',
             style: const TextStyle(fontSize: 12, color: P.muted)),
-        if (pin != null) ...[
+        if (h != null) ...[
           const Section('Host key'),
-          Card2(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('${pin.alg} ${pin.fingerprint}', style: const TextStyle(fontFamily: mono, fontSize: 12)),
-            const SizedBox(height: 4),
-            Text('Pinned ${pin.when} from ${pin.by}', style: const TextStyle(fontSize: 12, color: P.muted)),
-          ])),
+          if (pins.isNotEmpty)
+            Card2(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              for (final p in pins) ...[
+                Text('${p.alg} ${p.fingerprint}', style: const TextStyle(fontFamily: mono, fontSize: 12)),
+                const SizedBox(height: 4),
+                Text('Pinned ${p.when} from ${p.by}', style: const TextStyle(fontSize: 12, color: P.muted)),
+                if (p != pins.last) const SizedBox(height: 10),
+              ],
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                key: const Key('share-pin'),
+                icon: const Icon(Icons.qr_code_2, size: 18),
+                label: const Text('Share pin'),
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SharePinPage(host: h, pins: pins))),
+              ),
+              const SizedBox(height: 4),
+              const Text('Shows it as a QR code and text, for another device to pin this host from.', style: TextStyle(fontSize: 12, color: P.muted)),
+            ]))
+          else
+            Card2(
+              border: P.amberLine,
+              color: P.amberDeep,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text("Not pinned. Pylon won't connect until you pin this host's key from a source you trust, then the server needs your key.",
+                    style: TextStyle(fontSize: 13, height: 1.4, color: Color(0xFFD9CBAE))),
+                const SizedBox(height: 10),
+                FilledButton(
+                  key: const Key('edit-pin'),
+                  onPressed: () async {
+                    await Navigator.push(context, MaterialPageRoute(builder: (_) => PinPage(st: widget.st, host: h)));
+                    if (mounted) setState(() {});
+                  },
+                  child: const Text('Pin the host key'),
+                ),
+              ]),
+            ),
+          const Section('Access'),
+          OutlinedButton.icon(
+            key: const Key('edit-authorize'),
+            icon: const Icon(Icons.key_outlined, size: 18),
+            label: const Text('Authorize a key on this host'),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AuthorizePage(st: widget.st, host: h))),
+          ),
+          const SizedBox(height: 4),
+          const Text("Adds another device's key (or a CA) to this server, logging in with this device's.", style: TextStyle(fontSize: 12, color: P.muted)),
         ],
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            key: const Key('edit-access-help'),
+            icon: const Icon(Icons.help_outline, size: 18),
+            label: const Text('Getting access to a server'),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AccessPage(st: widget.st, host: h))),
+          ),
+        ),
         if (err.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 12), child: Text(err, style: const TextStyle(color: P.red))),
         const SizedBox(height: 24),
         FilledButton(onPressed: _save, child: const Text('Save')),

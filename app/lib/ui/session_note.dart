@@ -1,18 +1,26 @@
 import 'package:material_ui/material_ui.dart';
 
+import '../backend/access.dart';
 import '../backend/model.dart';
 import '../theme.dart';
+import 'access_help.dart';
+import 'app_state.dart';
 import 'widgets.dart';
 
 /// The core's messages for a session, above its terminal: the pylond
 /// release it checked, the Pylon protocol session it opened, the host's
 /// banner. While the session is live they fold to their first line (tap
 /// for the rest), so the terminal keeps the room; while it starts, and
-/// once it has ended (the reason, usually), they are shown whole.
+/// once it has ended (the reason, usually), they are shown whole. When
+/// the host refused every key, what to do about it instead (the message
+/// itself a tap away).
 class SessionNote extends StatefulWidget {
-  const SessionNote({super.key, required this.session, this.padding = 12});
+  const SessionNote({super.key, required this.session, this.padding = 12, this.st});
   final Session session;
   final double padding;
+
+  /// For the refusal card's way to "Getting access to a server".
+  final AppState? st;
 
   @override
   State<SessionNote> createState() => _SessionNoteState();
@@ -26,6 +34,14 @@ class _SessionNoteState extends State<SessionNote> {
     final s = widget.session;
     final text = visible(s.status.trim());
     if (text.isEmpty) return const SizedBox.shrink();
+    final refusal = s.local ? null : parseKeyRefusal(s.status);
+    if (refusal != null) {
+      // Above the terminal, which keeps some room: the card scrolls.
+      return ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.6),
+        child: SingleChildScrollView(child: KeyRefusalCard(refusal: refusal, host: s.host, st: widget.st)),
+      );
+    }
     final ended = s.exitCode != null;
     final starting = text.startsWith('Connecting') || text.startsWith('Starting');
     final lines = text.split('\n');
