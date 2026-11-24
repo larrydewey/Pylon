@@ -1,0 +1,436 @@
+// QR codes (ISO/IEC 18004) for `pylon share` (SPEC 6.1.4): byte mode,
+// error correction level M, versions 1 to 20 (up to 666 bytes), the mask
+// chosen by the standard's penalty rules. The construction follows
+// Project Nayuki's reference QR Code generator (MIT), step for step.
+// The code is shown on a terminal with half blocks, two module rows per
+// line, dark on light whatever the terminal's colors.
+
+// The blocks of a version at level M: error correction codewords per
+// block, and two groups of (blocks, data codewords per block).
+type QrSpec = { Int ec; Int b1; Int d1; Int b2; Int d2; };
+
+QrSpec qs(Int ec, Int b1, Int d1, Int b2, Int d2) { return QrSpec {.ec = ec, .b1 = b1, .d1 = d1, .b2 = b2, .d2 = d2}; }
+
+QrSpec spec_m(Int v) {
+    if (v == 1) { return qs(10, 1, 16, 0, 0); }
+    if (v == 2) { return qs(16, 1, 28, 0, 0); }
+    if (v == 3) { return qs(26, 1, 44, 0, 0); }
+    if (v == 4) { return qs(18, 2, 32, 0, 0); }
+    if (v == 5) { return qs(24, 2, 43, 0, 0); }
+    if (v == 6) { return qs(16, 4, 27, 0, 0); }
+    if (v == 7) { return qs(18, 4, 31, 0, 0); }
+    if (v == 8) { return qs(22, 2, 38, 2, 39); }
+    if (v == 9) { return qs(22, 3, 36, 2, 37); }
+    if (v == 10) { return qs(26, 4, 43, 1, 44); }
+    if (v == 11) { return qs(30, 1, 50, 4, 51); }
+    if (v == 12) { return qs(22, 6, 36, 2, 37); }
+    if (v == 13) { return qs(22, 8, 37, 1, 38); }
+    if (v == 14) { return qs(24, 4, 40, 5, 41); }
+    if (v == 15) { return qs(24, 5, 41, 5, 42); }
+    if (v == 16) { return qs(28, 7, 45, 3, 46); }
+    if (v == 17) { return qs(28, 10, 46, 1, 47); }
+    if (v == 18) { return qs(26, 9, 43, 4, 44); }
+    if (v == 19) { return qs(26, 3, 44, 11, 45); }
+    return qs(26, 3, 41, 13, 42);
+}
+
+List(Int) align_at(Int v) {
+    if (v == 1) { return []; }
+    if (v <= 6) { return [6, 10 + 4 * v]; }
+    if (v == 7) { return [6, 22, 38]; }
+    if (v == 8) { return [6, 24, 42]; }
+    if (v == 9) { return [6, 26, 46]; }
+    if (v == 10) { return [6, 28, 50]; }
+    if (v == 11) { return [6, 30, 54]; }
+    if (v == 12) { return [6, 32, 58]; }
+    if (v == 13) { return [6, 34, 62]; }
+    if (v == 14) { return [6, 26, 46, 66]; }
+    if (v == 15) { return [6, 26, 48, 70]; }
+    if (v == 16) { return [6, 26, 50, 74]; }
+    if (v == 17) { return [6, 30, 54, 78]; }
+    if (v == 18) { return [6, 30, 56, 82]; }
+    if (v == 19) { return [6, 30, 58, 86]; }
+    return [6, 34, 62, 90];
+}
+
+Int data_cw(QrSpec s) { return s.b1 * s.d1 + s.b2 * s.d2; }
+Int count_bits(Int v) { return if (v <= 9) { 8 } else { 16 }; }
+
+// The smallest version that holds n bytes, or 0.
+Int version_for(Int n, Int v) {
+    if (v > 20) { return 0; }
+    if (4 + count_bits(v) + 8 * n <= 8 * data_cw(spec_m(v))) { return v; }
+    return version_for(n, v + 1);
+}
+
+// ============================================================================
+// Codewords
+// ============================================================================
+
+ListBuf(Int) push_bits(ListBuf(Int) acc, Int val, Int n) {
+    if (n <= 0) { return acc; }
+    return push_bits(acc.push((val >> (n - 1)) & 1), val, n - 1);
+}
+
+ListBuf(Int) push_bytes(ListBuf(Int) acc, List(Int) d, Int i) {
+    if (i >= d.len()) { return acc; }
+    return push_bytes(push_bits(acc, d[i], 8), d, i + 1);
+}
+
+List(Int) pack(List(Int) bits, Int i, ListBuf(Int) acc) {
+    if (i + 8 > bits.len()) { return acc.finish(); }
+    Int b = (bits[i] << 7) | (bits[i + 1] << 6) | (bits[i + 2] << 5) | (bits[i + 3] << 4) | (bits[i + 4] << 3) | (bits[i + 5] << 2) | (bits[i + 6] << 1) | bits[i + 7];
+    return pack(bits, i + 8, acc.push(b));
+}
+
+ListBuf(Int) pad_bytes(ListBuf(Int) acc, Int n, Int k) {
+    if (n <= 0) { return acc; }
+    return pad_bytes(acc.push(if (k % 2 == 0) { 236 } else { 17 }), n - 1, k + 1);
+}
+
+// The data codewords: mode, count, bytes, terminator, padding.
+List(Int) data_codewords(List(Int) data, Int v) {
+    Int cap = 8 * data_cw(spec_m(v));
+    ListBuf(Int) b0 = ListBuf();
+    List(Int) bits = push_bytes(push_bits(push_bits(b0, 4, 4), data.len(), count_bits(v)), data, 0).finish();
+    Int term = if (cap - bits.len() < 4) { cap - bits.len() } else { 4 };
+    Int fill = (8 - (bits.len() + term) % 8) % 8;
+    List(Int) bits2 = bits.concat(zeros(term + fill, 0, ListBuf()));
+    List(Int) bytes = pack(bits2, 0, ListBuf());
+    ListBuf(Int) pb = ListBuf();
+    List(Int) pads = pad_bytes(pb, cap / 8 - bytes.len(), 0).finish();
+    return bytes.concat(pads);
+}
+
+List(Int) zeros(Int n, Int i, ListBuf(Int) acc) {
+    if (i >= n) { return acc.finish(); }
+    return zeros(n, i + 1, acc.push(0));
+}
+
+Int gf_mul(Int x, Int y) { return gf_acc(x, y, 0, 7); }
+
+Int gf_acc(Int x, Int y, Int z, Int i) {
+    if (i < 0) { return z; }
+    Int z1 = ((z << 1) ^ ((z >> 7) * 285)) & 255;
+    return gf_acc(x, y, z1 ^ (((y >> i) & 1) * x), i - 1);
+}
+
+// The Reed-Solomon generator of the given degree (highest term implied).
+List(Int) rs_divisor(Int deg) {
+    List(Int) start = zeros(deg - 1, 0, ListBuf()).concat([1]);
+    return div_rounds(start, 1, 0, deg);
+}
+
+List(Int) div_rounds(List(Int) r, Int root, Int i, Int deg) {
+    if (i >= deg) { return r; }
+    return div_rounds(div_round(r, root, 0), gf_mul(root, 2), i + 1, deg);
+}
+
+List(Int) div_round(List(Int) r, Int root, Int j) {
+    if (j >= r.len()) { return r; }
+    Int x = gf_mul(r[j], root) ^ (if (j + 1 < r.len()) { r[j + 1] } else { 0 });
+    return div_round(r.with(j, x), root, j + 1);
+}
+
+List(Int) rs_remainder(List(Int) data, List(Int) div) { return rem_acc(data, div, 0, zeros(div.len(), 0, ListBuf())); }
+
+List(Int) rem_acc(List(Int) data, List(Int) div, Int i, List(Int) r) {
+    if (i >= data.len()) { return r; }
+    Int factor = data[i] ^ r[0];
+    List(Int) shifted = r[1..r.len()].concat([0]);
+    return rem_acc(data, div, i + 1, xor_scaled(shifted, div, factor, 0));
+}
+
+List(Int) xor_scaled(List(Int) r, List(Int) div, Int f, Int i) {
+    if (i >= r.len()) { return r; }
+    return xor_scaled(r.with(i, r[i] ^ gf_mul(div[i], f)), div, f, i + 1);
+}
+
+// The blocks, each with its error correction, interleaved.
+List(Int) with_ecc(List(Int) d, Int v) {
+    QrSpec s = spec_m(v);
+    List(List(Int)) blocks = split_blocks(d, s, 0, 0, []);
+    List(Int) div = rs_divisor(s.ec);
+    List(List(Int)) eccs = eccs_of(blocks, div, 0, []);
+    Int longest = if (s.b2 > 0) { s.d2 } else { s.d1 };
+    List(Int) a = interleave(blocks, longest, 0, 0, ListBuf());
+    List(Int) b = interleave(eccs, s.ec, 0, 0, ListBuf());
+    return a.concat(b);
+}
+
+List(List(Int)) split_blocks(List(Int) d, QrSpec s, Int k, Int at, List(List(Int)) acc) {
+    if (k >= s.b1 + s.b2) { return acc; }
+    Int n = if (k < s.b1) { s.d1 } else { s.d2 };
+    return split_blocks(d, s, k + 1, at + n, acc.concat([d[at..at + n]]));
+}
+
+List(List(Int)) eccs_of(List(List(Int)) bs, List(Int) div, Int i, List(List(Int)) acc) {
+    if (i >= bs.len()) { return acc; }
+    return eccs_of(bs, div, i + 1, acc.concat([rs_remainder(bs[i], div)]));
+}
+
+List(Int) interleave(List(List(Int)) bs, Int n, Int i, Int k, ListBuf(Int) acc) {
+    if (i >= n) { return acc.finish(); }
+    if (k >= bs.len()) { return interleave(bs, n, i + 1, 0, acc); }
+    if (i < bs[k].len()) { return interleave(bs, n, i, k + 1, acc.push(bs[k][i])); }
+    return interleave(bs, n, i, k + 1, acc);
+}
+
+// ============================================================================
+// The matrix
+// ============================================================================
+
+// Modules row by row (y * n + x): m dark (1) or light (0), f 1 where a
+// function pattern is (never masked, never holds data).
+type Grid = { Int n; List(Int) m; List(Int) f; };
+
+Grid put(Grid g, Int x, Int y, Bool dark) {
+    if (x < 0 || y < 0 || x >= g.n || y >= g.n) { return g; }
+    return Grid {.n = g.n, .m = g.m.with(y * g.n + x, if (dark) { 1 } else { 0 }), .f = g.f.with(y * g.n + x, 1)};
+}
+
+Int iabs(Int a) { return if (a < 0) { 0 - a } else { a }; }
+Int imax(Int a, Int b) { return if (a > b) { a } else { b }; }
+
+Grid timing(Grid g, Int i) {
+    if (i >= g.n) { return g; }
+    return timing(put(put(g, 6, i, i % 2 == 0), i, 6, i % 2 == 0), i + 1);
+}
+
+// A finder pattern centered at (cx, cy) with its separator: dark except
+// at distance 2 and 4 (Chebyshev) from the center.
+Grid finder(Grid g, Int cx, Int cy, Int k) {
+    if (k >= 81) { return g; }
+    Int dx = k % 9 - 4;
+    Int dy = k / 9 - 4;
+    Int d = imax(iabs(dx), iabs(dy));
+    return finder(put(g, cx + dx, cy + dy, d != 2 && d != 4), cx, cy, k + 1);
+}
+
+Grid alignment(Grid g, Int cx, Int cy, Int k) {
+    if (k >= 25) { return g; }
+    Int dx = k % 5 - 2;
+    Int dy = k / 5 - 2;
+    return alignment(put(g, cx + dx, cy + dy, imax(iabs(dx), iabs(dy)) != 1), cx, cy, k + 1);
+}
+
+Grid alignments(Grid g, List(Int) ps, Int i, Int j) {
+    Int last = ps.len() - 1;
+    if (i >= ps.len()) { return g; }
+    if (j >= ps.len()) { return alignments(g, ps, i + 1, 0); }
+    Bool corner = (i == 0 && j == 0) || (i == 0 && j == last) || (i == last && j == 0);
+    return alignments(if (corner) { g } else { alignment(g, ps[i], ps[j], 0) }, ps, i, j + 1);
+}
+
+Bool bit_of(Int x, Int i) { return ((x >> i) & 1) != 0; }
+
+// The format bits (level M, the mask) in both copies, and the dark module.
+Grid format(Grid g, Int mask) {
+    Int data = mask;  // level M is 00
+    Int rem = bch(data, 0, data);
+    Int bits = ((data << 10) | rem) ^ 21522;
+    Grid a = fmt1(g, bits, 0);
+    Grid b = fmt2(a, bits, 0);
+    return put(b, 8, g.n - 8, true);
+}
+
+Int bch(Int data, Int i, Int rem) {
+    if (i >= 10) { return rem; }
+    return bch(data, i + 1, (rem << 1) ^ ((rem >> 9) * 1335));
+}
+
+Grid fmt1(Grid g, Int bits, Int i) {
+    if (i >= 15) { return g; }
+    Bool b = bit_of(bits, i);
+    Grid h = if (i <= 5) { put(g, 8, i, b) } else { if (i == 6) { put(g, 8, 7, b) } else { if (i == 7) { put(g, 8, 8, b) } else { if (i == 8) { put(g, 7, 8, b) } else { put(g, 14 - i, 8, b) } } } };
+    return fmt1(h, bits, i + 1);
+}
+
+Grid fmt2(Grid g, Int bits, Int i) {
+    if (i >= 15) { return g; }
+    Bool b = bit_of(bits, i);
+    Grid h = if (i < 8) { put(g, g.n - 1 - i, 8, b) } else { put(g, 8, g.n - 15 + i, b) };
+    return fmt2(h, bits, i + 1);
+}
+
+// Version information, for version 7 and up.
+Grid version_info(Grid g, Int v) {
+    if (v < 7) { return g; }
+    Int rem = vbch(v, 0, v);
+    return vinfo(g, (v << 12) | rem, 0);
+}
+
+Int vbch(Int v, Int i, Int rem) {
+    if (i >= 12) { return rem; }
+    return vbch(v, i + 1, (rem << 1) ^ ((rem >> 11) * 7973));
+}
+
+Grid vinfo(Grid g, Int bits, Int i) {
+    if (i >= 18) { return g; }
+    Bool b = bit_of(bits, i);
+    Int a = g.n - 11 + i % 3;
+    Int c = i / 3;
+    return vinfo(put(put(g, a, c, b), c, a, b), bits, i + 1);
+}
+
+Grid functions(Int v) {
+    Int n = 17 + 4 * v;
+    List(Int) z = zeros(n * n, 0, ListBuf());
+    Grid g0 = Grid {.n = n, .m = z, .f = z};
+    Grid g1 = timing(g0, 0);
+    Grid g2 = finder(finder(finder(g1, 3, 3, 0), n - 4, 3, 0), 3, n - 4, 0);
+    Grid g3 = alignments(g2, align_at(v), 0, 0);
+    // The format areas are reserved now and drawn for each mask.
+    return version_info(format(g3, 0), v);
+}
+
+// The data modules, in the standard's zigzag order: columns in pairs from
+// the right (skipping the timing column), up and down by turns.
+List(Int) zigzag(Grid g, Int right, Int vert, Int j, ListBuf(Int) acc) {
+    if (right < 1) { return acc.finish(); }
+    if (right == 6) { return zigzag(g, 5, 0, 0, acc); }
+    if (vert >= g.n) { return zigzag(g, right - 2, 0, 0, acc); }
+    if (j >= 2) { return zigzag(g, right, vert + 1, 0, acc); }
+    Int x = right - j;
+    Bool up = ((right + 1) & 2) == 0;
+    Int y = if (up) { g.n - 1 - vert } else { vert };
+    Int at = y * g.n + x;
+    return zigzag(g, right, vert, j + 1, if (g.f[at] == 0) { acc.push(at) } else { acc });
+}
+
+List(Int) place(List(Int) m, List(Int) order, List(Int) cw, Int i) {
+    if (i >= order.len() || i >= cw.len() * 8) { return m; }
+    Int bit = (cw[i >> 3] >> (7 - (i & 7))) & 1;
+    return place(m.with(order[i], bit), order, cw, i + 1);
+}
+
+Bool masked(Int mask, Int x, Int y) {
+    if (mask == 0) { return (x + y) % 2 == 0; }
+    if (mask == 1) { return y % 2 == 0; }
+    if (mask == 2) { return x % 3 == 0; }
+    if (mask == 3) { return (x + y) % 3 == 0; }
+    if (mask == 4) { return (x / 3 + y / 2) % 2 == 0; }
+    if (mask == 5) { return (x * y) % 2 + (x * y) % 3 == 0; }
+    if (mask == 6) { return ((x * y) % 2 + (x * y) % 3) % 2 == 0; }
+    return ((x + y) % 2 + (x * y) % 3) % 2 == 0;
+}
+
+List(Int) apply_mask(Grid g, Int mask, Int i, ListBuf(Int) acc) {
+    if (i >= g.n * g.n) { return acc.finish(); }
+    Int v = if (g.f[i] == 0 && masked(mask, i % g.n, i / g.n)) { 1 - g.m[i] } else { g.m[i] };
+    return apply_mask(g, mask, i + 1, acc.push(v));
+}
+
+Grid masked_grid(Grid g, Int mask) {
+    return format(Grid {.n = g.n, .m = apply_mask(g, mask, 0, ListBuf()), .f = g.f}, mask);
+}
+
+// ============================================================================
+// Penalty (the standard's four rules)
+// ============================================================================
+
+// The module at position i of line k (a row, or a column when `col`).
+Int at_line(List(Int) m, Int n, Bool col, Int k, Int i) { return if (col) { m[i * n + k] } else { m[k * n + i] }; }
+
+// Rule 1: runs of five or more of one color.
+Int runs(List(Int) m, Int n, Bool col, Int k, Int i, Int run, Int acc) {
+    if (k >= n) { return acc; }
+    if (i >= n) { return runs(m, n, col, k + 1, 1, 1, acc + run_cost(run)); }
+    Bool same = at_line(m, n, col, k, i) == at_line(m, n, col, k, i - 1);
+    return runs(m, n, col, k, i + 1, if (same) { run + 1 } else { 1 }, if (same) { acc } else { acc + run_cost(run) });
+}
+
+Int run_cost(Int run) { return if (run >= 5) { run - 2 } else { 0 }; }
+
+// Rule 2: 2x2 blocks of one color.
+Int blocks(List(Int) m, Int n, Int i, Int acc) {
+    if (i >= n * n) { return acc; }
+    Int x = i % n;
+    Int y = i / n;
+    Bool box = x + 1 < n && y + 1 < n && m[i] == m[i + 1] && m[i] == m[i + n] && m[i] == m[i + n + 1];
+    return blocks(m, n, i + 1, if (box) { acc + 3 } else { acc });
+}
+
+// Rule 3: 1:1:3:1:1 finder-like patterns with four light modules on a side.
+Int dark_at(List(Int) m, Int n, Bool col, Int k, Int i) { return if (i < 0 || i >= n) { 0 } else { at_line(m, n, col, k, i) }; }
+
+Bool light_run(List(Int) m, Int n, Bool col, Int k, Int from) {
+    return dark_at(m, n, col, k, from) == 0 && dark_at(m, n, col, k, from + 1) == 0 && dark_at(m, n, col, k, from + 2) == 0 && dark_at(m, n, col, k, from + 3) == 0;
+}
+
+Bool finder_like(List(Int) m, Int n, Bool col, Int k, Int i) {
+    Bool core = dark_at(m, n, col, k, i) == 1 && dark_at(m, n, col, k, i + 1) == 0 && dark_at(m, n, col, k, i + 2) == 1 && dark_at(m, n, col, k, i + 3) == 1
+        && dark_at(m, n, col, k, i + 4) == 1 && dark_at(m, n, col, k, i + 5) == 0 && dark_at(m, n, col, k, i + 6) == 1;
+    return core && (light_run(m, n, col, k, i - 4) || light_run(m, n, col, k, i + 7));
+}
+
+Int finders(List(Int) m, Int n, Bool col, Int k, Int i, Int acc) {
+    if (k >= n) { return acc; }
+    if (i + 7 > n) { return finders(m, n, col, k + 1, 0, acc); }
+    return finders(m, n, col, k, i + 1, if (finder_like(m, n, col, k, i)) { acc + 40 } else { acc });
+}
+
+Int darks(List(Int) m, Int i, Int acc) {
+    if (i >= m.len()) { return acc; }
+    return darks(m, i + 1, acc + m[i]);
+}
+
+Int penalty(Grid g) {
+    Int n = g.n;
+    Int total = n * n;
+    Int d = darks(g.m, 0, 0);
+    Int k = (iabs(d * 20 - total * 10) + total - 1) / total - 1;
+    return runs(g.m, n, false, 0, 1, 1, 0) + runs(g.m, n, true, 0, 1, 1, 0) + blocks(g.m, n, 0, 0)
+        + finders(g.m, n, false, 0, 0, 0) + finders(g.m, n, true, 0, 0, 0) + k * 10;
+}
+
+Grid best_mask(Grid g, Int mask, Grid best, Int score) {
+    if (mask >= 8) { return best; }
+    Grid t = masked_grid(g, mask);
+    Int p = penalty(t);
+    Bool better = mask == 0 || p < score;
+    return best_mask(g, mask + 1, if (better) { t } else { best }, if (better) { p } else { score });
+}
+
+// The modules of the QR code for `data`: its size and, row by row, 1 for
+// dark. Size 0 when the data is too long.
+pub type Qr = { Int n; List(Int) m; };
+
+pub Qr qr_encode(List(Int) data) {
+    Int v = version_for(data.len(), 1);
+    if (v == 0) { return Qr {.n = 0, .m = []}; }
+    List(Int) cw = with_ecc(data_codewords(data, v), v);
+    Grid g = functions(v);
+    List(Int) order = zigzag(g, g.n - 1, 0, 0, ListBuf());
+    Grid placed = Grid {.n = g.n, .m = place(g.m, order, cw, 0), .f = g.f};
+    Grid best = best_mask(placed, 0, placed, 0);
+    return Qr {.n = best.n, .m = best.m};
+}
+
+// ============================================================================
+// On a terminal
+// ============================================================================
+
+// Lines of half blocks (upper, lower, full), black on white, with a quiet
+// zone of four modules; empty when the data does not fit.
+pub List(Str) qr_lines(List(Int) data) {
+    Qr q = qr_encode(data);
+    if (q.n == 0) { return []; }
+    return term_rows(q, -4, []);
+}
+
+Int module(Qr q, Int x, Int y) { return if (x < 0 || y < 0 || x >= q.n || y >= q.n) { 0 } else { q.m[y * q.n + x] }; }
+
+List(Str) term_rows(Qr q, Int y, List(Str) acc) {
+    if (y >= q.n + 4) { return acc; }
+    Str esc = str_from_code(27);
+    return term_rows(q, y + 2, acc.concat([esc + "[30;107m" + term_row(q, y, -4, "") + esc + "[0m"]));
+}
+
+Str term_row(Qr q, Int y, Int x, Str acc) {
+    if (x >= q.n + 4) { return acc; }
+    Int top = module(q, x, y);
+    Int bottom = module(q, x, y + 1);
+    Str c = if (top == 1 && bottom == 1) { "█" } else { if (top == 1) { "▀" } else { if (bottom == 1) { "▄" } else { " " } } };
+    return term_row(q, y, x + 1, acc + c);
+}

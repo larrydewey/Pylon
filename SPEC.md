@@ -272,7 +272,19 @@ A host key is accepted only through one of:
    with, e.g.,
    `echo "pylon-hostkey/1 $(hostname -f) $(for k in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf $k | cut -d' ' -f2; done)" | qrencode -t ansiutf8`.
    Parsers: `core/oob.resid` (CLI) and `app/lib/backend/hostkey_qr.dart`
-   (the app's scanner, to come).
+   (the app).
+
+   **Sharing a pin.** A device where the host is already pinned shows its
+   pin as this payload, so another device pins it without going back to
+   the host's console: `pylon share [-p PORT] HOST` prints the payload
+   and the same as a QR code (byte mode, level M, `core/qr.resid`) on the
+   terminal, and the app shows it under the host's *Share pin*; the
+   app's pin page scans it with the camera (decoded on the device, ZXing)
+   or takes it pasted. This is the out-of-band value above: the receiving
+   device still connects and pins only a key the host presents to it,
+   and the payload names the host and port it is for. It is as good as
+   the sharing device's own pin, which is why only a pinned key, never
+   one merely seen, is shared.
 
 Plain trust-on-first-use is available per host only, never globally, and
 is marked on the host.
@@ -380,8 +392,24 @@ a P-256 vector); it has not yet been run against the live DNS from CI.
 User keys are Symbolon `ssh` items: threshold ECDSA P-256 keys (no single
 party holds the private key) or imported OpenSSH keys. Pylon learns only
 public keys, from the agent's identity list. OpenSSH user certificates
-issued to those keys are stored with the host entry and presented when
-present.
+issued to those keys (by a Symbolon CA, Symbolon SPEC 16.1, or any other)
+are listed by the agent beside their keys and offered first, as OpenSSH
+does: the request names the certificate's algorithm
+(`ecdsa-sha2-nistp256-cert-v01@openssh.com`, `rsa-sha2-512-cert-v01@openssh.com`
+for an RSA key, ...), the agent signs for the certificate's blob with
+the certified key, and Pylon checks that signature under the certified
+key before sending it. A certificate that is not a user certificate, is
+outside its validity window, or does not name the user is not offered
+(and is named if the login fails).
+
+When the host accepts none, the error says so with what was offered:
+each key as its `authorized_keys` line, each certificate with its key,
+principals, CA and expiry, what the server said it accepts besides keys,
+and the commands that fix it (7.7): `pylon authorize USER@HOST 'KEY'`
+for keys, `pylon authorize --ca USER@HOST 'CA'` for a certificate's CA.
+Each key stands on a line of its own (two spaces, then the line), and
+each command on a line beginning with two spaces and `pylon authorize`,
+so the app can offer them to copy.
 
 ### 7.2 Binding
 
@@ -515,6 +543,59 @@ Keystore-held MAC key.
 
 **Policy.** An organization's Symbolon policy can forbid tiers B-D for
 its hosts, or allow only tier B.
+
+### 7.7 Letting a key in
+
+A server accepts a key only if the account's `~/.ssh/authorized_keys`
+lists it, and hand-editing that file is the step that most often breaks
+access: a paste that replaces the other keys, a file saved with Windows
+line endings (sshd then reads no line of it), a missing final newline
+(the next key appended joins the last line), or modes that let others
+write to the home folder, `~/.ssh` or the file (with `StrictModes`,
+sshd's default, every key in it is then ignored).
+
+`pylon authorize [-p PORT] [-J ...] [--ca] USER@HOST [KEY-LINE...|-]`
+does it from a device that can already log in. It authenticates as any
+command does (host trust and agent unchanged), opens a session, runs
+`sh` and gives it a script on standard input (no quoting layer between
+them). Keys are given as `ALG BASE64 [COMMENT]`, as `.pub` files and
+`ssh-add -L` print them; with none, the agent's own keys are used.
+Before connecting, each line is checked: a known algorithm, base64 that
+holds a key of that algorithm (meeting section 5 unless it is a security
+key), no `authorized_keys` options in front; the comment is cut to
+letters, digits and `. _ @ : + = , / -`. Only checked values are put in
+the script, so none can end a quoted string in it. The script:
+
+1. creates `~/.ssh` and the file (umask 077) when missing;
+2. when the file holds a carriage return, keeps it as
+   `authorized_keys.pylon-backup` (mode 0600) and removes the carriage
+   returns; adds a missing final newline;
+3. for each key, outside comment lines: when its base64 is present (with
+   `--ca`, on a `cert-authority` line), reports it; otherwise appends it;
+4. removes group and other write permission from the home folder,
+   `~/.ssh` and the file where present, and warns when one belongs to
+   another user (only root can fix that) or carries an access control
+   list;
+5. warns when `sshd_config` names another `AuthorizedKeysFile` or sets
+   `PubkeyAuthentication no`.
+
+It never removes or reorders a key. Its report is read back and only
+its own kinds of line are shown, escaped: `added ALG SHA256:FP COMMENT`,
+`present ALG SHA256:FP`, `fixed WHAT`, `warning WHAT`, then `done`; the
+command fails unless the script ends with `done` and exit status 0.
+With `--app` the agent is reached through the app (7.3) and the report
+leaves as frames of type 1.
+
+With `--ca`, each line is a CA's key, installed as
+`cert-authority,principals="USER" ALG BASE64 COMMENT`: certificates that
+CA signs for USER are then accepted for this account, with no root
+access and no further change on the server (system-wide, root adds the
+CA to the file `TrustedUserCAKeys` names instead). USER must then be
+letters, digits and `. _ - @`.
+
+The app offers the same from the host's page (*Authorize a key*), and,
+when a login is refused, the refused key and the command to run on a
+device that already has access.
 
 ## 8. Delivering `pylond`
 

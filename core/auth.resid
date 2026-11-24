@@ -14,6 +14,7 @@ import "wire.resid";
 import "hostkey.resid";
 import "transport.resid";
 import "agent.resid";
+import "known.resid";
 
 pub Int msg_userauth_request() { return 50; }
 pub Int msg_userauth_failure() { return 51; }
@@ -51,44 +52,184 @@ List(Int) request_body(Conn c, Str user, Str alg, List(Int) blob, Bool signed) {
     return if (c.hostbound) { base.concat(sstring(c.host_blob)) } else { base };
 }
 
+// What a failed authentication tried, for the principal: the plain keys
+// offered (as authorized_keys lines), the certificates offered and their
+// CAs' keys, the certificates not offered (expired, not yet valid, not
+// user certificates), and the methods the server last said it accepts.
+type Tried = { List(Str) keys; List(Str) certs; List(Str) cas; List(Str) skipped; List(Str) methods; Bool seen; };
+
+// A key or certificate to offer: the blob the agent listed, the
+// algorithm the request names (a certificate's own, e.g.
+// ecdsa-sha2-nistp256-cert-v01@openssh.com), the key that signs, and how
+// it is described if every offer fails.
+type Offer = { List(Int) blob; Str alg; PubKey k; Bool cert; Str shown; Str ca; };
+
+type Offers = { List(Offer) certs; List(Offer) plain; List(Str) skipped; };
+
 @requires(network, declassify, clock(readonly))
-pub Authed authenticate(Conn c0, Int agent, Str user, List(Ident) ids) {
+pub Authed authenticate(Conn c0, Int agent, Str user, List(Ident) ids, Str host, Int port) {
     Conn c = request_service(c0, "ssh-userauth");
     if (!conn_ok(c)) { return auth_fail(c, c.err); }
     if (!agent_bind(agent, c.host_blob, c.sid, c.host_sig)) {
         return auth_fail(c, "the agent refused to bind to this session (session-bind@openssh.com); Symbolon's agent and OpenSSH 8.9+ support it");
     }
-    return try_keys(c, agent, user, ids, 0);
+    // Certificates first (as OpenSSH does): a host that trusts their CA
+    // takes them without any key of the principal's in authorized_keys.
+    Offers os = offers_of(c, ids, user, clock.now_sec(), 0, Offers {.certs = [], .plain = [], .skipped = []});
+    Tried t0 = Tried {.keys = [], .certs = [], .cas = [], .skipped = os.skipped, .methods = [], .seen = false};
+    Authed a = try_keys(c, agent, user, os.certs.concat(os.plain), 0, t0, host, port);
+    return a;
+}
+
+// The agent's identities as offers: valid user certificates, plain keys,
+// and why other certificates are left out.
+Offers offers_of(Conn c, List(Ident) ids, Str user, Int now, Int i, Offers acc) {
+    if (i >= ids.len()) { return acc; }
+    List(Int) blob = ids[i].blob;
+    GotText a = rd_text(rd(blob));
+    if (is_cert_alg(a.v)) {
+        Cert ct = cert_of_blob(blob);
+        Str what = if (ct.ok) { cert_text(ct) } else { "" };
+        Str why = if (!ct.ok) { "" } else { if (ct.ctype != 1) { "certificate " + what + ": a host certificate, not a user one" } else { if (now >= ct.before) { "certificate " + what + ": expired on " + cert_day(ct.before) + " (renew it in Symbolon)" } else { if (now < ct.after) { "certificate " + what + ": not valid until " + cert_day(ct.after) } else { if (ct.principals.len() > 0 && !ct.principals.contains(user)) { "certificate " + what + ": not for " + user } else { "" } } } } };
+        Bool usable = ct.ok && str_len(why) == 0;
+        Str alg = if (ct.ok && ct.key.kind == "rsa") { user_sig_alg(c, ct.key) + "-cert-v01@openssh.com" } else { a.v };
+        Offer o = Offer {.blob = blob, .alg = alg, .k = ct.key, .cert = true, .shown = "certificate " + what, .ca = if (ct.ok) { key_line(ct.ca) } else { "" }};
+        return offers_of(c, ids, user, now, i + 1, Offers {.certs = if (usable) { acc.certs.concat([o]) } else { acc.certs }, .plain = acc.plain, .skipped = if (str_len(why) > 0) { acc.skipped.concat([why]) } else { acc.skipped }});
+    }
+    Option(PubKey) ok = key_of_blob(blob);
+    PubKey k = ok else { no_key() };
+    if (k.kind == "") { return offers_of(c, ids, user, now, i + 1, acc); }
+    Str comment = safe_comment(ids[i].comment);
+    Offer o = Offer {.blob = blob, .alg = user_sig_alg(c, k), .k = k, .cert = false, .shown = key_line(blob) + (if (str_len(comment) > 0) { " " + comment } else { "" }), .ca = ""};
+    return offers_of(c, ids, user, now, i + 1, Offers {.certs = acc.certs, .plain = acc.plain.concat([o]), .skipped = acc.skipped});
+}
+
+// A certificate as the principal reads it: the certified key, the names
+// it is for, its CA and its expiry.
+Str cert_text(Cert ct) {
+    return "for key " + fingerprint(ct.key.blob) + " (user " + (if (ct.principals.len() > 0) { str_join(principals_shown(ct.principals, 0, []), ", ") } else { "any" }) + "; CA " + fingerprint(ct.ca) + "; " + (if (ct.before >= 4611686018427387904) { "never expires" } else { "valid until " + cert_day(ct.before) }) + ")";
+}
+
+List(Str) principals_shown(List(Str) ps, Int i, List(Str) acc) {
+    if (i >= ps.len() || i >= 8) { return if (ps.len() > 8) { acc.concat(["..."]) } else { acc }; }
+    return principals_shown(ps, i + 1, acc.concat([display_text(bytes_of(ps[i]))]));
+}
+
+Str cert_day(Int t) { return civil(t / 86400); }
+
+// A key's comment fit to stand in an authorized_keys line and inside
+// single quotes on a command line: letters, digits and . _ @ : + = , / -
+// kept, anything else dropped.
+pub Str safe_comment(Str c) { return safe_acc(bytes_of(c), 0, ""); }
+
+Str safe_acc(List(Int) b, Int i, Str acc) {
+    if (i >= b.len() || str_len(acc) >= 100) { return acc; }
+    Int x = b[i];
+    Bool keep = (x >= 48 && x <= 57) || (x >= 65 && x <= 90) || (x >= 97 && x <= 122) || x == 46 || x == 95 || x == 64 || x == 58 || x == 43 || x == 61 || x == 44 || x == 47 || x == 45;
+    return safe_acc(b, i + 1, if (keep) { acc + str_from_code(x) } else { acc });
 }
 
 @requires(network, declassify, clock(readonly))
-Authed try_keys(Conn c, Int agent, Str user, List(Ident) ids, Int i) {
-    if (i >= ids.len()) { return auth_fail(c, "the server accepted none of the agent's keys"); }
-    Option(PubKey) ok = key_of_blob(ids[i].blob);
-    PubKey k = ok else { no_key() };
-    if (k.kind == "") { return try_keys(c, agent, user, ids, i + 1); }
-    Str alg = user_sig_alg(c, k);
+Authed try_keys(Conn c, Int agent, Str user, List(Offer) os, Int i, Tried t, Str host, Int port) {
+    if (i >= os.len()) { return auth_fail(c, refused_help(user, host, port, t)); }
+    Offer o = os[i];
+    Tried t1 = Tried {.keys = if (o.cert) { t.keys } else { t.keys.concat([o.shown]) }, .certs = if (o.cert) { t.certs.concat([o.shown]) } else { t.certs },
+        .cas = if (o.cert && !t.cas.contains(o.ca)) { t.cas.concat([o.ca]) } else { t.cas }, .skipped = t.skipped, .methods = t.methods, .seen = t.seen};
+    Str sig_alg = plain_alg(o.alg);
     // Offer the key without a signature first.
-    Conn c1 = send_packet(c, request_body(c, user, alg, k.blob, false));
+    Conn c1 = send_packet(c, request_body(c, user, o.alg, o.blob, false));
     Pkt r = auth_reply(c1);
     if (!conn_ok(r.c)) { return auth_fail(r.c, r.c.err); }
     if (r.p[0] == msg_userauth_success()) { return Authed {.c = r.c, .ok = true, .why = ""}; }
-    if (r.p[0] != msg_userauth_pk_ok()) { return try_keys(r.c, agent, user, ids, i + 1); }
-    List(Int) body = request_body(r.c, user, alg, k.blob, true);
+    if (r.p[0] != msg_userauth_pk_ok()) { return try_keys(r.c, agent, user, os, i + 1, with_methods(t1, r.p), host, port); }
+    List(Int) body = request_body(r.c, user, o.alg, o.blob, true);
     List(Int) to_sign = sstring(r.c.sid).concat(body);
-    List(Int) sig = agent_sign(agent, k.blob, to_sign, agent_flags(alg));
+    // A certificate is signed for by its key: the agent finds the key by
+    // the certificate's blob, as OpenSSH's agent does.
+    List(Int) sig = agent_sign(agent, o.blob, to_sign, agent_flags(sig_alg));
     // The consent sheet may have been open for minutes.
     _ = rearm(r.c, 30000);
     if (sig.len() == 0) { return auth_fail(r.c, "the agent did not sign (refused on the consent sheet, or locked)"); }
     // The agent's signature is checked before it is sent: a wrong one
     // would only fail at the server, but checking here catches an agent
     // that signs with another key.
-    if (!verify_blob(k, alg, to_sign, sig)) { return auth_fail(r.c, "the agent's signature does not verify"); }
+    if (!verify_blob(o.k, sig_alg, to_sign, sig)) { return auth_fail(r.c, "the agent's signature does not verify"); }
     Conn c2 = send_packet(r.c, body.concat(sstring(sig)));
     Pkt r2 = auth_reply(c2);
     if (!conn_ok(r2.c)) { return auth_fail(r2.c, r2.c.err); }
     if (r2.p[0] == msg_userauth_success()) { return Authed {.c = r2.c, .ok = true, .why = ""}; }
-    return try_keys(r2.c, agent, user, ids, i + 1);
+    return try_keys(r2.c, agent, user, os, i + 1, with_methods(t1, r2.p), host, port);
+}
+
+// The methods a USERAUTH_FAILURE says may continue (RFC 4252 5.1).
+Tried with_methods(Tried t, List(Int) p) {
+    if (p.len() == 0 || p[0] != msg_userauth_failure()) { return t; }
+    GotNames ns = rd_names(rd_at(p, 1));
+    if (!rd_ok(ns.r)) { return t; }
+    return Tried {.keys = t.keys, .certs = t.certs, .cas = t.cas, .skipped = t.skipped, .methods = ns.v, .seen = true};
+}
+
+// USER@HOST, with -p PORT before it when the port is not 22, as the
+// commands below take it (an IPv6 address in brackets).
+pub Str target_text(Str user, Str host, Int port) {
+    Str h = if (str_contains(host, ":")) { "[" + host + "]" } else { host };
+    return (if (port != 22) { "-p " + f"{port}" + " " } else { "" }) + user + "@" + h;
+}
+
+// Why the server refused, what was offered, and how to let a key in.
+// Each offered key is on a line of its own, two spaces and then exactly
+// an authorized_keys line; the commands to run are lines that start with
+// two spaces and "pylon authorize" (the app picks both out).
+Str refused_help(Str user, Str host, Int port, Tried t) {
+    Str target = target_text(user, host, port);
+    Str head = user + "@" + host + " accepted none of the agent's keys.";
+    Str offered = if (t.keys.len() + t.certs.len() > 0) { "\nOffered:" + indented(t.keys, 0, "") + indented(t.certs, 0, "") } else { "\nNothing was offered: the agent holds no key Pylon can use." };
+    Str skipped = if (t.skipped.len() > 0) { "\nNot offered:" + indented(t.skipped, 0, "") } else { "" };
+    return head + offered + skipped + methods_note(t) + keys_help(target, host, t.keys) + certs_help(target, user, t.cas);
+}
+
+Str indented(List(Str) ls, Int i, Str acc) {
+    if (i >= ls.len()) { return acc; }
+    return indented(ls, i + 1, acc + "\n  " + ls[i]);
+}
+
+List(Str) without(List(Str) xs, Str x, Int i, List(Str) acc) {
+    if (i >= xs.len()) { return acc; }
+    return without(xs, x, i + 1, if (xs[i] == x) { acc } else { acc.concat([display_text(bytes_of(xs[i]))]) });
+}
+
+// What the server said it accepts, when that tells the principal
+// something: keys switched off, or other methods (Pylon uses only keys).
+Str methods_note(Tried t) {
+    if (!t.seen) { return ""; }
+    List(Str) others = without(t.methods, "publickey", 0, []);
+    if (!t.methods.contains("publickey")) {
+        return "\nThe server no longer takes keys" + (if (others.len() > 0) { " (it accepts: " + str_join(others, ", ") + ")" } else { "" }) + ": too many were tried (MaxAuthTries), or its sshd has PubkeyAuthentication off.";
+    }
+    return if (others.len() > 0) { "\nThe server also accepts " + str_join(others, ", ") + "; Pylon logs in with keys only." } else { "" };
+}
+
+Str keys_help(Str target, Str host, List(Str) keys) {
+    if (keys.len() == 0) { return ""; }
+    return "\nTo let " + (if (keys.len() == 1) { "this key" } else { "these keys" }) + " in, run this on a device that can already log in to " + host + ":"
+        + "\n  pylon authorize " + target + quoted(keys, 0, "")
+        + "\nOr append the key line to ~/.ssh/authorized_keys on " + host + " yourself, then run"
+        + "\n  chmod go-w ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+        + "\nsshd ignores every key in the file when your home folder, ~/.ssh or the file can be written"
+        + "\nby others, or when the file was saved with Windows line endings; pylon authorize fixes both.";
+}
+
+Str quoted(List(Str) ls, Int i, Str acc) {
+    if (i >= ls.len()) { return acc; }
+    return quoted(ls, i + 1, acc + " '" + ls[i] + "'");
+}
+
+Str certs_help(Str target, Str user, List(Str) cas) {
+    if (cas.len() == 0) { return ""; }
+    return "\nA certificate is accepted only where the server trusts its CA for " + user + ". To trust "
+        + (if (cas.len() == 1) { "it" } else { "them" }) + " for " + user + " alone, from a device that can already log in:"
+        + "\n  pylon authorize --ca " + target + quoted(cas, 0, "")
+        + "\nor, for every user, add the CA as root to the file sshd_config's TrustedUserCAKeys names.";
 }
 
 // The next authentication reply; banners are shown (escaped) on stderr.

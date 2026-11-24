@@ -26,6 +26,8 @@ import "../core/hostkey.resid";
 import "../core/transport.resid";
 import "../core/agent.resid";
 import "../core/auth.resid";
+import "../core/authorize.resid";
+import "../core/qr.resid";
 import "../core/session.resid";
 import "../core/known.resid";
 import "../core/forward.resid";
@@ -53,7 +55,7 @@ Opts parse(Int i, Opts o) {
     }
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
-    if (a == "--attach" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app" || a == "--resume") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--attach" || a == "--ca" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app" || a == "--resume") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond-unverified") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["pylond-unverified"]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond-roots" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["roots=" + args.get(i + 1)]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
@@ -86,6 +88,11 @@ Int usage() {
     eprintln("                       for a local build: --pylond-roots ROOTS or --pylond-unverified");
     eprintln("       pylon pylond-check DIR [PROOF]          check DIR's release (PROOF: a newer log proof)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
+    eprintln("       pylon authorize [-p PORT] [--ca] USER@HOST [KEY-LINE...|-]");
+    eprintln("                       from a device that can log in: add keys to HOST's authorized_keys");
+    eprintln("                       (only appending), and fix what makes sshd ignore them; no KEY-LINE:");
+    eprintln("                       the agent's keys; --ca: trust certificates a CA signs for USER");
+    eprintln("       pylon share [-p PORT] HOST              HOST's pin as a QR code, for another device to scan");
     eprintln("       pylon pin [-p PORT] HOST FINGERPRINT   (replaces any key pinned for HOST)");
     eprintln("                       FINGERPRINT: SHA256:..., ssh-keygen -lf lines, or - to paste them");
     eprintln("       pylon pin [-p PORT] 'pylon-hostkey/1 HOST[:PORT] SHA256:...'   a scanned QR payload");
@@ -239,7 +246,7 @@ Authed login(Str user, Str host, Opts o, Int via) {
     Bool by_dns = pinned.len() == 0 && sshfp_match(dv, plain) == "match";
     _ = if (by_dns) { pin(token, plain, "sshfp") && history("sshfp", token, fingerprint(plain), "DNSSEC-validated in " + name_text(dv.zone)) } else { true };
     _ = if (by_dns) { eprintln_true("pylon: " + host + " was not pinned; its key " + fingerprint(plain) + " matches its DNSSEC-validated SSHFP record (zone " + name_text(dv.zone) + "), so Pylon pinned it.") } else { true };
-    Authed a = authenticate(h.c, agent, user, ids);
+    Authed a = authenticate(h.c, agent, user, ids, host, o.port);
     _ = resid_unix_close(agent);
     if (!a.ok) { _ = disconnect(a.c, "authentication failed"); return a; }
     // Session traffic may idle for a long time: no read deadline now.
@@ -269,6 +276,111 @@ Str pin_details(List(Pin) ps, Int i, Str acc) {
     Str when = if (str_len(ps[i].when) > 0) { " on " + ps[i].when } else { "" };
     Str by = if (str_len(ps[i].by) > 0) { " from " + ps[i].by } else { "" };
     return pin_details(ps, i + 1, acc + "\nPinned: " + fingerprint(ps[i].blob) + when + by);
+}
+
+// pylon authorize [-p PORT] [--ca] USER@HOST [KEY-LINE...|-]: log in
+// with the agent's keys and have HOST add the keys given (or, with none,
+// the agent's own) to the account's authorized_keys, appending only, and
+// repair what makes sshd ignore that file (core/authorize.resid). With
+// --ca the keys are CAs whose certificates for USER are accepted. With
+// --app (the app runs it) the report goes out as frames of type 1.
+@requires(network, filesystem, environment, declassify, clock)
+Int cmd_authorize(Opts o, Int via) {
+    if (o.rest.len() < 1) { return usage(); }
+    Bool app = has_flag(o.pflags, "app");
+    Bool ca = has_flag(o.pflags, "ca");
+    List(Str) uh = str_split(o.rest[0], "@");
+    HostRest hr = split_host(if (uh.len() == 2) { uh[1] } else { "" });
+    if (uh.len() != 2 || str_len(uh[0]) == 0 || str_len(hr.host) == 0 || str_len(hr.rest) > 0) { eprintln("pylon: give the user as USER@HOST (an IPv6 address may be in brackets)"); return 2; }
+    Str user = uh[0];
+    if (ca && !principal_ok(user)) { eprintln("pylon: --ca needs a user name of letters, digits and . _ - @"); return 2; }
+    List(Str) given = if (o.rest.len() == 2 && o.rest[1] == "-") { str_split(text_of(read_stdin(65536, [])), "\n") } else { o.rest[1..o.rest.len()] };
+    List(KeyLine) named = key_lines(given, 0, []);
+    KeyLine bad = first_bad(named, 0);
+    if (str_len(bad.err) > 0) { eprintln("pylon: " + bad.err); return 2; }
+    if (ca && named.len() == 0) { eprintln("pylon: --ca needs the CA's public key line"); return 2; }
+    List(KeyLine) ks = if (named.len() > 0) { named } else { agent_lines() };
+    if (ks.len() == 0) { eprintln("pylon: no key to add (the agent holds none Pylon can read; give KEY-LINEs)"); return 1; }
+    Authed a = login(user, hr.host, o, via);
+    if (!a.ok) { eprintln("pylon: " + a.why); return 1; }
+    Chan ch = open_session(a.c);
+    if (str_len(ch.err) > 0) { eprintln("pylon: " + ch.err); return 1; }
+    // The script goes to sh on standard input: no quoting layer between.
+    Chan run = send_eof(send_data(capturing(exec(ch, "sh")), bytes_of(authorize_script(ks, ca, user))));
+    Chan done = pump(run);
+    if (str_len(done.err) > 0) { eprintln("pylon: " + done.err); return 1; }
+    _ = disconnect(done.c, "done");
+    List(Str) rep = report_of(kept(done));
+    _ = say_all(rep, 0, app);
+    if (done.status != 0 || !rep.contains("done")) {
+        eprintln("pylon: " + hr.host + "'s shell did not finish adding the keys" + (if (done.status > 0) { " (exit status " + f"{done.status}" + ")" } else { "" }) + "; what it said is above");
+        return 1;
+    }
+    return 0;
+}
+
+Str text_of(List(Int) b) { return display_text(b); }
+
+List(KeyLine) key_lines(List(Str) ls, Int i, List(KeyLine) acc) {
+    if (i >= ls.len()) { return acc; }
+    Bool blank = str_len(str_trim(ls[i])) == 0 || str_starts_with(str_trim(ls[i]), "#");
+    return key_lines(ls, i + 1, if (blank) { acc } else { acc.concat([key_line_of(ls[i])]) });
+}
+
+KeyLine first_bad(List(KeyLine) ks, Int i) {
+    if (i >= ks.len()) { return KeyLine {.alg = "", .blob = [], .comment = "", .err = ""}; }
+    if (str_len(ks[i].err) > 0) { return ks[i]; }
+    return first_bad(ks, i + 1);
+}
+
+// The agent's plain keys (not its certificates), as key lines.
+@requires(network, environment)
+List(KeyLine) agent_lines() {
+    Int agent = agent_connect();
+    if (agent == -1) { return []; }
+    List(Ident) ids = agent_ids(agent);
+    _ = if (agent >= 0) { resid_unix_close(agent) } else { true };
+    return idents_as_lines(ids, 0, []);
+}
+
+List(KeyLine) idents_as_lines(List(Ident) ids, Int i, List(KeyLine) acc) {
+    if (i >= ids.len()) { return acc; }
+    GotText a = rd_text(rd(ids[i].blob));
+    KeyLine k = if (is_cert_alg(a.v)) { KeyLine {.alg = "", .blob = [], .comment = "", .err = "certificate"} } else { key_line_of(key_line(ids[i].blob) + " " + ids[i].comment) };
+    return idents_as_lines(ids, i + 1, if (str_len(k.err) == 0) { acc.concat([k]) } else { acc });
+}
+
+Bool say_all(List(Str) ls, Int i, Bool app) {
+    if (i >= ls.len()) { return true; }
+    _ = if (app) { print_bytes(app_frame(1, bytes_of(ls[i] + "\n"))) } else { println(ls[i]) };
+    return say_all(ls, i + 1, app);
+}
+
+// pylon share [-p PORT] HOST: the payload of SPEC 6.1.4 for HOST's pinned
+// keys, and the same as a QR code another device scans to pin HOST (it
+// still pins only a key the host presents to it).
+@requires(filesystem(readonly), environment)
+Int cmd_share(Opts o) {
+    if (o.rest.len() != 1) { return usage(); }
+    Str host = split_host(o.rest[0]).host;
+    List(List(Int)) ps = pinned_for(host_token(host, o.port));
+    if (ps.len() == 0) { eprintln("pylon: " + host + (if (o.port != 22) { " port " + f"{o.port}" } else { "" }) + " has no pinned key here (pylon pins lists them)"); return 1; }
+    Str payload = payload_for(host, o.port, fps_of(ps, 0, []));
+    println(payload);
+    _ = print_raw(qr_lines(bytes_of(payload)), 0);
+    return 0;
+}
+
+// Lines Pylon made itself (the QR code's colors and blocks), unescaped.
+Bool print_raw(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    println(ls[i]);
+    return print_raw(ls, i + 1);
+}
+
+List(Str) fps_of(List(List(Int)) bs, Int i, List(Str) acc) {
+    if (i >= bs.len() || acc.len() >= oob_max()) { return acc; }
+    return fps_of(bs, i + 1, acc.concat([fingerprint(bs[i])]));
 }
 
 // pylon ca [PATTERN 'ALG BASE64']: trust a host CA for names under
@@ -592,6 +704,7 @@ Int dispatch(Str verb, Opts o, Int via) {
     if (verb == "get") { return cmd_get(o, via); }
     if (verb == "put") { return cmd_put(o, via); }
     if (verb == "sftp") { return cmd_sftp(o, via); }
+    if (verb == "authorize") { return cmd_authorize(o, via); }
     return cmd_run(o, via);
 }
 
@@ -639,7 +752,7 @@ Int via_jump(Str verb, Opts o) {
 @requires(args, network, filesystem, environment, declassify, terminal, clock)
 Int main() {
     Str verb = if (args.count() > 1) { args.get(1) } else { "" };
-    Bool sub = verb == "pylond-check" || verb == "pin" || verb == "get" || verb == "put" || verb == "sftp" || verb == "history" || verb == "ca" || verb == "pins" || verb == "sshfp";
+    Bool sub = verb == "pylond-check" || verb == "pin" || verb == "authorize" || verb == "share" || verb == "get" || verb == "put" || verb == "sftp" || verb == "history" || verb == "ca" || verb == "pins" || verb == "sshfp";
     Opts o = parse(if (sub) { 2 } else { 1 }, Opts {.port = 22, .no_strict = false, .no_obfuscate = false, .no_cmd = false, .force = false, .jump = "", .pylond = "", .pflags = [], .fwds = [], .rest = [], .err = ""});
     if (str_len(o.err) > 0) { eprintln("pylon: " + o.err); return usage(); }
     if (verb == "history") { return cmd_history(o); }
@@ -647,6 +760,7 @@ Int main() {
     if (verb == "pylond-check") { return cmd_pylond_check(o); }
     if (verb == "pins") { _ = print_lines(pin_lines(), 0); return 0; }
     if (verb == "sshfp") { return cmd_sshfp(o); }
+    if (verb == "share") { return cmd_share(o); }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
 }

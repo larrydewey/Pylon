@@ -38,7 +38,8 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Key exchange | `mlkem768x25519-sha256` (post-quantum hybrid, ML-KEM-768 from Resid) first, then `curve25519-sha256`; strict kex and ext-info |
 | Host keys | `ssh-ed25519`, `ecdsa-sha2-nistp256/384`, `rsa-sha2-512/256` (RSA ≥ 2048) |
 | Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` (AES-GCM first on CPUs with AES and carry-less multiply instructions, where it is several times faster) |
-| Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound |
+| Authentication | agent keys over `SSH_AUTH_SOCK`, session-bound, host-bound; OpenSSH user certificates the agent holds (offered first; expired ones and ones for another user are left out and named). A refused login names every key offered and the exact `pylon authorize` command that lets it in |
+| Letting keys in | `pylon authorize [--ca] USER@HOST [KEY-LINE...]`, from a device that can already log in: appends keys (the agent's, or those given) to the account's `~/.ssh/authorized_keys` only if missing, never removes or rewrites one, and repairs what makes sshd ignore the file (Windows line endings, a missing final newline, modes others can write; ownership it cannot fix is reported). `--ca` trusts a CA's user certificates for USER (`cert-authority,principals="USER"`) |
 | Sessions | exec (stdout, escaped stderr, exit status) and interactive shells on a pty (resize, paste); flow control both ways; rekeying started by either side (Pylon starts one after 1 GiB, an hour or 2^31 packets) |
 | Keystroke timing | obfuscated by default: 20 ms ticks, one-size chaff (PING or IGNORE), checked on the wire; `--no-obfuscate-keystrokes` opts out |
 | Port forwarding | `-N` with `-L [127.0.0.1:]PORT:HOST:HOSTPORT`, `-D [127.0.0.1:]PORT` (SOCKS5, host names validated), `-R [localhost:]RPORT:HOST:HOSTPORT` (server binds loopback; only requested ports, each to its own destination); loopback binds only |
@@ -46,7 +47,7 @@ Phase 0: the SSH transport core and the `pylon` command-line client.
 | Jump hosts | `-J USER@JUMP[:PORT]` on any command: the jump host is verified under its own pins, the target under its own, end to end through a direct-tcpip channel; no agent forwarding |
 | Pylon protocol (experimental) | `--pylond DIR USER@HOST` (a terminal) or `--pylond DIR -N -L/-D/-R ...`: pushes the host's `pylond` build from DIR over SSH (hash-addressed, 0500 in a 0700 `~/.cache/pylon`), bootstraps a post-quantum UDP session through the SSH channel (to the address SSH reached: a host name, IPv4 or IPv6), closes SSH; terminals keep running in a per-user session daemon (`--sessions`, `--attach`, `--ephemeral`), roam across address changes, rekey every 2 minutes; packets padded to 64 bytes; silent to unauthenticated datagrams, and under load a cookie (`mac2`) before any asymmetric work (SPEC 9.7) |
 | `pylond` releases | pushed only as a release signed by k of n pinned Ed25519 release keys, in an RFC 9162 transparency log (inclusion proof under a tree head signed by the log key, consistent with the newest head seen), with a release counter that never goes back; verified offline from the files shipped beside `pylond`, before anything reaches the host; `pylon pylond-check DIR [PROOF]`; `tools/release` makes keys, manifests, signatures, the log and proofs; code images reproducible (SPEC 8.2.1). Three release keys are pinned (any two sign) and one log key; until a release signed by them is published, only `--pylond-roots ROOTS` or `--pylond-unverified` (developer options, announced) push a `pylond` |
-| Host trust | pinned keys (`pylon pin HOST FINGERPRINT`, where FINGERPRINT is `SHA256:...`, `ssh-keygen -lf` output as arguments or pasted with `-`, or the QR payload `pylon-hostkey/1 HOST[:PORT] SHA256:...` of SPEC 6.1.4; re-pinning replaces the old key), host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked), or SSHFP records validated by Pylon's own DNSSEC validator from the IANA root anchors (RSA/SHA-256, ECDSA P-256/P-384, Ed25519; NSEC and NSEC3 denial; a secure match pins the key, anything insecure, bogus or indeterminate never does and is shown; `pylon sshfp HOST`; SPEC 6.4); a changed key names the old pin; `pylon history [HOST]` |
+| Host trust | pinned keys (`pylon pin HOST FINGERPRINT`, where FINGERPRINT is `SHA256:...`, `ssh-keygen -lf` output as arguments or pasted with `-`, or the QR payload `pylon-hostkey/1 HOST[:PORT] SHA256:...` of SPEC 6.1.4; re-pinning replaces the old key), host certificates from a CA you trust for the name (`pylon ca PATTERN 'ALG BASE64'`, PATTERN a host, `*.domain` or `*`; host type, exact principal, validity window and no critical options checked), or SSHFP records validated by Pylon's own DNSSEC validator from the IANA root anchors (RSA/SHA-256, ECDSA P-256/P-384, Ed25519; NSEC and NSEC3 denial; a secure match pins the key, anything insecure, bogus or indeterminate never does and is shown; `pylon sshfp HOST`; SPEC 6.4); a changed key names the old pin; `pylon history [HOST]`; `pylon share HOST` shows a host's pin as that QR payload (text and a QR code on the terminal) for another device to scan |
 | Key material | `Secret(UInt(8))` throughout; K handled in constant time, including its mpint encoding (SPEC A, I4) |
 | Local shell | `pylon-local` (SPEC 13): a shell on the device that cannot reach Pylon's files, the agent, Pylon's processes or the network. Linux: an empty environment and new user, mount, pid and network namespaces with a root of its own (system directories read-only, its own home at `~/.local/share/pylon-local/home`); Android: an `isolatedProcess` service (its own UID, no permissions, no storage), not yet verified on a device. No SSH from it yet |
 | Linux desktop | the app as tabs and splits (SPEC 15): a session per pane, each resized to its pane, Ctrl+Shift shortcuts never sent to the host, closing a pane ends its session. `flutter build linux` needs GTK 3 development files |
@@ -90,6 +91,29 @@ build/pylon pin example.org SHA256:...
 eval "$(symbolon ssh-agent ~/.symbolon &)"   # or any session-bind capable agent
 build/pylon alice@example.org uptime
 ```
+
+### Getting access to a server
+
+Two things, once per server:
+
+1. **Pin the server's key**, so Pylon knows it is talking to the real
+   machine. Pylon never trusts a key the first time it sees it. Get the
+   fingerprint somewhere the network can't touch: the server's console
+   (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), its provider's
+   web console, or another of your devices where the server is already
+   pinned (`pylon share HOST` there shows a QR code; the app shows one
+   under the host's *Share pin* and scans it on the *Pin* page). Then
+   `pylon pin HOST FINGERPRINT-OR-PAYLOAD`. The key is pinned only if
+   the server presents a matching one.
+2. **Let your key in.** The server must list your public key in
+   `~/.ssh/authorized_keys`. From a device that can already log in, run
+   `pylon authorize USER@HOST 'KEY-LINE'` (a refused login prints this
+   command with your key filled in). It appends the key and fixes what
+   makes sshd ignore the file. Symbolon's keys are the same on every
+   device of your quorum, so once one device is authorized, all are.
+   With a Symbolon CA, `pylon authorize --ca USER@HOST 'CA-LINE'` once
+   per server instead: Symbolon's certificates are then accepted, and
+   new keys need no server changes.
 
 Options: `-p PORT`, `--allow-no-strict` (exception for a target server
 without the Terrapin fix, shown as a warning; never applied to a `-J` jump host), `--no-obfuscate-keystrokes`, `-N -L

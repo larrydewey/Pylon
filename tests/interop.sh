@@ -41,7 +41,7 @@ Port $PORT
 ListenAddress 127.0.0.1
 $([ "$HAVE6" = 1 ] && echo "ListenAddress ::1")
 PidFile $WORK/sshd.pid
-AuthorizedKeysFile $WORK/authorized_keys
+AuthorizedKeysFile ${AKF:-$WORK/authorized_keys}
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
@@ -832,6 +832,78 @@ kill $PQ 2>/dev/null; wait $PQ 2>/dev/null
 else
     echo "skip pq: this Python's cryptography has no ML-KEM"
 fi
+
+# --- letting keys in: pylon authorize, user certificates, pin sharing --------
+# The account's authorized_keys is home/.ssh/authorized_keys here (sshd's
+# HOME for the session points at it), set up the way hand edits break it:
+# Windows line endings, no final newline, writable by everyone.
+mkdir -p home/.ssh
+ssh-keygen -q -t ed25519 -N '' -C newkey -f user_new
+ssh-keygen -q -t ed25519 -N '' -C userca -f user_ca
+ssh-keygen -q -t ecdsa -N '' -C certkey -f user_cert
+ssh-keygen -q -s user_ca -I t1 -n "$USER_NAME" -V -5m:+1h user_cert.pub
+printf '# kept\r\n%s' "$(cat user_ed25519.pub)" > home/.ssh/authorized_keys
+chmod 666 home/.ssh/authorized_keys; chmod 777 home/.ssh
+AKF="$WORK/home/.ssh/authorized_keys" start_sshd "HostKey $WORK/host_ed25519" "SetEnv HOME=$WORK/home"
+ssh-add -D -q; ssh-add -q user_new
+check "authorize: a refused key is named with the command that lets it in" 1 "pylon authorize -p $PORT $USER_NAME@127.0.0.1 '$(cut -d' ' -f1,2 user_new.pub) newkey'" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+ssh-add -q user_ed25519
+check "authorize: adds the agent's other key" 0 "added ssh-ed25519 $(fp user_new.pub) newkey" \
+    "$PYLON" authorize -p $PORT "$USER_NAME@127.0.0.1"
+check "authorize: Windows line endings are gone, the old file kept" 0 "" \
+    bash -c "! grep -q \$'\r' home/.ssh/authorized_keys && grep -q \$'\r' home/.ssh/authorized_keys.pylon-backup"
+check "authorize: nothing was removed" 0 "" \
+    bash -c "grep -qx '# kept' home/.ssh/authorized_keys && grep -qF '$(cut -d' ' -f2 user_ed25519.pub)' home/.ssh/authorized_keys"
+check "authorize: no one else can write ~/.ssh or the file" 0 "" \
+    bash -c 'test "$(stat -c %a home/.ssh)" = 755 && test "$(stat -c %a home/.ssh/authorized_keys)" = 644'
+check "authorize: a second run changes nothing" 0 "present ssh-ed25519 $(fp user_new.pub)" \
+    "$PYLON" authorize -p $PORT "$USER_NAME@127.0.0.1" "$(cat user_new.pub)"
+check "authorize: options before a key are refused" 2 "without authorized_keys options" \
+    "$PYLON" authorize -p $PORT "$USER_NAME@127.0.0.1" "from=\"10.0.0.1\" $(cat user_new.pub)"
+ssh-add -D -q; ssh-add -q user_new
+check "authorize: the added key logs in" 0 "via-new-key" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo via-new-key"
+ssh-add -D -q; ssh-add -q user_cert
+check "user certificate: refused while the host does not trust its CA" 1 "pylon authorize --ca -p $PORT $USER_NAME@127.0.0.1 '$(cut -d' ' -f1,2 user_ca.pub)'" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+ssh-add -q user_new
+check "user certificate: authorize --ca trusts the CA for this user" 0 "added CA ssh-ed25519 $(fp user_ca.pub)" \
+    "$PYLON" authorize --ca -p $PORT "$USER_NAME@127.0.0.1" "$(cat user_ca.pub)"
+ssh-add -d -q user_new.pub
+check "user certificate: logs in" 0 "via-user-cert" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" "echo via-user-cert"
+check "user certificate: sshd accepted the certificate" 0 "" \
+    grep -q "Accepted publickey for $USER_NAME .* ECDSA-CERT" sshd.log
+ssh-keygen -q -s user_ca -I t2 -n someone-else -V -5m:+1h user_cert.pub
+ssh-add -D -q; ssh-add -q user_cert
+check "user certificate: one for another user is not offered" 1 "not for $USER_NAME" \
+    "$PYLON" -p $PORT "$USER_NAME@127.0.0.1" true
+check "share: the pin as a payload" 0 "pylon-hostkey/1 127.0.0.1:$PORT $(fp host_ed25519.pub)" \
+    "$PYLON" share -p $PORT 127.0.0.1
+check "share: the payload pins the host on another device" 0 "pinned" \
+    env PYLON_HOME="$WORK/other-device" "$PYLON" pin -p $PORT "$("$PYLON" share -p $PORT 127.0.0.1 | head -1)"
+if command -v zbarimg > /dev/null; then
+    "$PYLON" share -p $PORT 127.0.0.1 > share.txt
+    python3 - share.txt share.pbm <<'PY'
+import re, sys
+rows = []
+for l in open(sys.argv[1], encoding='utf-8'):
+    l = re.sub(r'\x1b\[[0-9;]*m', '', l.rstrip('\n'))
+    if not l or l.startswith('pylon-hostkey'): continue
+    rows += [[1 if c in '█▀' else 0 for c in l], [1 if c in '█▄' else 0 for c in l]]
+w, s = max(len(r) for r in rows), 6
+with open(sys.argv[2], 'w') as o:
+    o.write(f"P1\n{w * s} {len(rows) * s}\n")
+    for r in rows:
+        line = ' '.join(str(v) for v in r for _ in range(s))
+        for _ in range(s): o.write(line + '\n')
+PY
+    check "share: the QR code reads back as the payload" 0 "" \
+        bash -c 'test "$(zbarimg -q --raw share.pbm)" = "$(head -1 share.txt)"'
+fi
+ssh-add -D -q; ssh-add -q user_ed25519
+start_sshd "HostKey $WORK/host_ed25519"
 
 # --- hostile servers (refused before any key exchange completes) -------------
 hostile() {   # scenario expected-substring

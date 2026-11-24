@@ -1,0 +1,143 @@
+// Letting a key in (SPEC 7.7): `pylon authorize` logs in from a device
+// that already can, and has the host's own shell add keys to the
+// account's ~/.ssh/authorized_keys. Hand-editing that file is where
+// access most often breaks: a key pasted over the others, Windows line
+// endings that spoil every line, a missing final newline that joins two
+// keys, or modes that let others write (sshd's StrictModes then ignores
+// every key in it). The script below only appends, and repairs exactly
+// those, saying what it did.
+//
+// Nothing the host sends is trusted: the script's report is read back
+// and only its known lines are shown, escaped.
+
+import "crypto.resid";
+import "wire.resid";
+import "hostkey.resid";
+import "auth.resid";
+
+// A public key as given on the command line: its algorithm, blob and
+// comment (made safe), or why it is refused.
+pub type KeyLine = { Str alg; List(Int) blob; Str comment; Str err; };
+
+KeyLine bad_line(Str why) { return KeyLine {.alg = "", .blob = [], .comment = "", .err = why}; }
+
+Bool alg_known(Str a) {
+    return a == "ssh-ed25519" || a == "ecdsa-sha2-nistp256" || a == "ecdsa-sha2-nistp384" || a == "ecdsa-sha2-nistp521" || a == "ssh-rsa"
+        || a == "sk-ssh-ed25519@openssh.com" || a == "sk-ecdsa-sha2-nistp256@openssh.com";
+}
+
+Bool b64_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int x = b[i];
+    Bool ok = (x >= 48 && x <= 57) || (x >= 65 && x <= 90) || (x >= 97 && x <= 122) || x == 43 || x == 47 || x == 61;
+    return ok && b64_chars(b, i + 1);
+}
+
+// "ALG BASE64 [COMMENT...]", exactly as a .pub file or `ssh-add -L`
+// prints it. Options in front (from=, command=, ...) are refused: the
+// key alone is installed. Security keys (sk-*) are taken as they are;
+// any other key must parse and meet the profile (SPEC 5: RSA of 2048
+// bits or more).
+pub KeyLine key_line_of(Str text) {
+    List(Str) ws = words(str_trim(text));
+    if (ws.len() < 2) { return bad_line("not a public key line (ALG BASE64 [COMMENT]): " + display_text(bytes_of(text))); }
+    if (!alg_known(ws[0])) { return bad_line("not a public key line: it starts with " + display_text(bytes_of(ws[0])) + (if (str_contains(ws[0], "=") || str_contains(ws[0], ",")) { " (give the key without authorized_keys options)" } else { "" })); }
+    if (str_len(ws[1]) > 4096 || !b64_chars(bytes_of(ws[1]), 0)) { return bad_line("the key's base64 is malformed"); }
+    List(Int) blob = base64_decode(ws[1]);
+    GotText a = rd_text(rd(blob));
+    if (!rd_ok(a.r) || a.v != ws[0] || base64_encode(blob) != ws[1]) { return bad_line("the key's base64 does not hold a " + ws[0] + " key"); }
+    Bool sk = str_starts_with(ws[0], "sk-");
+    Option(PubKey) ok = if (sk || ws[0] == "ecdsa-sha2-nistp521") { None } else { key_of_blob(blob) };
+    PubKey k = ok else { no_key() };
+    if (!sk && ws[0] != "ecdsa-sha2-nistp521" && k.kind == "") { return bad_line("the " + ws[0] + " key is malformed or too weak (RSA needs 2048 bits or more)"); }
+    Str comment = safe_comment(str_join(ws[2..ws.len()], "_"));
+    return KeyLine {.alg = ws[0], .blob = blob, .comment = comment, .err = ""};
+}
+
+List(Str) words(Str s) { return non_empty(str_split(str_replace(str_replace(s, "\t", " "), "\r", " "), " "), 0, []); }
+
+List(Str) non_empty(List(Str) xs, Int i, List(Str) acc) {
+    if (i >= xs.len()) { return acc; }
+    return non_empty(xs, i + 1, if (str_len(xs[i]) > 0) { acc.concat([xs[i]]) } else { acc });
+}
+
+pub Str line_text(KeyLine k) { return k.alg + " " + base64_encode(k.blob) + (if (str_len(k.comment) > 0) { " " + k.comment } else { "" }); }
+
+// A user name fit for principals="..." in authorized_keys.
+pub Bool principal_ok(Str u) {
+    List(Int) b = bytes_of(u);
+    return b.len() > 0 && b.len() <= 64 && principal_chars(b, 0);
+}
+
+Bool principal_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int x = b[i];
+    Bool ok = (x >= 48 && x <= 57) || (x >= 65 && x <= 90) || (x >= 97 && x <= 122) || x == 46 || x == 95 || x == 45 || x == 64;
+    return ok && principal_chars(b, i + 1);
+}
+
+// The shell script the host runs (fed to `sh` on standard input, so no
+// layer of quoting lies between it and the host's shell). Every value
+// put in it has passed key_line_of or principal_ok: base64, algorithm
+// names and comments of letters, digits and . _ @ : + = , / - only, so
+// nothing in them can end a quoted string. With `ca`, each key is
+// installed as a CA whose certificates for `user` are accepted.
+pub Str authorize_script(List(KeyLine) ks, Bool ca, Str user) {
+    return "umask 077\n"
+        + "rc=0\n"
+        + "cd || exit 1\n"
+        + "f=.ssh/authorized_keys\n"
+        + "if [ ! -d .ssh ]; then mkdir .ssh || exit 1; echo 'fixed created ~/.ssh'; fi\n"
+        + "if [ ! -e $f ]; then : > $f || exit 1; echo 'fixed created ~/.ssh/authorized_keys'; fi\n"
+        + "cr=$(printf '\\r')\n"
+        + "if grep -q \"$cr\" $f; then cp -p $f $f.pylon-backup && chmod 600 $f.pylon-backup && tr -d '\\r' < $f.pylon-backup > $f && echo 'fixed removed Windows line endings (the file as it was is ~/.ssh/authorized_keys.pylon-backup)' || rc=1; fi\n"
+        + "if [ -s $f ] && [ -n \"$(tail -c 1 $f)\" ]; then echo >> $f && echo 'fixed added the missing line break at the end of the file' || rc=1; fi\n"
+        + key_steps(ks, ca, user, 0, "")
+        + "me=$(id -u)\n"
+        + "chk() {\n"
+        + "  m=$(ls -ldn \"$1\" | awk '{print $1}'); u=$(ls -ldn \"$1\" | awk '{print $3}')\n"
+        + "  if [ \"$u\" != \"$me\" ] && [ \"$u\" != 0 ]; then echo \"warning $2 belongs to user id $u, not to you ($me): sshd ignores your keys until it is yours again (as root: chown)\"; fi\n"
+        + "  case $m in ?????w*|????????w*) chmod go-w \"$1\" && echo \"fixed $2 could be written by others ($m); now only you can write to it\" || rc=1;; esac\n"
+        + "  case $m in *+) echo \"warning $2 has an access control list ($m): if logins still fail, check that it lets no one else write\";; esac\n"
+        + "}\n"
+        + "chk . 'your home folder'\n"
+        + "chk .ssh '~/.ssh'\n"
+        + "chk $f '~/.ssh/authorized_keys'\n"
+        + "s=/etc/ssh/sshd_config\n"
+        + "a=$(grep -i '^[[:space:]]*AuthorizedKeysFile' $s 2>/dev/null | head -n 1)\n"
+        + "case \"$a\" in ''|*.ssh/authorized_keys*) ;; *) echo \"warning $s says: $a (keys were added to ~/.ssh/authorized_keys)\";; esac\n"
+        + "p=$(grep -i '^[[:space:]]*PubkeyAuthentication[[:space:]]*no' $s 2>/dev/null | head -n 1)\n"
+        + "if [ -n \"$p\" ]; then echo \"warning $s says: $p (sshd takes no keys at all until an administrator changes it)\"; fi\n"
+        + "[ $rc = 0 ] && echo done\n"
+        + "exit $rc\n";
+}
+
+// For each key: is it there already (outside comments; as a CA when that
+// is asked for), else append it.
+Str key_steps(List(KeyLine) ks, Bool ca, Str user, Int i, Str acc) {
+    if (i >= ks.len()) { return acc; }
+    KeyLine k = ks[i];
+    Str b = base64_encode(k.blob);
+    Str fp = fingerprint(k.blob);
+    Str line = (if (ca) { "cert-authority,principals=\"" + user + "\" " } else { "" }) + line_text(k);
+    Str found = "grep -v '^[[:space:]]*#' $f | grep -F '" + b + "'" + (if (ca) { " | grep -q cert-authority" } else { " > /dev/null" });
+    Str what = if (ca) { "CA " } else { "" };
+    Str step = "if " + found + "; then echo 'present " + what + k.alg + " " + fp + "'; else printf '%s\\n' '" + line + "' >> $f && echo 'added " + what + k.alg + " " + fp + (if (str_len(k.comment) > 0) { " " + k.comment } else { "" }) + "' || rc=1; fi\n";
+    return key_steps(ks, ca, user, i + 1, acc + step);
+}
+
+// The script's report, as the principal sees it: only its own kinds of
+// line, escaped (the host wrote them).
+pub List(Str) report_of(List(Int) out) { return report_acc(str_split(display_text(strip_cr(out, 0, [])), "\n"), 0, []); }
+
+List(Int) strip_cr(List(Int) b, Int i, List(Int) acc) {
+    if (i >= b.len()) { return acc; }
+    return strip_cr(b, i + 1, if (b[i] == 13) { acc } else { acc.concat([b[i]]) });
+}
+
+List(Str) report_acc(List(Str) ls, Int i, List(Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    Str l = ls[i];
+    Bool keep = str_starts_with(l, "added ") || str_starts_with(l, "present ") || str_starts_with(l, "fixed ") || str_starts_with(l, "warning ") || l == "done";
+    return report_acc(ls, i + 1, if (keep) { acc.concat([l]) } else { acc });
+}
