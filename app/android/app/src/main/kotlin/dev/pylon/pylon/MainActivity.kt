@@ -44,6 +44,9 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val agent by lazy { SymbolonAgent(applicationContext) }
 
+    // The camera, for scanning a pin shared from another device.
+    private var scanner: QrScanner? = null
+
     // The isolated programs (local shells, terminal emulators): their ends
     // of the socket pairs, by id, and which service runs each.
     private val shells = HashMap<Int, ParcelFileDescriptor>()
@@ -293,6 +296,11 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        scanner?.onPermission(requestCode, grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED)
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         SensitiveClip.focused = hasFocus
@@ -342,6 +350,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        scanner = QrScanner(this, flutterEngine)
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, "pylon/local").setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { localSink = events }
             override fun onCancel(arguments: Any?) { localSink = null }

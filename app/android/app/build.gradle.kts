@@ -82,3 +82,9 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // The QR decoder (Apache-2.0, no dependencies), with the platform camera:
+    // QrScanner.kt. Its license and notice ship in assets/third_party/zxing.
+    implementation("com.google.zxing:core:3.5.3")
+}

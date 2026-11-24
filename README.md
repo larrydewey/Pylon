@@ -142,4 +142,9 @@ FUZZ_PORT=2299 FUZZ_EXPECT=ok tests/fuzz_proxy.py 200 2222 -- build/pylon -p {po
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The Android app includes [ZXing](https://github.com/zxing/zxing)'s
+core library (it decodes the QR code of a shared pin), under the Apache
+License 2.0: its license and notice are in
+[app/android/app/src/main/assets/third_party/zxing](app/android/app/src/main/assets/third_party/zxing),
+and in the APK under `assets/third_party/zxing/`. The app's QR codes are
+drawn with the Dart `qr` package (BSD-3-Clause).
