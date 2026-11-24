@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:pylon/backend/access.dart';
 import 'package:pylon/backend/files.dart';
 import 'package:pylon/backend/mem_files.dart';
 import 'package:pylon/backend/model.dart';
@@ -53,6 +54,15 @@ class FakeBackend implements Backend {
     files.add(f);
     return f;
   }
+  /// The authorize runs started, newest last.
+  final List<FakeAuthorize> authorized = [];
+  @override
+  Authorize authorize(Host h, List<String> keys, {bool ca = false}) {
+    final a = FakeAuthorize(h, keys, ca: ca);
+    authorized.add(a);
+    return a;
+  }
+
   @override
   Session openLocal(int rows, int cols, {bool shareNet = false}) => _add(FakeSession(Host.local()));
 
@@ -60,4 +70,20 @@ class FakeBackend implements Backend {
     opened.add(s);
     return s;
   }
+}
+
+/// An authorize run the test finishes by hand.
+class FakeAuthorize extends Authorize {
+  FakeAuthorize(super.host, super.keys, {super.ca});
+  bool closed = false;
+
+  void finish(bool ok, {List<ReportLine> report = const [], String messages = ''}) {
+    lines.addAll(report);
+    this.messages = messages;
+    this.ok = ok;
+    changed();
+  }
+
+  @override
+  void close() => closed = true;
 }

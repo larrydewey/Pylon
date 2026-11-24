@@ -279,7 +279,7 @@ class DesktopShellState extends State<DesktopShell> {
             ),
           ]),
         ),
-        SessionNote(session: s, padding: 10),
+        SessionNote(session: s, padding: 10, st: widget.st),
         Expanded(
           child: TermView(
             key: _viewKey(p),

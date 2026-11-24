@@ -12,6 +12,13 @@ and parses no host output itself:
   or before a host writes to the clipboard (OSC 52);
 - pins, CAs and the pin history are the core's (`pylon pin`, `pylon ca`,
   `pylon pins`); the host list is `$PYLON_HOME/app_hosts.json`;
+- getting into a server (`lib/ui/access_help.dart`): a host that refuses
+  every key gets a card with the keys to add and the `pylon authorize`
+  command; Authorize a key (`pylon authorize --app`, agent requests framed
+  as for a terminal) adds keys or a CA from a device that can log in;
+  Share pin shows a host's pins as a `pylon-hostkey/1` QR code, which
+  another device scans (Android: Camera2 and ZXing, `QrScanner.kt`) or
+  pastes into `pylon pin`, which still checks the key the host presents;
 - the local shell (SPEC 13) is `pylon-local` in place of `pylon --app`
   (Linux: namespaces, a root of its own; Android: `LocalShellService`, an
   isolated process running `libpylon_local.so`), drawn by `pylon-term`
@@ -22,8 +29,11 @@ and parses no host output itself:
   Ctrl+PageUp/PageDown tabs, Ctrl+Shift+V paste, Ctrl+Shift+K commands.
   `PYLON_LAYOUT=phone` gives the phone layout.
 
-No third-party Dart packages. JetBrains Mono is bundled (OFL,
-`assets/fonts/JetBrainsMono-OFL.txt`).
+One third-party Dart package, `qr` (BSD-3-Clause), draws the Share pin
+code. JetBrains Mono is bundled (OFL, `assets/fonts/JetBrainsMono-OFL.txt`).
+On Android, ZXing's core library (Apache-2.0) decodes scanned codes; its
+license and notice are in `android/app/src/main/assets/third_party/zxing`,
+and in the APK under `assets/third_party/zxing/`.
 
 ## Run
 
