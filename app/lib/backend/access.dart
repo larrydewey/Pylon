@@ -11,7 +11,8 @@ const refusedMarker = "accepted none of the agent's keys";
 /// authorized_keys line.
 final RegExp offeredKeyLine = RegExp(r'^  ((?:ssh|ecdsa|sk|rsa)-\S+) ([A-Za-z0-9+/]+={0,2})( \S+)?$');
 
-/// A public key line: TYPE BASE64 [COMMENT], the comment one word.
+/// TYPE BASE64 [COMMENT] with a one-word comment (the comment as the core
+/// writes it).
 final RegExp keyLinePattern = RegExp(r'^((?:ssh|ecdsa|sk|rsa)-\S+) ([A-Za-z0-9+/]+={0,2})( \S+)?$');
 
 /// What the core said when a host accepted none of the agent's keys.
@@ -83,16 +84,16 @@ String authorizeCommand(String target, int port, String jump, List<String> keys)
 const modesFix = 'chmod go-w ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys';
 
 /// Why [line] is not a public key line, or null when it is one. It must
-/// be TYPE BASE64 [COMMENT] with a one-word comment, and the key inside
-/// must be of the type the line names.
+/// be TYPE BASE64 [COMMENT], and the key inside must be of the type the
+/// line names. A comment of several words is fine: the core joins them
+/// with underscores.
 String? keyLineProblem(String line) {
   final ws = line.split(RegExp(r'\s+'));
   if (ws.isNotEmpty && !RegExp(r'^(?:ssh|ecdsa|sk|rsa)-').hasMatch(ws[0])) {
     final at = ws.indexWhere((w) => RegExp(r'^(?:ssh|ecdsa|sk|rsa)-').hasMatch(w));
     return at > 0 ? 'options before the key type are not accepted; start the line at ${ws[at]}' : 'not a public key line (TYPE BASE64 COMMENT, e.g. ssh-ed25519 AAAA… name)';
   }
-  if (ws.length > 3) return 'the comment must be one word (no spaces), or left out';
-  final m = keyLinePattern.firstMatch(ws.join(' '));
+  final m = keyLinePattern.firstMatch(ws.take(2).join(' '));
   if (m == null) return 'not a public key line (TYPE BASE64 COMMENT, e.g. ssh-ed25519 AAAA… name)';
   final alg = m.group(1)!;
   if (alg.contains('-cert-')) return 'a certificate, not a key';

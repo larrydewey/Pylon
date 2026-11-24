@@ -67,7 +67,7 @@ void main() {
     test('what is wrong is said', () {
       expect(keyLineProblem('hello there'), contains('not a public key line'));
       expect(keyLineProblem('from="10.0.0.1" $ed'), contains('options before the key type'));
-      expect(keyLineProblem('$ed and more'), contains('one word'));
+      expect(keyLineProblem('$ed and more words'), isNull);
       expect(keyLineProblem('ssh-ed25519-cert-v01@openssh.com AAAAC3NzaC1lZDI1NTE5AAAAIGGi3CwEyRfKgW8t8sKj5fNcQ4/YUz/8mory7yZuj40I x'), contains('certificate'));
       // Cut short: no longer base64 of whole bytes.
       expect(keyLineProblem('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGGi3CwEyRfKgW8t8sKj5fNc x'), isNotNull);
