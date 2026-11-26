@@ -85,7 +85,9 @@ class _HostsPageState extends State<HostsPage> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             Expanded(child: Text(h.name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600))),
-            if (live)
+            if (live && st.sessionFor(h)!.linkState == linkReconnecting)
+              const Chip2('Reconnecting…', fg: P.amber, bg: Color(0xFF3A2C10))
+            else if (live)
               Chip2(h.mode == Mode.pylon ? 'Pylon · roaming' : 'SSH · live')
             else if (!pinned)
               const Chip2('Not pinned', fg: P.amber, bg: Color(0xFF3A2C10))

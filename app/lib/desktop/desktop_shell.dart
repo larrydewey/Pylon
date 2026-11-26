@@ -100,12 +100,12 @@ class DesktopShellState extends State<DesktopShell> {
 
   /// A new session to [h] in a new tab, or beside the focused pane.
   /// A host not pinned yet goes to pinning first (no trust on first use).
-  Pane? open(Host h, {SplitDir? where}) {
+  Pane? open(Host h, {SplitDir? where, int? attach}) {
     if (!h.local && widget.st.pinFor(h) == null && !widget.st.backend.demo) {
       Navigator.push(context, MaterialPageRoute(builder: (_) => PinPage(st: widget.st, host: h)));
       return null;
     }
-    final s = widget.st.openNew(h, 24, 80);
+    final s = widget.st.openNew(h, 24, 80, attach: attach);
     _subs[s] = s.changes.listen((_) {
       if (mounted && s.clipboardRequests.isNotEmpty) askClipboard(context, s);
     });
@@ -253,6 +253,7 @@ class DesktopShellState extends State<DesktopShell> {
     final focused = t.focused == p;
     final many = t.panes.length > 1;
     final ended = s.exitCode != null;
+    final quiet = !ended && s.linkState == linkReconnecting;
     final accent = s.local ? P.purple : P.teal;
     final h = s.host;
     final label = s.local
@@ -266,10 +267,11 @@ class DesktopShellState extends State<DesktopShell> {
           padding: const EdgeInsets.only(left: 12, right: 4),
           decoration: BoxDecoration(color: s.local ? P.purpleDeep : P.ink, border: Border(bottom: BorderSide(color: focused && many ? accent : (s.local ? P.purpleLine : P.ink)))),
           child: Row(children: [
-            Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : accent, shape: BoxShape.circle)),
+            Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : (quiet ? P.amber : accent), shape: BoxShape.circle)),
             const SizedBox(width: 8),
             Expanded(child: Text(label, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, color: focused ? (s.local ? P.localText : P.text) : (s.local ? P.localMuted : P.muted)))),
             if (ended) Text('Ended (${s.exitCode})  ', style: const TextStyle(fontSize: 12, color: P.red)),
+            if (quiet) const Text('Reconnecting…  ', style: TextStyle(fontSize: 12, color: P.amber)),
             IconButton(
               tooltip: 'Close pane (Ctrl+Shift+W)',
               iconSize: 14,
@@ -280,6 +282,15 @@ class DesktopShellState extends State<DesktopShell> {
           ]),
         ),
         SessionNote(session: s, padding: 10, st: widget.st),
+        // Connecting again opens a tab in this pane's place.
+        LinkNote(
+          session: s,
+          padding: 10,
+          onReconnect: () {
+            final k = s.resumable ? s.keptSession : null;
+            if (open(s.host, attach: k) != null) ws.closePane(p);
+          },
+        ),
         Expanded(
           child: TermView(
             key: _viewKey(p),

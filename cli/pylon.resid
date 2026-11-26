@@ -56,6 +56,11 @@ Opts parse(Int i, Opts o) {
     if (a == "-J" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = args.get(i + 1), .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = args.get(i + 1), .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--attach" || a == "--ca" || a == "--sessions" || a == "--ephemeral" || a == "--allow-unconfined" || a == "--app" || a == "--resume") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat([str_slice(a, 2, str_len(a))]), .fwds = o.fwds, .rest = [], .err = ""}); }
+    if (a == "--session" && i + 1 < args.count()) {
+        Str v = args.get(i + 1);
+        if (!str_is_int(v) || str_parse_int(v) < 0) { return Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = "bad session " + v}; }
+        return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["session=" + v]), .fwds = o.fwds, .rest = [], .err = ""});
+    }
     if (a == "--pylond-unverified") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["pylond-unverified"]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--pylond-roots" && i + 1 < args.count()) { return parse(i + 2, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = o.force, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags.concat(["roots=" + args.get(i + 1)]), .fwds = o.fwds, .rest = [], .err = ""}); }
     if (a == "--force") { return parse(i + 1, Opts {.port = o.port, .no_strict = o.no_strict, .no_obfuscate = o.no_obfuscate, .no_cmd = o.no_cmd, .force = true, .jump = o.jump, .pylond = o.pylond, .pflags = o.pflags, .fwds = o.fwds, .rest = [], .err = ""}); }
@@ -86,6 +91,8 @@ Int usage() {
     eprintln("                       DIR holds pylond-x86_64, pylond-aarch64 and the signed release");
     eprintln("                       (pylond.release, pylond.proof), checked before pylond is pushed;");
     eprintln("                       for a local build: --pylond-roots ROOTS or --pylond-unverified");
+    eprintln("                       --attach: pick up a session pylond keeps unattended;");
+    eprintln("                       --session ID: pick up that one (the ID pylon names when a link is gone)");
     eprintln("       pylon pylond-check DIR [PROOF]          check DIR's release (PROOF: a newer log proof)");
     eprintln("       any of these with -J USER@JUMP[:PORT] to go through a jump host");
     eprintln("       pylon authorize [-p PORT] [--ca] USER@HOST [KEY-LINE...|-]");
@@ -501,7 +508,7 @@ Int pylon_transfer(Conn c, Remote r, Str local, Int op, Bool resume, Opts o, Boo
     if (u.code >= 0) { return u.code; }
     eprintln("pylon: Pylon protocol session to " + addr_port(u.l.addr, u.l.port) + " (experimental); SSH closed");
     Str st = environment.get("PYLON_TEST_STOP_AFTER");
-    Fx x = pylon_file(file_start(u.l, u.rk, op, resume, r.path, local, data, if (str_is_int(st)) { str_parse_int(st) } else { 0 }, clock.monotonic_ns()));
+    Fx x = pylon_file(file_start(u.l, u.rk, watch_new(u.l), op, resume, r.path, local, data, if (str_is_int(st)) { str_parse_int(st) } else { 0 }, clock.monotonic_ns()));
     if (str_len(x.err) > 0) { eprintln("pylon: " + x.err); return 1; }
     Str whence = if (x.start > 0) { " (resumed at " + f"{x.start}" + ")" } else { "" };
     eprintln("pylon: " + f"{x.size}" + " bytes to " + (if (op == 0) { local } else { r.host + ":" + display_text(bytes_of(r.path)) }) + whence);
@@ -637,16 +644,22 @@ Int run_pylon(Conn c, Str host, List(Fwd) fs, Str path, Bool shell0, Bool obfusc
         Bool app = has_flag(pflags, "app");
         Int cols = if (app) { 80 } else { resid_term_cols() };
         Int rows = if (app) { 24 } else { resid_term_rows() };
-        Listed found = if (has_flag(pflags, "attach")) { list_sessions(l0, 0, clock.monotonic_ns()) } else { Listed {.l = l0, .ok = false, .items = []} };
-        Int pick = detached(found.items, 0);
+        Str want = flag_value(pflags, "session=");
+        Bool pickup = has_flag(pflags, "attach") || str_len(want) > 0;
+        Listed found = if (pickup) { list_sessions(l0, 0, clock.monotonic_ns()) } else { Listed {.l = l0, .ok = false, .items = []} };
+        _ = if (pickup && !found.ok) { eprintln("pylon: pylond did not list its sessions; starting a new shell") } else { true };
+        Int asked = if (str_len(want) > 0) { str_parse_int(want) } else { -1 };
+        Int pick = if (asked >= 0) { if (listed(found.items, asked, 0)) { asked } else { -1 } } else { detached(found.items, 0) };
+        _ = if (asked >= 0 && pick < 0 && found.ok) { eprintln("pylon: session " + want + " is no longer on the host (its shell ended, or pylond restarted); starting a new shell") } else { true };
         _ = if (pick >= 0) { eprintln("pylon: attaching to session " + f"{pick}") } else { true };
         Link l1 = if (pick >= 0) { attach(found.l, pick, rows, cols, clock.monotonic_ns()) } else { open_shell(found.l, rows, cols, clock.monotonic_ns()) };
         _ = if (app) { print_bytes(app_frame(4, [])) } else { resid_term_raw() };
-        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk, .app = App {.on = app, .buf = []}}, ls);
+        Int code = pylon_shell(Sh {.l = l1, .sid = l1.next_sid - 2, .rows = rows, .cols = cols, .in_eof = false, .k = keys_new(obfuscate), .rebind = rebind_after, .rk = rk, .app = App {.on = app, .buf = []},
+            .w = watch_new(l1), .session = pick, .asks = 0, .asked = 0}, ls);
         _ = if (app) { false } else { resid_term_restore() };
         return code;
     }
-    Link done = pylon_forwards(l0, ls, rebind_after, rk);
+    Link done = pylon_forwards(l0, ls, rebind_after, rk, watch_new(l0));
     eprintln("pylon: " + done.err);
     return 1;
 }
@@ -763,6 +776,12 @@ Int main() {
     if (verb == "share") { return cmd_share(o); }
     if (str_len(o.jump) > 0) { return via_jump(verb, o); }
     return dispatch(verb, o, -1);
+}
+
+// Whether pylond listed session `id`.
+Bool listed(List(List(Int)) items, Int id, Int i) {
+    if (i >= items.len()) { return false; }
+    return items[i][0] == id || listed(items, id, i + 1);
 }
 
 Bool has_flag(List(Str) fs, Str f) {

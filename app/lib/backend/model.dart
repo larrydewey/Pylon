@@ -60,6 +60,8 @@ enum AgentKeys { unknown, some, none, unreachable }
 
 /// A live terminal: the latest screen from the confined emulator, its
 /// title, and how it ended. [changes] fires on every update.
+const linkConnected = 0, linkReconnecting = 1, linkGone = 2;
+
 abstract class Session {
   Session(this.host);
   final Host host;
@@ -77,6 +79,23 @@ abstract class Session {
   /// asked for its keys: [AgentKeys.none] for an empty list,
   /// [AgentKeys.unreachable] when Pylon could not reach it.
   AgentKeys agentKeys = AgentKeys.unknown;
+
+  /// The Pylon protocol's link (SPEC 9.8), as the core reports it:
+  /// [linkConnected], [linkReconnecting] (no answer from the host; the
+  /// core keeps trying) or [linkGone] (silent too long: the host let the
+  /// connection go, its shell kept). [linkNote] says what is happening
+  /// in words ("" when there is nothing to say).
+  int linkState = linkConnected;
+  String linkNote = '';
+
+  /// The id the host's pylond keeps this terminal under, once known: a
+  /// session whose link is gone is picked up again by it.
+  int? keptSession;
+
+  /// Whether reconnecting picks up the same shell (the link was lost, the
+  /// shell was not).
+  bool get resumable => linkState == linkGone && keptSession != null;
+
   final List<Uint8List> clipboardRequests = [];
   final _changes = StreamController<void>.broadcast();
   Stream<void> get changes => _changes.stream;
@@ -127,7 +146,9 @@ abstract class Backend {
   Future<List<Pin>> pins();
   Future<Outcome> pin(Host h, String fingerprint);
   Future<Outcome> trustCa(String pattern, String key);
-  Session open(Host h, int rows, int cols);
+  /// A terminal on [h]; over the Pylon protocol, [attach] picks up the
+  /// shell pylond keeps under that id instead of starting one.
+  Session open(Host h, int rows, int cols, {int? attach});
 
   /// A file browser's connection to the host (SPEC 11), over SSH.
   FileSession openFiles(Host h);

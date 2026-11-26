@@ -367,6 +367,15 @@ pub Int room(Link l, Int sid) {
     return window_bytes() - ua_len(l.streams[i]);
 }
 
+// Whether the link waits on the peer for anything: bytes of a stream not
+// yet acknowledged, or an opening not yet confirmed. While it does, the
+// peer's acknowledgments keep coming, so silence means trouble sooner.
+pub Bool awaiting(Link l) { return awaiting_at(l.streams, 0); }
+Bool awaiting_at(List(St) ss, Int i) {
+    if (i >= ss.len()) { return false; }
+    return ua_len(ss[i]) > 0 || ss[i].opening.len() > 0 || awaiting_at(ss, i + 1);
+}
+
 // Bytes from a stream's local end into its window, and sent.
 @requires(network, declassify)
 Link push_at(Link l, Int i, List(Int) d, Int now) {

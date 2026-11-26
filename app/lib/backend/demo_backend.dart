@@ -40,7 +40,7 @@ class DemoBackend implements Backend {
   Future<Outcome> trustCa(String pattern, String key) async => Outcome(false, 'Demo mode: no CA is trusted.');
 
   @override
-  Session open(Host h, int rows, int cols) => _DemoSession(h, rows, cols);
+  Session open(Host h, int rows, int cols, {int? attach}) => _DemoSession(h, rows, cols);
 
   @override
   FileSession openFiles(Host h) => MemFiles(h);

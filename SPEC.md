@@ -1101,6 +1101,43 @@ The helper confines itself the same way to `$HOME`. Without Landlock
 pylond refuses to serve unless the client passes `--allow-unconfined`
 for that host.
 
+### 9.8 A quiet link (as implemented)
+
+The principal never has to guess what a silent terminal is doing. pylond
+sends at least a keepalive every 10 seconds, so its silence means
+something, and the client (`keep_link`, `core/pyclient.resid`) watches
+for it with two clocks: the monotonic clock, which stops while a phone
+or laptop sleeps (Android's deep sleep, a suspend), and the wall clock,
+which does not. A gap between them is time asleep, during which pylond's
+clock ran on: by then it may refuse the client's keys (older than 3
+minutes, 9.5) or have let the client go (15 minutes, 10.4). So the client
+starts a handshake at once:
+
+- after a sleep;
+- after 15 seconds without an authenticated packet, or 3 seconds while
+  pylond owes it an acknowledgment (keys typed, bytes sent).
+
+The initiation is sent again every second (every 5 seconds once the link
+has been quiet for 30), until it is answered. The answer carries on the
+same link and streams, at the client's new address if it moved; nothing
+typed meanwhile is lost (it waits in the stream's window). While there is
+no answer the principal is told so, with how long it has been, and again
+once the link is back ("Reconnected after ..."). Silent for 15 minutes by
+the wall clock, the link is gone: pylond has dropped the client, its
+terminal detached and still running. The client then exits (status 255)
+saying so and naming the session, which a fresh login picks up again:
+`pylon --pylond DIR --session ID USER@HOST` (or `--attach`, a session
+left unattended). A stream pylond resets (another client took the
+session over) also ends the client with a message, never silently.
+
+The app hears this as frames from `pylon --app`: type 6, the link's state
+(one byte: 0 connected, 1 reconnecting, 2 gone) and the words for it,
+sent on each change and each second while reconnecting; type 10, the
+session id (4 bytes, big-endian) once pylond has said it. It shows the
+state over the terminal (amber while reconnecting, with the shell still
+running there), and once the link is gone a Reconnect button that logs in
+again with `--session` and so returns to the same shell.
+
 ## 10. Sessions, screen sync and re-attach
 
 ### 10.1 Screen synchronization

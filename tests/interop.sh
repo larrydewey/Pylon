@@ -746,6 +746,10 @@ except socket.timeout:
         bash -c "for p in \$(pgrep -f '^/proc/self/exe xfer '); do grep -hE '^(NoNewPrivs|Seccomp):' /proc/\$p/status | tr '\\n' ' '; echo; done; true"
     check "pylon protocol: app mode over the Pylon protocol" 0 "app ok" \
         python3 "$(dirname "$HOSTILE")/app_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
+    # SPEC 9.8: a silent link is reported (reconnecting, back, gone) and
+    # the shell picked up again with --session.
+    check "pylon protocol: a quiet link is reported, and the shell picked up again" 0 "link watch ok" \
+        env PYLOND_HASH="$(sha256sum "$PYLOND" | cut -d' ' -f1)" python3 "$(dirname "$HOSTILE")/link_watch_drive.py" "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1"
     check "pylon protocol: --pylond with a COMMAND is refused" 2 "not a COMMAND" \
         "$PYLON" -p $PORT $PYF "$USER_NAME@127.0.0.1" true
     # Under load pylond answers an init with a cookie and does no

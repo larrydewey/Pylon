@@ -196,8 +196,12 @@ class ProcessBackend implements Backend {
   }
 
   @override
-  Session open(Host h, int rows, int cols) => ProcSession(this, h, rows, cols, () async {
-        final args = ['--app', '-p', '${h.port}', if (h.jump.isNotEmpty) ...['-J', h.jump], if (h.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', pylondPath], h.target];
+  Session open(Host h, int rows, int cols, {int? attach}) => ProcSession(this, h, rows, cols, () async {
+        final args = [
+          '--app', '-p', '${h.port}', if (h.jump.isNotEmpty) ...['-J', h.jump],
+          if (h.mode == Mode.pylon) ...[if (unverifiedPylond) '--pylond-unverified', '--pylond', pylondPath, if (attach != null) ...['--session', '$attach']],
+          h.target,
+        ];
         return ProcessConduit(await Process.start(pylonPath, args, environment: await _env()));
       });
 
@@ -300,6 +304,10 @@ class ProcSession extends Session {
           _held.clear();
         } else if (t == 5 && p.length == 1) {
           _reported = p[0];
+        } else if (t == 6 && p.isNotEmpty) {
+          _onLink(p[0], utf8.decode(p.sublist(1), allowMalformed: true));
+        } else if (t == 10 && p.length == 4) {
+          keptSession = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
         }
       }
     });
@@ -318,6 +326,26 @@ class ProcSession extends Session {
   }
 
   bool get _starting => status.startsWith('Connecting') || status.startsWith('Starting');
+
+  // "Reconnected after …" stays a few seconds, then goes.
+  Timer? _linkNoteTimer;
+
+  // Frame 6 (SPEC 9.8): the link's state and what the core says of it.
+  // Gone, the core's own message (why, and that the shell is kept) ends
+  // the session in its status, so the note goes.
+  void _onLink(int state, String note) {
+    _linkNoteTimer?.cancel();
+    linkState = state;
+    linkNote = state == linkGone ? '' : note;
+    if (state == linkConnected && note.isNotEmpty) {
+      _linkNoteTimer = Timer(const Duration(seconds: 6), () {
+        if (linkState != linkConnected) return;
+        linkNote = '';
+        changed();
+      });
+    }
+    changed();
+  }
 
   Future<void> _agentRequest(Uint8List req) async {
     final a = b.agent;
@@ -372,6 +400,7 @@ class ProcSession extends Session {
   @override
   void close() {
     _closed = true;
+    _linkNoteTimer?.cancel();
     if (!local) b.agentClose?.call(_agentConn);
     _conn?.close();
     _term?.close();

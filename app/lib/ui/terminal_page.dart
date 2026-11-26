@@ -39,6 +39,17 @@ class _TerminalPageState extends State<TerminalPage> {
   void initState() {
     super.initState();
     s = widget.st.open(widget.host, 24, 80);
+    _listen();
+  }
+
+  @override
+  void dispose() {
+    sub?.cancel();
+    super.dispose();
+  }
+
+  void _listen() {
+    sub?.cancel();
     sub = s.changes.listen((_) {
       if (!mounted) return;
       setState(() {});
@@ -46,10 +57,13 @@ class _TerminalPageState extends State<TerminalPage> {
     });
   }
 
-  @override
-  void dispose() {
-    sub?.cancel();
-    super.dispose();
+  // The session ended: connect again in its place (to the same shell
+  // when pylond kept it), at the size the terminal has.
+  void _reconnect() {
+    final rows = s.screen.rows, cols = s.screen.cols;
+    widget.st.reconnect(s);
+    setState(() => s = widget.st.open(widget.host, rows, cols));
+    _listen();
   }
 
   Widget _key(String label, List<int> bytes, {bool latched = false, VoidCallback? onTap, IconData? icon}) => Expanded(
@@ -81,6 +95,7 @@ class _TerminalPageState extends State<TerminalPage> {
   Widget _title() {
     final h = widget.host;
     final ended = s.exitCode != null;
+    final quiet = !ended && s.linkState == linkReconnecting;
     if (local) {
       return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text('Local shell · $deviceName', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: P.localText)),
@@ -95,9 +110,16 @@ class _TerminalPageState extends State<TerminalPage> {
         Text(h.name, key: const Key('header-host'), maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
         if (s.title.isNotEmpty) RemoteTitle(s.title, key: const Key('header-title')),
         Row(children: [
-          Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : P.teal, shape: BoxShape.circle)),
+          Container(width: 7, height: 7, decoration: BoxDecoration(color: ended ? P.red : (quiet ? P.amber : P.teal), shape: BoxShape.circle)),
           const SizedBox(width: 6),
-          Text(ended ? 'Ended (${s.exitCode})' : (h.mode == Mode.pylon ? 'Pylon · post-quantum · roaming' : 'SSH · pinned host key'), style: const TextStyle(fontSize: 12, color: P.muted)),
+          Text(
+              ended
+                  ? 'Ended (${s.exitCode})'
+                  : quiet
+                      ? 'Reconnecting…'
+                      : (h.mode == Mode.pylon ? 'Pylon · post-quantum · roaming' : 'SSH · pinned host key'),
+              key: const Key('header-state'),
+              style: TextStyle(fontSize: 12, color: quiet ? P.amber : P.muted)),
         ]),
       ]),
     );
@@ -144,6 +166,7 @@ class _TerminalPageState extends State<TerminalPage> {
       body: Column(children: [
         if (s.agentKeys == AgentKeys.none || s.agentKeys == AgentKeys.unreachable) _KeysCard(session: s),
         SessionNote(session: s, st: widget.st),
+        LinkNote(session: s, onReconnect: _reconnect),
         Expanded(
           child: TermView(
             key: view,

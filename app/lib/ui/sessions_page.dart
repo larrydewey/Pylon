@@ -53,7 +53,9 @@ class SessionsPage extends StatelessWidget {
                     if (s.title.isNotEmpty) RemoteTitle(s.title, key: Key('session-title-${s.host.name}')),
                   ]),
                 ),
-                Chip2(s.host.mode == Mode.pylon ? 'Pylon · live' : 'SSH · live'),
+                s.linkState == linkReconnecting
+                    ? const Chip2('Reconnecting…', fg: P.amber, bg: Color(0xFF3A2C10))
+                    : Chip2(s.host.mode == Mode.pylon ? 'Pylon · live' : 'SSH · live'),
                 IconButton(
                   key: Key('disconnect-${s.host.name}'),
                   tooltip: 'Disconnect',
@@ -78,7 +80,7 @@ class SessionsPage extends StatelessWidget {
                 onTap: st.openInTab != null
                     ? null
                     : () {
-                        st.end(s);
+                        st.reconnect(s);
                         _show(context, s.host);
                       },
                 child: Row(children: [

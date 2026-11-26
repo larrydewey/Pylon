@@ -109,9 +109,10 @@ SessionKeys connect_c(Int udp, List(Int) addr, Int port, Boot b, Static c, Int t
 
 // The forwarding loop over the link. `rebind_after` > 0 (a test hook,
 // PYLON_TEST_REBIND_AFTER) moves the client to a new UDP socket after that
-// many packets, as a change of network would.
+// many packets, as a change of network would. The link is watched as a
+// terminal's is (keep_link), and what happens to it printed.
 @requires(network, declassify, clock)
-pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after, Rk rk) {
+pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after, Rk rk, Watch w) {
     if (str_len(l.err) > 0) { return l; }
     Int now = clock.monotonic_ns();
     Link lc = serve_connects(events_taken(l), fs, events(l).connects, 0, now);
@@ -120,13 +121,15 @@ pub Link pylon_forwards(Link l, List(Fwd) fs, Int rebind_after, Rk rk) {
     List(Int) fds = [lc.udp].concat(lfd).concat(sfds);
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), 100);
     Drained g0 = drain(lc, now, 64, []);
-    Rekeyed rr = rekey_step(g0.l, rk, g0.other, now);
+    Kept rr = keep_link(g0.l, rk, w, g0.other, now);
+    _ = say_link(rr);
+    if (rr.ev == 3) { return link_err(rr.l, rr.note); }
     Link a = accept_into(rr.l, fs, ready, 1, 0, now);
     Link b = retransmit(read_streams(a, sfds, ready, 1 + fs.len(), 0, now), 0, now);
     Link c = keepalive(b, now);
     Bool move = rebind_after > 0 && c.tx_ctr >= rebind_after;
     Link d = if (move) { rebind(c) } else { c };
-    return pylon_forwards(d, fs, if (move) { 0 } else { rebind_after }, rr.rk);
+    return pylon_forwards(d, fs, if (move) { 0 } else { rebind_after }, rr.rk, rr.w);
 }
 
 // A new local UDP socket (a new source address and port); the server
@@ -224,9 +227,17 @@ Int remote_at(List(Fwd) fs, Int port, Int i) {
 // The interactive loop for the terminal on stream `sid`, with any -L
 // forwards beside it. Keystrokes are batched on 20 ms ticks with chaff of
 // the same sealed size as a one-key frame, as over SSH (SPEC 5, 9.4); the
-// terminal's size is checked every pass and sent when it changed. Returns
-// the shell's exit code (255 when the stream was reset).
-pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; Rk rk; App app; };
+// terminal's size is checked every pass and sent when it changed. The
+// link is watched (keep_link): the principal is told when it goes quiet,
+// when it is back, and why it ended. Returns the shell's exit code (255
+// when the stream was reset or the link is gone).
+//
+// session: the id pylond keeps this terminal under (-1 until known), so
+// the principal can pick it up again after the link is gone: known from
+// the start for an attach, else asked with LIST once the shell has
+// spoken (pylond lists the newest terminal first); asks, asked: how many
+// times and when last (at most 5, 3 s apart).
+pub type Sh = { Link l; Int sid; Int rows; Int cols; Bool in_eof; Keys k; Int rebind; Rk rk; App app; Watch w; Int session; Int asks; Int asked; };
 
 @requires(network, declassify, terminal, clock(readonly))
 pub Int pylon_shell(Sh h, List(Fwd) fs) {
@@ -237,9 +248,17 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     _ = if (show.len() > 0) { print_bytes(if (h.app.on) { app_frame(1, show) } else { show }) } else { true };
     Ev e = events(h.l);
     Int code = exit_of(e.exits, h.sid, 0);
-    if (code != -2) { return if (code >= 0) { code } else { 255 }; }
-    if (!open_sid(h.l, h.sid)) { return 255; }
-    Link l0 = serve_connects(events_taken(take_inbox(h.l, h.sid, show.len())), fs, e.connects, 0, now);
+    if (code >= 0) { return code; }
+    if (code == -1 || !open_sid(h.l, h.sid)) {
+        eprintln("\r\npylon: pylond closed this terminal's stream: another client took the session over, or the shell could not start\r");
+        return 255;
+    }
+    // Which session this is, once pylond says (frame 10 to the app).
+    Int sess = if (h.session >= 0) { h.session } else { newest_attached(answer(e.sessions, session_nonce(), 0)) };
+    _ = if (sess >= 0 && h.session < 0 && h.app.on) { print_bytes(app_frame(10, u32_be(sess))) } else { true };
+    Bool ask = sess < 0 && h.asks < 5 && (show.len() > 0 || h.asks > 0) && now - h.asked > 3000000000;
+    Link l0a = serve_connects(events_taken(take_inbox(h.l, h.sid, show.len())), fs, e.connects, 0, now);
+    Link l0 = if (ask) { ask_sessions(l0a, session_nonce(), now) } else { l0a };
     List(Int) lfd = listen_fds(fs, 0, []);
     List(Int) sfds = stream_fds(l0.streams, 0, []);
     List(Int) kb = if (h.in_eof) { [] } else { [0] };
@@ -247,8 +266,10 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     List(Int) ready = resid_tcp_poll(fds, ones(fds.len(), []), wait_ms(h.k, now));
     Int t = clock.monotonic_ns();
     Drained g1 = drain(l0, t, 64, []);
-    Rekeyed rr = rekey_step(g1.l, h.rk, g1.other, t);
-    Drained g = Drained {.l = rr.l, .other = []};
+    Kept kp = keep_link(g1.l, h.rk, h.w, g1.other, t);
+    _ = if (h.app.on) { app_link(kp) } else { say_link(kp) };
+    if (kp.ev == 3) { _ = say_gone(kp.note, sess, h.app.on); return 255; }
+    Drained g = Drained {.l = kp.l, .other = []};
     Bool key = !h.in_eof && ready.len() > 1 && (ready[1] & 1) != 0;
     Int rm = room(g.l, h.sid);
     List(Int) raw_in = if (key && rm > 0) { resid_read_some(if (rm < 4096) { rm } else { 4096 }) } else { [] };
@@ -278,7 +299,38 @@ pub Int pylon_shell(Sh h, List(Fwd) fs) {
     Bool move = h.rebind > 0 && l5.tx_ctr >= h.rebind;
     Link l6 = if (move) { rebind(l5) } else { l5 };
     return pylon_shell(Sh {.l = l6, .sid = h.sid, .rows = if (changed) { nr } else { h.rows }, .cols = if (changed) { nc } else { h.cols },
-        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }, .rk = rr.rk, .app = App {.on = h.app.on, .buf = ai.rest}}, fs);
+        .in_eof = now_eof, .k = k3, .rebind = if (move) { 0 } else { h.rebind }, .rk = kp.rk, .app = App {.on = h.app.on, .buf = ai.rest},
+        .w = kp.w, .session = sess, .asks = if (ask) { h.asks + 1 } else { h.asks }, .asked = if (ask) { now } else { h.asked }}, fs);
+}
+
+Int session_nonce() { return 7000; }
+
+// The newest terminal pylond lists, when it is attached (ours, asked for
+// once our shell had started), else -1.
+Int newest_attached(List(Int) got) {
+    if (got.len() == 0) { return -1; }
+    List(List(Int)) items = items_of(got, 1, got[0], []);
+    return if (items.len() > 0 && items[0][1] == 1) { items[0][0] } else { -1 };
+}
+
+// The link's state to the app, frame 6: state (0 connected, 1
+// reconnecting, 2 gone) | the note. Sent when it changes, and each second
+// while reconnecting (the count).
+Bool app_link(Kept k) {
+    if (k.ev == 0 || k.ev == 3) { return true; }
+    Int state = if (k.ev == 2) { 0 } else { 1 };
+    return print_bytes(app_frame(6, [state].concat(bytes_of(k.note))));
+}
+
+// The link is gone: why, and how to get the terminal back. The app also
+// hears it as frame 6 (state 2), and offers to reconnect to the session.
+Bool say_gone(Str note, Int sess, Bool app) {
+    Str back = if (sess < 0) { " The shell is still running there: connect again with --attach to pick it up." }
+        else { if (app) { " The shell is still running there (session " + f"{sess}" + "): reconnect to pick it up." }
+        else { " The shell is still running there (session " + f"{sess}" + "): connect again with --session " + f"{sess}" + " to pick it up." } };
+    _ = if (app) { print_bytes(app_frame(6, [2].concat(bytes_of(note)))) } else { true };
+    eprintln("\r\npylon: " + note + back + "\r");
+    return true;
 }
 
 // The exit code reported for sid: -2 when none, -1 when the stream was reset.
@@ -356,7 +408,13 @@ pub type Rekeyed = { Link l; Rk rk; };
 pub Rk rk_new(Boot b, Static c, Int every) { return Rk {.b = b, .c = c, .waiting = false, .p = Pending {.pkt = [], .ck = [], .h = [], .e = c, .kem = mlkem768_keygen(), .idx = 0}, .sent = 0, .every = every, .cookie = []}; }
 
 @requires(network, declassify, clock(readonly))
-pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
+pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) { return rekey_step_f(l, r, others, now, false, 1000000000); }
+
+// The same, with `force`: a new handshake now, whatever the keys' age
+// (the link went quiet, or this device slept); an initiation unanswered
+// is sent again after `retry` ns.
+@requires(network, declassify, clock(readonly))
+pub Rekeyed rekey_step_f(Link l, Rk r, List(List(Int)) others, Int now, Bool force, Int retry) {
     // An answer to our initiation.
     List(Int) resp = if (r.waiting) { response(others, 0) } else { [] };
     SessionKeys k = if (resp.len() > 0) { hs_finish(r.b, r.c, r.p, resp) } else { SessionKeys {.ok = false, .tx = [], .rx = [], .my_idx = 0, .their_idx = 0} };
@@ -366,7 +424,7 @@ pub Rekeyed rekey_step(Link l, Rk r, List(List(Int)) others, Int now) {
     List(Int) ck = if (r.waiting) { cookie_in(others, r, 0) } else { [] };
     _ = if (ck.len() > 0 && r.every < 120000000000) { eprintln("pylon: a cookie for the new keys (test hook)\r") } else { true };
     // Time for new keys, or an initiation unanswered for a second.
-    Bool due = (!r.waiting && now - l.keyed >= r.every) || (r.waiting && now - r.sent > 1000000000) || ck.len() > 0;
+    Bool due = force || (!r.waiting && now - l.keyed >= r.every) || (r.waiting && now - r.sent > retry) || ck.len() > 0;
     if (!due) { return Rekeyed {.l = l, .rk = r}; }
     List(Int) cookie = if (ck.len() > 0) { ck } else { r.cookie };
     Pending p = hs_init_c(r.b, r.c, clock.now_ns(), cookie);
@@ -391,6 +449,83 @@ List(Int) response(List(List(Int)) xs, Int i) {
 }
 
 // ============================================================================
+// Watching the link (SPEC 9.8)
+// ============================================================================
+
+// pylond sends at least a keepalive every 10 s, so its silence means
+// something, and the client says what it is doing about it (the app shows
+// it above the terminal; the command line prints it). Two clocks: the
+// monotonic one stops while a phone or a laptop sleeps, the wall clock
+// does not, and a gap between them is time asleep. pylond's clock ran
+// meanwhile: it refuses keys older than 3 minutes (SPEC 9.5) and lets a
+// client silent for 15 minutes go. So after a sleep, or 15 s without a
+// word from pylond (3 s while it owes an acknowledgment), the client
+// starts a handshake at once, sent again every second (every 5 once quiet
+// for 30 s) until answered; the answer carries on the same link and
+// streams, at the client's new address if it moved. Silent for 15
+// minutes by the wall clock, the link is gone: pylond keeps the terminal,
+// and a fresh login (SPEC 10.4) picks it up again.
+//
+// mono, wall: both clocks at the last pass; rx: the link's last_rx then;
+// heard: the wall clock when pylond was last heard; lost: quiet and
+// reconnecting; said: the note last given; gone: the silence after which
+// the link is gone (15 minutes; PYLON_TEST_GONE_SECS in tests).
+pub type Watch = { Int mono; Int wall; Int rx; Int heard; Bool lost; Str said; Int gone; };
+
+@requires(environment, clock(readonly))
+pub Watch watch_new(Link l) {
+    Str t = environment.get("PYLON_TEST_GONE_SECS");
+    Int gone = if (str_is_int(t) && str_parse_int(t) > 0) { str_parse_int(t) * 1000000000 } else { 900000000000 };
+    Int wall = clock.now_ns();
+    return Watch {.mono = clock.monotonic_ns(), .wall = wall, .rx = l.last_rx, .heard = wall, .lost = false, .said = "", .gone = gone};
+}
+
+// A pass over the link: rekeyed when due (now, when it went quiet or this
+// device slept), and what changed. ev: 0 nothing to say, 1 the link went
+// quiet (reconnecting), 2 it is back, 3 it is gone, 4 still reconnecting,
+// with a new note (the seconds count). note: what to tell the principal.
+pub type Kept = { Link l; Rk rk; Watch w; Int ev; Str note; };
+
+@requires(network, declassify, clock(readonly))
+pub Kept keep_link(Link l, Rk rk, Watch w, List(List(Int)) others, Int mono) {
+    Int wall = clock.now_ns();
+    Bool slept = (wall - w.wall) - (mono - w.mono) > 3000000000;
+    Bool heard = l.last_rx != w.rx;
+    Int heard_at = if (heard) { wall } else { w.heard };
+    Int quiet = wall - heard_at;
+    Bool suspect = slept || quiet > 15000000000 || (awaiting(l) && mono - l.last_rx > 3000000000);
+    Bool lost = !heard && (w.lost || suspect);
+    Bool force = slept || (lost && !w.lost);
+    Rekeyed rr = rekey_step_f(l, rk, others, mono, force, if (quiet > 30000000000) { 5000000000 } else { 1000000000 });
+    Bool gone = lost && quiet > w.gone;
+    Str note = if (gone) { "Nothing heard from the host for " + span(quiet) + ", so pylond has let this connection go." }
+        else { if (lost) { "No answer from the host for " + span(quiet) + "; reconnecting." }
+        else { if (w.lost) { "Reconnected after " + span(wall - w.heard) + " without an answer." } else { "" } } };
+    Int ev = if (gone) { 3 } else { if (lost && !w.lost) { 1 } else { if (!lost && w.lost) { 2 } else { if (lost && note != w.said) { 4 } else { 0 } } } };
+    Watch w2 = Watch {.mono = mono, .wall = wall, .rx = l.last_rx, .heard = heard_at, .lost = lost, .said = if (lost) { note } else { "" }, .gone = w.gone};
+    return Kept {.l = rr.l, .rk = rr.rk, .w = w2, .ev = ev, .note = note};
+}
+
+// A span of time in words: "42 s", "3 min 5 s", "2 h 10 min".
+pub Str span(Int ns) {
+    Int s = if (ns < 0) { 0 } else { ns / 1000000000 };
+    Int m = s / 60;
+    Int sr = s % 60;
+    Int hr = m / 60;
+    Int mr = m % 60;
+    if (s < 60) { return f"{s} s"; }
+    if (m < 60) { return f"{m} min {sr} s"; }
+    return f"{hr} h {mr} min";
+}
+
+// The command line's word on a change (printed on its own line, the
+// terminal being raw): when the link goes quiet and when it is back.
+Bool say_link(Kept k) {
+    if (k.ev == 1 || k.ev == 2) { eprintln("\r\npylon: " + k.note + "\r"); }
+    return true;
+}
+
+// ============================================================================
 // Files (core/files.resid)
 // ============================================================================
 
@@ -401,26 +536,28 @@ List(Int) response(List(List(Int)) xs, Int i) {
 // how much is sent, the size, start and hash pylond announced (get), the
 // bytes written, a test hook that stops after that many bytes (as an
 // interruption would), and the outcome ("" while running).
-pub type Fx = { Link l; Rk rk; Int sid; Int op; Str local; Int stage; List(UInt(8)) data; List(Int) buf; List(Int) out; Int sent;
+pub type Fx = { Link l; Rk rk; Watch w; Int sid; Int op; Str local; Int stage; List(UInt(8)) data; List(Int) buf; List(Int) out; Int sent;
     Int size; Int start; List(Int) hash; Int wrote; Int stop; Str err; Bool done; };
 
-Fx fx_l(Fx x, Link l, Rk rk) {
-    return Fx {.l = l, .rk = rk, .sid = x.sid, .op = x.op, .local = x.local, .stage = x.stage, .data = x.data, .buf = x.buf, .out = x.out, .sent = x.sent,
+Fx fx_l(Fx x, Link l, Rk rk) { return fx_lw(x, l, rk, x.w); }
+
+Fx fx_lw(Fx x, Link l, Rk rk, Watch w) {
+    return Fx {.l = l, .rk = rk, .w = w, .sid = x.sid, .op = x.op, .local = x.local, .stage = x.stage, .data = x.data, .buf = x.buf, .out = x.out, .sent = x.sent,
         .size = x.size, .start = x.start, .hash = x.hash, .wrote = x.wrote, .stop = x.stop, .err = x.err, .done = x.done};
 }
 
 Fx fx_end(Fx x, Str err) {
-    return Fx {.l = x.l, .rk = x.rk, .sid = x.sid, .op = x.op, .local = x.local, .stage = x.stage, .data = x.data, .buf = x.buf, .out = x.out, .sent = x.sent,
+    return Fx {.l = x.l, .rk = x.rk, .w = x.w, .sid = x.sid, .op = x.op, .local = x.local, .stage = x.stage, .data = x.data, .buf = x.buf, .out = x.out, .sent = x.sent,
         .size = x.size, .start = x.start, .hash = x.hash, .wrote = x.wrote, .stop = x.stop, .err = err, .done = true};
 }
 
 Fx fx_buf(Fx x, Int stage, List(Int) buf, List(Int) out, Int sent, Int wrote) {
-    return Fx {.l = x.l, .rk = x.rk, .sid = x.sid, .op = x.op, .local = x.local, .stage = stage, .data = x.data, .buf = buf, .out = out, .sent = sent,
+    return Fx {.l = x.l, .rk = x.rk, .w = x.w, .sid = x.sid, .op = x.op, .local = x.local, .stage = stage, .data = x.data, .buf = buf, .out = out, .sent = sent,
         .size = x.size, .start = x.start, .hash = x.hash, .wrote = wrote, .stop = x.stop, .err = x.err, .done = x.done};
 }
 
 Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(UInt(8)) data) {
-    return Fx {.l = x.l, .rk = x.rk, .sid = x.sid, .op = x.op, .local = x.local, .stage = 1, .data = data, .buf = x.buf, .out = x.out, .sent = x.sent,
+    return Fx {.l = x.l, .rk = x.rk, .w = x.w, .sid = x.sid, .op = x.op, .local = x.local, .stage = 1, .data = data, .buf = x.buf, .out = x.out, .sent = x.sent,
         .size = size, .start = start, .hash = hash, .wrote = 0, .stop = x.stop, .err = x.err, .done = x.done};
 }
 
@@ -428,11 +565,11 @@ Fx fx_head(Fx x, Int size, Int start, List(Int) hash, List(UInt(8)) data) {
 // our end of the stream. data: the local file (put), or the part of it
 // kept for --resume (get).
 @requires(network, declassify, clock(readonly))
-pub Fx file_start(Link l, Rk rk, Int op, Bool resume, Str remote, Str local, List(UInt(8)) data, Int stop, Int now) {
+pub Fx file_start(Link l, Rk rk, Watch w, Int op, Bool resume, Str remote, Str local, List(UInt(8)) data, Int stop, Int now) {
     Link l1 = open_file(l, op, if (resume) { 1 } else { 0 }, bytes_of(remote), now);
     Int sid = l1.next_sid - 2;
     Link l2 = if (op == 0) { push_eof(push_bytes(l1, sid, if (resume) { chunk_hashes_u8(data, 0, []) } else { [] }, now), sid, -1, now) } else { l1 };
-    return Fx {.l = l2, .rk = rk, .sid = sid, .op = op, .local = local, .stage = 0, .data = data, .buf = [], .out = [], .sent = 0,
+    return Fx {.l = l2, .rk = rk, .w = w, .sid = sid, .op = op, .local = local, .stage = 0, .data = data, .buf = [], .out = [], .sent = 0,
         .size = 0, .start = 0, .hash = [], .wrote = 0, .stop = stop, .err = "", .done = false};
 }
 
@@ -444,12 +581,14 @@ pub Fx pylon_file(Fx x0) {
     Int now = clock.monotonic_ns();
     List(Int) ready = resid_tcp_poll([x0.l.udp], [1], 100);
     Drained g = drain(x0.l, now, 64, []);
-    Rekeyed rr = rekey_step(g.l, x0.rk, g.other, now);
+    Kept rr = keep_link(g.l, x0.rk, x0.w, g.other, now);
+    _ = say_link(rr);
+    if (rr.ev == 3) { return fx_end(fx_lw(x0, rr.l, rr.rk, rr.w), rr.note + " Run the same command with --resume to carry on."); }
     Link l1 = keepalive(retransmit(rr.l, 0, now), now);
     List(Int) in = inbox(l1, x0.sid);
     Bool gone = !open_sid(l1, x0.sid);
     Bool ended = peer_ended(l1, x0.sid);
-    Fx x1 = fx_l(fx_buf(x0, x0.stage, x0.buf.concat(in), x0.out, x0.sent, x0.wrote), take_inbox(l1, x0.sid, in.len()), rr.rk);
+    Fx x1 = fx_lw(fx_buf(x0, x0.stage, x0.buf.concat(in), x0.out, x0.sent, x0.wrote), take_inbox(l1, x0.sid, in.len()), rr.rk, rr.w);
     Fx x2 = if (x1.op == 0) { get_bytes(x1, ended) } else { put_bytes(x1, ended) };
     if (x2.done) { return x2; }
     if (gone && !ended) { return fx_end(x2, "pylond reset the transfer"); }

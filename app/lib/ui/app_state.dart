@@ -124,12 +124,25 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  /// The host's live session, or a new one (the phone layout: one per host).
-  Session open(Host h, int rows, int cols) => sessionFor(h) ?? openNew(h, rows, cols);
+  /// The host's live session, or a new one (the phone layout: one per
+  /// host); after [reconnect], one that picks up the kept shell.
+  Session open(Host h, int rows, int cols) => sessionFor(h) ?? openNew(h, rows, cols, attach: _pickUp.remove(h));
 
-  /// Always a new session (the desktop layout: a pane each).
-  Session openNew(Host h, int rows, int cols) {
-    final s = h.local ? backend.openLocal(rows, cols, shareNet: localShareNet) : backend.open(h, rows, cols);
+  // Hosts whose next session picks up a shell pylond kept (by its id).
+  final Map<Host, int> _pickUp = {};
+
+  /// Forgets the ended session [s] so that its host's next [open]
+  /// connects again: to the same shell, when only the link was lost.
+  void reconnect(Session s) {
+    final k = s.resumable ? s.keptSession : null;
+    end(s);
+    if (k != null) _pickUp[s.host] = k;
+  }
+
+  /// Always a new session (the desktop layout: a pane each); [attach]
+  /// picks up a shell pylond kept.
+  Session openNew(Host h, int rows, int cols, {int? attach}) {
+    final s = h.local ? backend.openLocal(rows, cols, shareNet: localShareNet) : backend.open(h, rows, cols, attach: attach);
     sessions.add(s);
     // Pages that list sessions show their title, status and how they
     // ended; a new screen alone (every keystroke's echo, every line of
@@ -146,7 +159,7 @@ class AppState extends ChangeNotifier {
     return s;
   }
 
-  static (int?, String, String, AgentKeys) _seen(Session s) => (s.exitCode, s.title, s.status, s.agentKeys);
+  static (int?, String, String, AgentKeys, int, String) _seen(Session s) => (s.exitCode, s.title, s.status, s.agentKeys, s.linkState, s.linkNote);
 
   /// Ends a session and forgets it.
   void end(Session s) {

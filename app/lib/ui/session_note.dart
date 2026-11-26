@@ -80,3 +80,66 @@ class _SessionNoteState extends State<SessionNote> {
     );
   }
 }
+
+/// The Pylon protocol's link above the terminal (SPEC 9.8), so nobody has
+/// to guess what a quiet terminal is doing: while the host does not
+/// answer, amber, with how long and that the core keeps trying; back, a
+/// few seconds of "Reconnected"; and once a session to a host has ended,
+/// a way to connect again: to the same shell when only the link was lost
+/// (the host keeps it), else to a new one.
+class LinkNote extends StatelessWidget {
+  const LinkNote({super.key, required this.session, required this.onReconnect, this.padding = 12});
+  final Session session;
+  final VoidCallback onReconnect;
+  final double padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final s = session;
+    if (s.local) return const SizedBox.shrink();
+    if (s.exitCode != null) {
+      final kept = s.resumable;
+      return _card(
+        color: kept ? P.amberDeep : P.surface,
+        border: kept ? P.amberLine : P.line,
+        icon: kept ? Icons.pause_circle_outline : Icons.restart_alt,
+        fg: kept ? P.amber : P.muted,
+        text: kept
+            ? 'Your shell is still running on ${visible(s.host.name, oneLine: true)} (session ${s.keptSession}). Reconnecting signs in again and picks it up where you left it.'
+            : 'Connecting again starts a new shell.',
+        action: FilledButton(key: const Key('reconnect'), onPressed: onReconnect, child: Text(kept ? 'Reconnect' : 'Connect again')),
+      );
+    }
+    if (s.linkNote.isEmpty) return const SizedBox.shrink();
+    final quiet = s.linkState == linkReconnecting;
+    return Semantics(
+      liveRegion: true,
+      child: _card(
+        key: const Key('link-note'),
+        color: quiet ? P.amberDeep : P.tealDeep,
+        border: quiet ? P.amberLine : P.tealLine,
+        icon: quiet ? Icons.sync_problem : Icons.check_circle_outline,
+        fg: quiet ? P.amber : P.tealText,
+        text: quiet
+            ? '${visible(s.linkNote)}\nYour shell keeps running on the host; what you type goes through once it answers.'
+            : visible(s.linkNote),
+      ),
+    );
+  }
+
+  Widget _card({Key? key, required Color color, required Color border, required IconData icon, required Color fg, required String text, Widget? action}) => Container(
+        key: key,
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        padding: EdgeInsets.all(padding),
+        decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(12), border: Border.all(color: border)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(icon, size: 18, color: fg),
+            const SizedBox(width: 10),
+            Expanded(child: Text(text, style: const TextStyle(fontSize: 13, height: 1.4, color: P.text))),
+          ]),
+          if (action != null) ...[const SizedBox(height: 10), action],
+        ]),
+      );
+}

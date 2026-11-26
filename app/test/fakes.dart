@@ -43,7 +43,13 @@ class FakeBackend implements Backend {
   @override
   Future<Outcome> trustCa(String pattern, String key) async => Outcome(false, '');
   @override
-  Session open(Host h, int rows, int cols) => _add(FakeSession(h));
+  Session open(Host h, int rows, int cols, {int? attach}) {
+    attached.add(attach);
+    return _add(FakeSession(h));
+  }
+
+  /// The `attach` each [open] was given, in order.
+  final List<int?> attached = [];
 
   /// The file sessions opened, newest last.
   final List<MemFiles> files = [];
