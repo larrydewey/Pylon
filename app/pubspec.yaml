@@ -1,7 +1,7 @@
 name: pylon
 description: "Pylon: a security-first terminal (SSH and the Pylon protocol)."
 publish_to: 'none'
-version: 0.3.0+24
+version: 0.3.1+25
 
 environment:
   sdk: ^3.14.0
